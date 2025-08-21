@@ -1,0 +1,160 @@
+# configs/datasets.yaml
+# Adapter config for building the unified obs index and split specs (no matrix copies).
+# Canonical obs fields we aim for:
+#   cell_id, dataset_id, lab_id, batch_id, cell_type, is_control,
+#   pert_type, target_gene, guide_id, dose, time_h
+# Notes:
+# - lab_id defaults to dataset_id unless you override.
+# - is_control is resolved via simple rules (e.g., target_id/perturbation equals one of control_tokens).
+# - target normalization should be HGNC upper-case where possible.
+
+defaults:
+  # Values & logic reused unless overridden per dataset
+  control_tokens: ["control", "NTC", "non-targeting", "neg_control", "DMSO"]
+  target_normalize: "hgnc"   # normalize gene symbols to HGNC upper-case
+  env_key: "batch_id"        # use batch as environment (IRM/REx); switch to lab_id later if you have it
+  pert_type_guess: "crispri" # most of these are CRISPRi; override where needed
+  # map canonical fields to dataset columns (overridden per dataset)
+  obs_map_template:
+    batch_id: "batch"
+    cell_type: null          # set per dataset: "celltype" or "cell_line" or CHECK_ME
+    pert_type: null          # often constant per dataset → set in "fixed"
+    target_gene: null        # e.g., "gene" or "target"
+    guide_id: "guide_id"
+    is_control_from: "target_id"  # or "perturbation"
+    target_id: "target_id"        # keep around; useful as a unique perturbation key
+
+datasets:
+
+  AdamsonWeissman2016_GSM2406681_10X010:
+    raw_path: "/data/scperturb/AdamsonWeissman2016_GSM2406681_10X010.h5ad"
+    preprocessed_path: "/data/scperturb/preprocessed_graft/AdamsonWeissman2016_GSM2406681_10X010.h5ad"
+    lab_id: "Weissman"
+    obs_map:
+      batch_id: null
+      cell_type: null
+      pert_type: null
+      target_gene: "perturbation"
+      guide_id: "perturbation"
+      is_control_from: "perturbation"
+      target_id: "perturbation"
+      perturbation: "perturbation"
+    fixed:
+      pert_type: "crispri"
+      cell_type: "K562"
+      batch_id: "1"
+
+  DixitRegev2016:
+    raw_path: "/data/scperturb/DixitRegev2016.h5ad"
+    preprocessed_path: "/data/scperturb/preprocessed_graft/DixitRegev2016.h5ad"
+    lab_id: "Regev"
+    obs_map:
+      batch_id: null
+      cell_type: "cell_line"   # present
+      pert_type: null
+      target_gene: "target"    # present
+      guide_id: "guide_id"
+      is_control_from: "target"
+      target_id: "target"
+      perturbation: "target"
+    fixed:
+      pert_type: "crispri"
+      batch_id: "1"
+
+  NormanWeissman2019_filtered:
+    raw_path: "/data/scperturb/NormanWeissman2019_filtered.h5ad"
+    preprocessed_path: "/data/scperturb/preprocessed_graft/NormanWeissman2019_filtered.h5ad"
+    lab_id: "Weissman"
+    obs_map:
+      batch_id: null
+      cell_type: "cell_line"
+      pert_type: null
+      target_gene: "perturbation"
+      guide_id: "guide_id"
+      is_control_from: "perturbation"
+      target_id: "perturbation"
+      perturbation: "perturbation"
+    fixed:
+      pert_type: "crispra"
+      batch_id: "1"
+
+  ShifrutMarson2018:
+    raw_path: "/data/scperturb/ShifrutMarson2018.h5ad"
+    preprocessed_path: "/data/scperturb/preprocessed_graft/ShifrutMarson2018.h5ad"
+    lab_id: "Marson"
+    obs_map:
+      batch_id: "replicate"
+      cell_type: "celltype"
+      pert_type: null
+      target_gene: "perturbation"
+      guide_id: "guide_id"
+      is_control_from: "perturbation"
+      target_id: "perturbation"
+      perturbation: "perturbation"
+    fixed:
+      pert_type: "crispr"
+
+  ReplogleWeissman2022_rpe1:
+    raw_path: "/data/scperturb/ReplogleWeissman2022_rpe1.h5ad"
+    preprocessed_path: "/data/scperturb/preprocessed_graft/ReplogleWeissman2022_rpe1.h5ad"
+    lab_id: "Weissman"
+    obs_map:
+      batch_id: "batch"
+      cell_type: "cell_line"
+      pert_type: null
+      target_gene: "gene"
+      guide_id: "guide_id"
+      is_control_from: "gene"
+      target_id: "gene"
+      perturbation: "perturbation"
+    fixed: 
+      pert_type: "crispri"
+
+  ReplogleWeissman2022_K562_essential:
+    raw_path: "/data/scperturb/ReplogleWeissman2022_K562_essential.h5ad"
+    preprocessed_path: "/data/scperturb/preprocessed_graft/ReplogleWeissman2022_K562_essential.h5ad"
+    lab_id: "Weissman"
+    obs_map:
+      batch_id: "batch"
+      cell_type: "cell_line"
+      pert_type: null
+      target_gene: "gene"
+      guide_id: "guide_id"
+      is_control_from: "gene"
+      target_id: "gene"
+      perturbation: "perturbation"
+    fixed: 
+      pert_type: "crispri"
+
+  ReplogleWeissman2022_K562_gwps:
+    raw_path: "/data/scperturb/ReplogleWeissman2022_K562_gwps.h5ad"
+    preprocessed_path: "/data/scperturb/preprocessed_graft/ReplogleWeissman2022_K562_gwps.h5ad"
+    lab_id: "Weissman"
+    obs_map:
+      batch_id: "batch"
+      cell_type: "cell_line"
+      pert_type: null
+      target_gene: "gene"
+      guide_id: "guide_id"
+      is_control_from: "gene"
+      target_id: "gene"
+      perturbation: "perturbation"
+    fixed: 
+      pert_type: "crispri"
+
+  VCC:
+    raw_path: "/data/vcc_data/adata_Training.h5ad"
+    preprocessed_path: "/data/vcc_data/adata_Training_preproc_graft.h5ad"
+    lab_id: "VCC"
+    obs_map:
+      batch_id: "batch"
+      cell_type: null
+      pert_type: null
+      target_gene: "target_gene"
+      guide_id: "guide_id"
+      is_control_from: "target_gene"
+      target_id: "target_gene"
+      perturbation: "target_gene"
+    fixed: 
+      pert_type: "crispri"
+      cell_type: "h1_hESC"
