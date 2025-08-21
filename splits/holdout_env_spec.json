@@ -1,0 +1,8 @@
+{
+  "task": "HOLDOUT_ENV",
+  "cell_types": ["K562"],
+  "env_key": "batch_id",
+  "min_test_cells": 200,
+  "selection": "largest",
+  "seed": 13
+}

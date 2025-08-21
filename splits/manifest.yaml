@@ -1,0 +1,19 @@
+runs:
+  - name: LOGO-K562
+    spec: splits/logo_spec.json
+    output_prefix: artifacts/splits/logo_k562
+    overrides:
+      cell_types: ["K562"]
+      min_test_cells: 100
+      max_genes: 200
+      seed: 13
+
+  - name: HOLDOUT-BATCH-K562
+    spec: splits/holdout_env_spec.json
+    output_prefix: artifacts/splits/holdout_batch_k562
+    overrides:
+      cell_types: ["K562"]
+      env_key: "batch_id"
+      min_test_cells: 200
+      selection: "largest"
+      seed: 13

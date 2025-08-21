@@ -1,0 +1,7 @@
+{
+  "task": "LOGO",
+  "cell_types": ["K562"],
+  "min_test_cells": 100,
+  "max_genes": 200,
+  "seed": 13
+}
