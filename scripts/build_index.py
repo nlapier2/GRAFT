@@ -7,6 +7,10 @@ from utils.config import load_datasets_yaml
 from utils.normalize import normalize_hgnc
 from utils.report import coverage_tables
 
+# temporary workaround for script visibility
+import os, sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 CANON_COLS = ["dataset_id","cell_id","lab_id","batch_id","cell_type",
               "is_control","pert_type","target_gene","guide_id",
               "dose","time_h","target_id","perturbation"]
