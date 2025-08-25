@@ -1,12 +1,22 @@
+# scripts/make_scvi_input.py  (v1-simplified)
+# Minimal: per-dataset contiguous block sampling + one backed block read.
+# Changes from original:
+#   (1) Does .to_memory() after a SINGLE backed slice (no chained views).
+#   (2) Loads a single contiguous block per dataset (as large as needed for the cap).
+# No strata, no row-block args, no extra knobs.
 
-# scripts/make_scvi_input.py
 import os, sys, json
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 import numpy as np
 import pandas as pd
 import anndata as ad
 import yaml
+from scipy import sparse
+
 from utils.normalize import normalize_hgnc
+
+# ------------------------------ helpers ------------------------------
 
 def read_yaml(yaml_path):
     with open(yaml_path, "r") as f:
@@ -18,93 +28,31 @@ def load_map(dataset_id):
         mp = json.load(f)
     return {int(k): int(v) for k, v in mp["to_common_idx"].items()}
 
-
-def _choose_blocks(n, block_size, n_blocks, rng):
-    """Return a list of (start, end) half-open intervals within [0, n)."""
-    if block_size <= 0:
-        return [(0, n)]
-    if n <= block_size or n_blocks <= 1:
-        return [(0, min(n, block_size))]
-    max_start = max(1, n - block_size)
-    starts = rng.integers(low=0, high=max_start, size=n_blocks)
-    starts = sorted(set(int(s) for s in starts))
-    return [(s, min(n, s + block_size)) for s in starts]
-
-def subset_rows_blocked(idx: pd.DataFrame,
-                        cell_type: str,
-                        datasets=None,
-                        max_cells_per_ds=None,
-                        seed=13,
-                        block_size=20000,
-                        blocks_per_stratum=3,
-                        strata=("batch_id","is_control")):
-    """Sample contiguous blocks per dataset (optionally stratified) to minimize random HDF5 I/O.
-       Returns a concatenated DataFrame of selected rows preserving within-dataset file order.
-    """
+def subset_rows_contiguous(idx: pd.DataFrame, cell_type: str, datasets=None, max_cells_per_ds=None, seed=13):
+    """Pick ONE contiguous block per dataset up to cap (max_cells_per_ds)."""
     rng = np.random.default_rng(seed)
     sub = idx[(idx["cell_type"] == cell_type) & (idx["common_gene_set"])].copy()
     if datasets:
         sub = sub[sub["dataset_id"].isin(datasets)]
-    out_parts = []
-    strata = tuple([s for s in strata if s in sub.columns])
+    parts = []
     for ds, g in sub.groupby("dataset_id", sort=False):
         n = len(g)
         if n == 0:
             continue
-        cap = max_cells_per_ds or n
-        if block_size <= 0:
-            sel = g.iloc[:cap]
-        elif len(strata) == 0:
-            n_blocks = max(1, int(np.ceil(cap / block_size)))
-            blocks = _choose_blocks(n, block_size, n_blocks, rng)
-            sel = pd.concat([g.iloc[s:e] for (s,e) in blocks], axis=0)
+        cap = min(max_cells_per_ds or n, n)
+        if cap == n:
+            sel = g  # take all
         else:
-            sel_parts = []
-            tot_blocks = max(1, int(np.ceil(cap / block_size)))
-            sizes = g.groupby(list(strata), sort=False).size()
-            weights = (sizes / sizes.sum()).clip(lower=0)
-            alloc = (weights * tot_blocks).round().astype(int).replace(0, 1)
-            diff = int(alloc.sum() - tot_blocks)
-            if diff != 0:
-                order = alloc.sort_values(ascending=(diff>0))
-                for key in order.index:
-                    if diff == 0: break
-                    if diff > 0 and alloc[key] > 1:
-                        alloc[key] -= 1; diff -= 1
-                    elif diff < 0:
-                        alloc[key] += 1; diff += 1
-            for key, n_blocks in alloc.items():
-                if isinstance(key, tuple):
-                    mask = (g[list(strata)].apply(tuple, axis=1) == key)
-                    grp = g.loc[mask]
-                else:
-                    grp = g[g[strata[0]] == key]
-                m = len(grp)
-                if m == 0: continue
-                blocks = _choose_blocks(m, block_size, n_blocks, rng)
-                sel_parts.extend([grp.iloc[s:e] for (s,e) in blocks])
-            sel = pd.concat(sel_parts, axis=0) if sel_parts else g.head(min(cap, n))
-        if len(sel) > cap:
-            sel = sel.iloc[:cap]
-        out_parts.append(sel)
-    if not out_parts:
+            # choose a contiguous window in the observed file order
+            start = int(rng.integers(0, n - cap + 1))
+            sel = g.iloc[start:start+cap]
+        parts.append(sel)
+    if not parts:
         return sub.iloc[0:0]
-    return pd.concat(out_parts, axis=0)
-
-
-def subset_rows(idx: pd.DataFrame, cell_type: str, datasets=None, max_cells_per_ds=None, seed=13):
-    sub = idx[(idx["cell_type"] == cell_type) & (idx["common_gene_set"])].copy()
-    if datasets:
-        sub = sub[sub["dataset_id"].isin(datasets)]
-    if max_cells_per_ds is not None:
-        parts = []
-        for ds, g in sub.groupby("dataset_id"):
-            k = min(len(g), max_cells_per_ds)
-            parts.append(g.sample(k, random_state=seed))
-        sub = pd.concat(parts, axis=0)
-    return sub
+    return pd.concat(parts, axis=0)
 
 def _build_keep_and_order(ds_nvars: int, gene_map: dict):
+    """Return (keep_bool, order_cols) for dataset->common gene mapping."""
     to_common = np.full(ds_nvars, -1, dtype=int)
     for k, v in gene_map.items():
         if 0 <= k < ds_nvars:
@@ -113,53 +61,70 @@ def _build_keep_and_order(ds_nvars: int, gene_map: dict):
     order_cols = np.argsort(to_common[keep_bool])
     return keep_bool, order_cols
 
-def fetch_dataset_slice_fast(raw_path, rows_meta: pd.DataFrame, gene_map: dict, gene_list, row_block=None):
+def fetch_dataset_slice_block(raw_path, rows_meta: pd.DataFrame, gene_map: dict, gene_list):
+    """Fast path: read a SINGLE contiguous [start:end) block from backed H5AD, then filter in-memory.
+       Steps:
+         - Map requested rows to integer positions in file.
+         - Take start=min(pos), end=max(pos)+1 → one backed slice → .to_memory().
+         - In-memory: pick requested rows from that block; then column keep+reorder.
+    """
     A_b = ad.read_h5ad(raw_path, backed="r")
+
+    # Map our global cell_id to dataset obs_names, then to positions
     cid = rows_meta["cell_id"].tolist()
     if not all(c in A_b.obs_names for c in cid):
         cid = [c.split("::", 1)[1] for c in cid]
-    row_pos = A_b.obs_names.get_indexer(cid)
-    if (row_pos < 0).any():
-        missing = sum(row_pos < 0)
+    pos = A_b.obs_names.get_indexer(cid)
+    if (pos < 0).any():
+        missing = int((pos < 0).sum())
         raise ValueError(f"{missing} requested cell_ids not found in {raw_path}")
-    order = np.argsort(row_pos)
-    row_pos_sorted = row_pos[order]
-    rows_meta_sorted = rows_meta.iloc[order].reset_index(drop=True)
+
+    start = int(pos.min())
+    end   = int(pos.max()) + 1
+
+    # SINGLE backed slice, then materialize
+    A_blk = A_b[start:end, :].to_memory()
+
+    # Filter ONLY the requested rows (relative to start), and restore original order
+    rel = (pos - start).astype(int)
+    mask = np.zeros(A_blk.n_obs, dtype=bool)
+    mask[rel] = True
+    A_sel = A_blk[mask, :]
+
+    # Reorder rows to match rows_meta's original order
+    # rows_meta order corresponds to our selection order; A_sel currently in file order among selected
+    order_map = {r: i for i, r in enumerate(rel)}
+    rel_in_sel = np.where(mask)[0]
+    desired_idx = np.array([order_map[r] for r in rel_in_sel])
+    inv = np.argsort(desired_idx)
+    A_sel = A_sel[inv, :]
+
+    # Column keep+reorder in-memory
     keep_bool, order_cols = _build_keep_and_order(A_b.n_vars, gene_map)
-    blocks = []
-    if row_block and row_block > 0:
-        for s in range(0, len(row_pos_sorted), row_block):
-            block_pos = row_pos_sorted[s:s+row_block]
-            A_blk = A_b[block_pos, :].to_memory()
-            A_blk = A_blk[:, keep_bool]
-            A_blk = A_blk[:, order_cols]
-            rm = rows_meta_sorted.iloc[s:s+row_block]
-            A_blk.obs["dataset_id"]  = rm["dataset_id"].values
-            A_blk.obs["lab_id"]      = rm["lab_id"].values
-            A_blk.obs["batch_id"]    = rm["batch_id"].values
-            A_blk.obs["cell_type"]   = rm["cell_type"].values
-            A_blk.obs["is_control"]  = rm["is_control"].values
-            A_blk.obs["target_gene"] = rm["target_gene"].values
-            blocks.append(A_blk)
-        A_sorted = ad.concat(blocks, join="outer", merge="first")
-    else:
-        A_rows = A_b[row_pos_sorted, :].to_memory()
-        A_rows = A_rows[:, keep_bool]
-        A_rows = A_rows[:, order_cols]
-        A_rows.obs["dataset_id"]  = rows_meta_sorted["dataset_id"].values
-        A_rows.obs["lab_id"]      = rows_meta_sorted["lab_id"].values
-        A_rows.obs["batch_id"]    = rows_meta_sorted["batch_id"].values
-        A_rows.obs["cell_type"]   = rows_meta_sorted["cell_type"].values
-        A_rows.obs["is_control"]  = rows_meta_sorted["is_control"].values
-        A_rows.obs["target_gene"] = rows_meta_sorted["target_gene"].values
-        A_sorted = A_rows
-    inv = np.empty_like(order); inv[order] = np.arange(len(order))
-    A = A_sorted[inv, :]
+    A_sel = A_sel[:, keep_bool]
+    A_sel = A_sel[:, order_cols]
+
+    # Attach *only* the minimal obs we need and ensure safe dtypes
+    A_sel.obs_names = rows_meta["cell_id"].values  # make global IDs the index
+    obs_keep = pd.DataFrame(index=A_sel.obs_names)
+    obs_keep["dataset_id"]  = rows_meta["dataset_id"].astype("category").values
+    obs_keep["lab_id"]      = rows_meta["lab_id"].astype("category").values
+    obs_keep["batch_id"]    = rows_meta["batch_id"].astype("category").values
+    obs_keep["cell_type"]   = rows_meta["cell_type"].astype("category").values
+    obs_keep["is_control"]  = rows_meta["is_control"].astype(bool).values
+    # target_gene may be missing/NA for controls; categories handle NA cleanly
+    obs_keep["target_gene"] = rows_meta["target_gene"].astype("category").values
+    A_sel.obs = obs_keep
+
+    # Ensure common var names
     try:
-        assert list(map(normalize_hgnc, A.var_names)) == gene_list
+        assert list(map(normalize_hgnc, A_sel.var_names)) == gene_list
     except Exception:
-        A.var_names = gene_list
-    return A
+        A_sel.var_names = gene_list
+
+    return A_sel
+
+# ------------------------------ main ------------------------------
 
 def main():
     import argparse
@@ -168,49 +133,44 @@ def main():
     ap.add_argument("--cell-type", required=True, help="Cell type to build (e.g., K562)")
     ap.add_argument("--datasets", nargs="*", default=None, help="Optional list of dataset_ids to include")
     ap.add_argument("--max-cells-per-ds", type=int, default=200000, help="Cap per dataset to limit memory")
-    ap.add_argument("--block-size", type=int, default=20000, help="If >0, sample contiguous blocks (faster I/O)")
-    ap.add_argument("--blocks-per-stratum", type=int, default=3, help="Blocks per stratum when block sampling")
-    ap.add_argument("--strata", nargs="*", default=[], help="Strata columns for block sampling (if present)")
-    ap.add_argument("--row-block", type=int, default=0, help="Optional row block size for backed reads (0=off)")
     ap.add_argument("--seed", type=int, default=13)
     ap.add_argument("--out", default=None, help="Output h5ad path")
-    ap.add_argument("--assemble", choices=["vstack","concat"], default="vstack", help="How to assemble per-dataset chunks into one AnnData (default: vstack)")
     args = ap.parse_args()
+
     gene_list = [g.strip() for g in open("artifacts/gene_list.tsv") if g.strip()]
     datasets_cfg = read_yaml(args.yaml)
     idx = pd.read_parquet("artifacts/cell_index.parquet")
-    rows = subset_rows_blocked(idx, args.cell_type, args.datasets, args.max_cells_per_ds, args.seed,
-                           block_size=args.block_size if args.block_size and args.block_size>0 else 0,
-                           blocks_per_stratum=args.blocks_per_stratum,
-                           strata=tuple(args.strata)) if (args.block_size and args.block_size>0) else \
-                           subset_rows(idx, args.cell_type, args.datasets, args.max_cells_per_ds, args.seed)
+
+    rows = subset_rows_contiguous(idx, args.cell_type, args.datasets, args.max_cells_per_ds, args.seed)
     if rows.empty:
         raise SystemExit(f"No rows for cell_type={args.cell_type} with common_gene_set=True")
-    adatas = []
-    for ds, g in rows.groupby("dataset_id"):
+
+    X_list, obs_list = [], []
+    for ds, g in rows.groupby("dataset_id", sort=False):
         raw_path = datasets_cfg[ds].get("raw_path") or datasets_cfg[ds].get("path")
         if not raw_path or not os.path.exists(raw_path):
             print(f"[WARN] {ds}: raw_path not found, skip")
             continue
         gmap = load_map(ds)
-        A = fetch_dataset_slice_fast(raw_path, g, gmap, gene_list, row_block=args.row_block)
-        adatas.append(A)
-        print(f"[INFO] added {ds}: {A.shape}")
-        if not adatas:
-            raise SystemExit("No datasets could be loaded.")
+        A = fetch_dataset_slice_block(raw_path, g, gmap, gene_list)
+        # Collect
+        X_list.append(A.X.tocsr() if hasattr(A.X, "tocsr") else sparse.csr_matrix(A.X))
+        obs_list.append(A.obs)
+
+        print(f"[INFO] added {ds}: {A.shape} (read [{A.n_obs} rows] from ONE contiguous block)")
+
+    if not X_list:
+        raise SystemExit("No datasets could be loaded.")
+
+    # Assemble final AnnData via vstack (fast & simple)
+    X = sparse.vstack(X_list, format="csr")
+    obs = pd.concat(obs_list, axis=0)
+    var = pd.DataFrame(index=gene_list)
+    Aall = ad.AnnData(X=X, obs=obs, var=var)
 
     out = args.out or f"artifacts/scvi_input_{args.cell_type}.h5ad"
     os.makedirs(os.path.dirname(out), exist_ok=True)
-    if args.assemble == "vstack":
-        from scipy import sparse
-        X_list = [A.X.tocsr() if hasattr(A.X, "tocsr") else sparse.csr_matrix(A.X) for A in adatas]
-        obs = pd.concat([A.obs for A in adatas], axis=0)
-        var = pd.DataFrame(index=gene_list)
-        X = sparse.vstack(X_list, format="csr")
-        Aall = ad.AnnData(X=X, obs=obs, var=var)
-    else:
-        Aall = ad.concat(adatas, join="outer", merge="first")
-    Aall.write_h5ad(out, compression="lzf")
+    Aall.write_h5ad(out, compression="gzip")
     print(f"[OK] wrote {out}: {Aall.shape}")
 
 if __name__ == "__main__":
