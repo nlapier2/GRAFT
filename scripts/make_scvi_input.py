@@ -28,10 +28,12 @@ def load_map(dataset_id):
         mp = json.load(f)
     return {int(k): int(v) for k, v in mp["to_common_idx"].items()}
 
-def subset_rows_contiguous(idx: pd.DataFrame, cell_type: str, datasets=None, max_cells_per_ds=None, seed=13):
+def subset_rows_contiguous(idx: pd.DataFrame, cell_type: str, datasets=None, max_cells_per_ds=None, seed=13, controls_only=False):
     """Pick ONE contiguous block per dataset up to cap (max_cells_per_ds)."""
     rng = np.random.default_rng(seed)
     sub = idx[(idx["cell_type"] == cell_type) & (idx["common_gene_set"])].copy()
+    if controls_only and "is_control" in idx.columns:
+        sub = sub[sub["is_control"].astype(bool)]
     if datasets:
         sub = sub[sub["dataset_id"].isin(datasets)]
     parts = []
@@ -135,13 +137,14 @@ def main():
     ap.add_argument("--max-cells-per-ds", type=int, default=200000, help="Cap per dataset to limit memory")
     ap.add_argument("--seed", type=int, default=13)
     ap.add_argument("--out", default=None, help="Output h5ad path")
+    ap.add_argument("--controls-only", action="store_true", default=True, help="Keep only control cells (obs.is_control==True)")
     args = ap.parse_args()
 
     gene_list = [g.strip() for g in open("artifacts/gene_list.tsv") if g.strip()]
     datasets_cfg = read_yaml(args.yaml)
     idx = pd.read_parquet("artifacts/cell_index.parquet")
 
-    rows = subset_rows_contiguous(idx, args.cell_type, args.datasets, args.max_cells_per_ds, args.seed)
+    rows = subset_rows_contiguous(idx, args.cell_type, args.datasets, args.max_cells_per_ds, args.seed, args.controls_only)
     if rows.empty:
         raise SystemExit(f"No rows for cell_type={args.cell_type} with common_gene_set=True")
 
@@ -168,7 +171,22 @@ def main():
     var = pd.DataFrame(index=gene_list)
     Aall = ad.AnnData(X=X, obs=obs, var=var)
 
-    out = args.out or f"artifacts/scvi_input_{args.cell_type}.h5ad"
+    # Optionally filter to controls only
+    if getattr(args, "controls_only", False):
+        if "is_control" not in Aall.obs.columns:
+            raise SystemExit("obs.is_control not found; cannot select controls-only.")
+        n0 = Aall.n_obs
+        Aall = Aall[Aall.obs["is_control"].astype(bool)].copy()
+        print(f"[INFO] controls-only: kept {Aall.n_obs}/{n0} cells")
+        Aall.uns["controls_only"] = True
+
+
+    # Determine output path
+    if args.out:
+        out = args.out
+    else:
+        suffix = "_controls" if getattr(args, "controls_only", False) else ""
+        out = f"artifacts/scvi_input_{args.cell_type}{suffix}.h5ad"
     os.makedirs(os.path.dirname(out), exist_ok=True)
     Aall.write_h5ad(out, compression="gzip")
     print(f"[OK] wrote {out}: {Aall.shape}")

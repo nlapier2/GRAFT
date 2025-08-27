@@ -75,6 +75,10 @@ def main():
     args = ap.parse_args()
 
     adata = ad.read_h5ad(args.input)
+    # Ensure only controls are used (safety guard)
+    if "is_control" in adata.obs and not bool(adata.obs["is_control"].astype(bool).all()):
+        print("[WARN] Non-control cells detected in scVI input; filtering to controls.")
+        adata = adata[adata.obs["is_control"].astype(bool)].copy()
     cell_type = str(adata.obs["cell_type"].unique().tolist()[0]) if "cell_type" in adata.obs else "UNKNOWN"
     model_dir = os.path.join(args.outdir, f"scvi_{cell_type}")
     os.makedirs(model_dir, exist_ok=True)
