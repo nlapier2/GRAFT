@@ -42,7 +42,7 @@ datasets:
     fixed:
       pert_type: "crispri"
       cell_type: "K562"
-      batch_id: "1"
+      batch_id: "AdamsonWeissman2016_GSM2406681_10X010"
 
   DixitRegev2016:
     raw_path: "/data/scperturb/DixitRegev2016.h5ad"
@@ -59,7 +59,7 @@ datasets:
       perturbation: "target"
     fixed:
       pert_type: "crispri"
-      batch_id: "1"
+      batch_id: "DixitRegev2016"
 
   NormanWeissman2019_filtered:
     raw_path: "/data/scperturb/NormanWeissman2019_filtered.h5ad"
@@ -76,7 +76,7 @@ datasets:
       perturbation: "perturbation"
     fixed:
       pert_type: "crispra"
-      batch_id: "1"
+      batch_id: "NormanWeissman2019_filtered"
 
   ShifrutMarson2018:
     raw_path: "/data/scperturb/ShifrutMarson2018.h5ad"
