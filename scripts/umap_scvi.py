@@ -1,15 +1,19 @@
 # scripts/umap_scvi.py
-# UMAP QC for scVI latents: robust loader (parquet/npz/npy), stratified downsample, lab-mixing score.
+# UMAP QC for scVI latents: robust z loader, stratified downsample, mixing metrics, fixed-color legend.
 
-import os, sys, argparse
+import os
+import argparse
 import numpy as np
 import pandas as pd
 import anndata as ad
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
 from umap import UMAP
 from sklearn.neighbors import NearestNeighbors
 
-def load_obs_backed(h5ad_path):
+# ------------------------ I/O helpers ------------------------
+
+def load_obs_backed(h5ad_path: str) -> pd.DataFrame:
     A = ad.read_h5ad(h5ad_path, backed="r")
     cols = [c for c in ["dataset_id","lab_id","batch_id","cell_type","is_control","target_gene"] if c in A.obs.columns]
     obs = A.obs[cols].copy()
@@ -17,38 +21,42 @@ def load_obs_backed(h5ad_path):
     del A
     return obs
 
-def load_z_any(path):
+def load_z_any(path: str) -> pd.DataFrame:
     ext = os.path.splitext(path)[1].lower()
     if ext == ".parquet":
-        # try pyarrow, then fastparquet
+        # try pyarrow then fastparquet
         try:
-            df = pd.read_parquet(path)  # defaults to pyarrow
-        except Exception as e1:
-            try:
-                df = pd.read_parquet(path, engine="fastparquet")
-            except Exception as e2:
-                raise RuntimeError(f"Failed to read parquet with both pyarrow and fastparquet.\npyarrow: {e1}\nfastparquet: {e2}")
-        # assume index=cell_id
+            df = pd.read_parquet(path)
+        except Exception:
+            df = pd.read_parquet(path, engine="fastparquet")
         return df
     elif ext == ".npz":
-        d = np.load(path, allow_pickle=False)
+        try:
+            d = np.load(path, allow_pickle=False)
+        except ValueError:
+            d = np.load(path, allow_pickle=True)   # fallback for object-dtype cell_ids
         z = d["z"]
-        if "cell_ids" in d:
-            idx = pd.Index(d["cell_ids"].astype(str))
+        if "cell_ids" in d.files:
+            ci = d["cell_ids"]
+            # coerce bytes/object → unicode
+            if getattr(ci, "dtype", None) is not None and ci.dtype.kind in {"S","O"}:
+                idx = pd.Index(np.asarray(ci, dtype="U"))
+            else:
+                idx = pd.Index(ci.astype("U", copy=False))
         else:
-            # fallback: synthetic index
-            idx = pd.Index([f"cell_{i}" for i in range(z.shape[0])])
+            idx = pd.RangeIndex(z.shape[0])
         cols = [f"z{i}" for i in range(z.shape[1])]
         return pd.DataFrame(z, index=idx, columns=cols)
     elif ext == ".npy":
         z = np.load(path, allow_pickle=False)
         cols = [f"z{i}" for i in range(z.shape[1])]
-        idx = pd.RangeIndex(z.shape[0])
-        return pd.DataFrame(z, index=idx, columns=cols)
+        return pd.DataFrame(z, index=pd.RangeIndex(z.shape[0]), columns=cols)
     else:
         raise ValueError(f"Unsupported z format: {ext}")
 
-def stratified_downsample(df, by=("lab_id","is_control"), max_total=100_000, seed=13):
+# ------------------------ sampling & metrics ------------------------
+
+def stratified_downsample(df: pd.DataFrame, by=("lab_id","is_control"), max_total=100_000, seed=13) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     if max_total is None or len(df) <= max_total:
         return df
@@ -59,46 +67,98 @@ def stratified_downsample(df, by=("lab_id","is_control"), max_total=100_000, see
     sizes = [len(g) for _, g in groups]
     total = float(sum(sizes))
     targets = [max(1, int(round(max_total * (s/total)))) for s in sizes]
+    # adjust to exact max_total
     diff = sum(targets) - max_total
     if diff != 0:
         order = np.argsort(sizes)[::-1]
-        for idx in order:
+        for i in order:
             if diff == 0: break
-            if diff > 0 and targets[idx] > 1:
-                cut = min(diff, targets[idx] - 1)
-                targets[idx] -= cut; diff -= cut
+            if diff > 0 and targets[i] > 1:
+                cut = min(diff, targets[i] - 1)
+                targets[i] -= cut; diff -= cut
             elif diff < 0:
-                add = min(-diff, sizes[idx] - targets[idx])
-                targets[idx] += add; diff += add
+                add = min(-diff, sizes[i] - targets[i])
+                targets[i] += add; diff += add
     parts = []
     if isinstance(by, (list, tuple)) and len(by) > 0:
-        for (k, g), t in zip(groups, targets):
-            parts.append(g if len(g) <= t else g.sample(t, random_state=int(rng.integers(0, 1<<31))))
+        for (_, g), t in zip(groups, targets):
+            parts.append(g if len(g) <= t else g.sample(t, random_state=int(rng.integers(0, 1 << 31))))
     else:
-        g = df
-        t = targets[0]
-        parts.append(g if len(g) <= t else g.sample(t, random_state=int(rng.integers(0, 1<<31))))
+        g = df; t = targets[0]
+        parts.append(g if len(g) <= t else g.sample(t, random_state=int(rng.integers(0, 1 << 31))))
     return pd.concat(parts, axis=0)
 
-def knn_label_entropy(emb, labels, n_neighbors=15):
-    if len(emb) <= 2: return 0.0
-    nn = NearestNeighbors(n_neighbors=min(n_neighbors, len(emb)-1))
-    nn.fit(emb)
-    dists, idx = nn.kneighbors(emb, return_distance=True)
-    if idx.shape[1] > 0 and np.all(idx[:,0] == np.arange(len(emb))):
-        idx = idx[:,1:]
-    neigh_labels = labels[idx]
+def knn_label_entropy(X: np.ndarray, labels: np.ndarray, n_neighbors: int = 15) -> float:
+    """Average entropy of neighbor label distribution (higher = more mixing)."""
+    if len(X) <= 2:
+        return 0.0
+    nn = NearestNeighbors(n_neighbors=min(n_neighbors, len(X)-1))
+    nn.fit(X)
+    _, idx = nn.kneighbors(X)
+    # drop self if present
+    if np.all(idx[:, 0] == np.arange(len(X))):
+        idx = idx[:, 1:]
+    neigh = labels[idx]
     ent = []
-    for row in neigh_labels:
+    for row in neigh:
         vals, counts = np.unique(row, return_counts=True)
         p = counts / counts.sum()
         ent.append(-(p * np.log(p + 1e-12)).sum())
     return float(np.mean(ent))
 
+# ------------------------ plotting ------------------------
+
+def scatter_with_fixed_legend(emb: np.ndarray,
+                              meta: pd.Series,
+                              out_png: str,
+                              title: str = None,
+                              max_legend: int = 16):
+    """Scatter using a fixed, repeatable palette and a legend whose marker colors match the plot."""
+    # categories & codes
+    cats = pd.Categorical(meta.astype(str).values)
+    n = len(cats.categories)
+    codes = cats.codes
+
+    # palette: repeat tab20 as needed
+    base = plt.get_cmap("tab20").colors
+    reps = (n + len(base) - 1) // len(base)
+    pal = (base * reps)[:n]
+    cmap = ListedColormap(pal)
+
+    # plot using integer codes + cmap (fast), ensure range aligns with cmap
+    plt.figure(figsize=(8, 7))
+    plt.scatter(emb[:, 0], emb[:, 1],
+                c=codes, s=1, alpha=0.75,
+                cmap=cmap, vmin=-0.5, vmax=n - 0.5,
+                linewidths=0)
+    plt.axis("off")
+    if title:
+        plt.title(title, fontsize=12)
+
+    # legend: up to max_legend entries, with matching colors
+    shown = cats.categories[:max_legend]
+    handles = []
+    labels = []
+    for i, cat in enumerate(shown):
+        handles.append(plt.Line2D([], [], marker="o", linestyle="",
+                                  markersize=6, markerfacecolor=pal[i],
+                                  markeredgecolor="none"))
+        labels.append(str(cat))
+    if len(shown) > 0:
+        plt.legend(handles=handles, labels=labels, loc="best",
+                   fontsize=8, frameon=False, handletextpad=0.4, borderpad=0.2)
+
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=200)
+    plt.close()
+    print(f"[save] {out_png}")
+
+# ------------------------ main ------------------------
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--scvi-input", required=True)
-    ap.add_argument("--z-path", required=True, help="z file: .parquet or .npz/.npy")
+    ap.add_argument("--scvi-input", required=True, help="artifacts/scvi_input_<CELL>.h5ad")
+    ap.add_argument("--z-path", required=True, help="Latent file (.parquet | .npz | .npy)")
     ap.add_argument("--outdir", default="artifacts/scvi_qc")
     ap.add_argument("--max-cells", type=int, default=100_000)
     ap.add_argument("--n-neighbors", type=int, default=30)
@@ -114,61 +174,50 @@ def main():
     print(f"[load] z from {args.z_path} ...")
     z_df = load_z_any(args.z_path)
 
-    # align indices
+    # align
     common = z_df.index.intersection(obs.index)
     if len(common) == 0:
-        raise SystemExit("No overlapping cell ids between z and h5ad obs_names. If using .npz without cell_ids, you must match ordering.")
+        raise SystemExit("No overlapping cell ids between z and h5ad obs_names.")
     z_df = z_df.loc[common]
     obs = obs.loc[common]
 
-    # Downsample by lab & control (if present)
-    by = [c for c in ["lab_id","is_control"] if c in obs.columns]
-    sample_obs = stratified_downsample(obs, by=by, max_total=args.max_cells, seed=args.random_state)
+    # stratified downsample (lab & control if present)
+    strata_cols = [c for c in ["lab_id", "is_control"] if c in obs.columns]
+    sample_obs = stratified_downsample(obs, by=strata_cols, max_total=args.max_cells, seed=args.random_state)
     z = z_df.loc[sample_obs.index].values.astype(np.float32)
 
+    # UMAP
     print(f"[umap] fit on {len(z)} cells (d={z.shape[1]}) ...")
     um = UMAP(n_neighbors=args.n_neighbors, min_dist=args.min_dist,
               metric="euclidean", random_state=args.random_state, verbose=True)
     emb = um.fit_transform(z)
 
-    # lab mixing
-    mix_msg = ""
+    # Mixing metrics
     if "lab_id" in sample_obs.columns:
-        mix_score = knn_label_entropy(emb, sample_obs["lab_id"].astype(str).values, n_neighbors=15)
-        mix_msg = f"(kNN lab-mixing entropy={mix_score:.3f}, higher=more mixed)"
-        print("[qc] " + mix_msg)
+        lab = sample_obs["lab_id"].astype(str).values
+        ent_umap = knn_label_entropy(emb, lab, n_neighbors=15)
+        ent_z    = knn_label_entropy(z,   lab, n_neighbors=30)
+        print(f"[qc] Lab mixing entropy — UMAP: {ent_umap:.3f}  |  z-space: {ent_z:.3f}")
 
-    # Save CSV
+    # Save CSV of embedding + meta
     csv_path = os.path.join(args.outdir, "umap_embedding.csv")
-    out_df = pd.DataFrame({"UMAP1": emb[:,0], "UMAP2": emb[:,1]}, index=sample_obs.index)
+    out_df = pd.DataFrame({"UMAP1": emb[:, 0], "UMAP2": emb[:, 1]}, index=sample_obs.index)
     for col in ["dataset_id","lab_id","batch_id","cell_type","is_control","target_gene"]:
         if col in sample_obs.columns:
             out_df[col] = sample_obs[col].values
     out_df.to_csv(csv_path)
-    print(f"[save] wrote {csv_path}")
+    print(f"[save] {csv_path}")
 
-    # Plots
-    def scatter_color_by(column, fname, title=None):
-        vals = sample_obs[column].astype(str).values
-        cats, inv = np.unique(vals, return_inverse=True)
-        plt.figure(figsize=(8, 7))
-        plt.scatter(emb[:,0], emb[:,1], c=inv, s=1, alpha=0.7, linewidths=0)
-        plt.axis("off")
-        ttl = title or f"UMAP colored by {column}"
-        if mix_msg and column == "lab_id":
-            ttl += f"\n{mix_msg}"
-        plt.title(ttl, fontsize=12)
-        shown = cats[:12]
-        handles = [plt.Line2D([], [], marker="o", linestyle="", markersize=6, label=c) for c in shown]
-        plt.legend(handles=handles, labels=shown.tolist(), loc="best", fontsize=8, frameon=False)
-        path = os.path.join(args.outdir, fname)
-        plt.tight_layout(); plt.savefig(path, dpi=200); plt.close()
-        print(f"[save] {path}")
-
-    if "lab_id" in sample_obs.columns:    scatter_color_by("lab_id", "umap_by_lab.png")
-    if "dataset_id" in sample_obs.columns: scatter_color_by("dataset_id", "umap_by_dataset.png")
+    # Plots with fixed legends
+    if "lab_id" in sample_obs.columns:
+        scatter_with_fixed_legend(emb, sample_obs["lab_id"], os.path.join(args.outdir, "umap_by_lab.png"),
+                                  title="UMAP colored by lab_id")
+    if "dataset_id" in sample_obs.columns:
+        scatter_with_fixed_legend(emb, sample_obs["dataset_id"], os.path.join(args.outdir, "umap_by_dataset.png"),
+                                  title="UMAP colored by dataset_id")
     if "cell_type" in sample_obs.columns and sample_obs["cell_type"].nunique() > 1:
-        scatter_color_by("cell_type", "umap_by_celltype.png")
+        scatter_with_fixed_legend(emb, sample_obs["cell_type"], os.path.join(args.outdir, "umap_by_celltype.png"),
+                                  title="UMAP colored by cell_type")
 
     print("[OK] UMAP QC done.")
 
