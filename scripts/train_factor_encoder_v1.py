@@ -12,6 +12,9 @@ from utils.scvi_stream import ScviOnTheFly
 from models.factor_encoder import FactorEncoder, FactorEncoderConfig, build_W0_from_membership
 
 def batch_index_loader(n_obs: int, batch_size: int, shuffle: bool, seed: int = 13):
+    """
+    Load a batch of cell indices (not data) for n_obs total rows.
+    """
     sampler = RandomSampler(range(n_obs), generator=torch.Generator().manual_seed(seed)) if shuffle \
               else SequentialSampler(range(n_obs))
     return BatchSampler(sampler, batch_size=batch_size, drop_last=False)

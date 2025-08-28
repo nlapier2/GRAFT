@@ -29,7 +29,7 @@ def colnorm_nonneg(W_param: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 
 def ridge_project_batch(xbar: torch.Tensor, W: torch.Tensor, lam: float) -> torch.Tensor:
     """
-    Compute a_lin = argmin_a ||x - W^T a||^2 + lam||a||^2 for a batch.
+    Compute a_lin = argmin_a ||x - W^T a||^2 + lam||a||^2 for a batch (ridge reconstruction target for batch).
     xbar: (B, G), W: (F, G). We use A = W (detached).
     a_lin = xbar @ ( (K^{-1} A)^T ), where K = A A^T + lam I, and solve K M = A.
     """
@@ -45,7 +45,7 @@ def ridge_project_batch(xbar: torch.Tensor, W: torch.Tensor, lam: float) -> torc
 
 
 def offdiag_penalty(C: torch.Tensor) -> torch.Tensor:
-    """Sum of squares of off-diagonal elements."""
+    """Sum of squares of off-diagonal elements (optional, used to decorrelate factors if desired)."""
     return (C - torch.diag(torch.diag(C))).pow(2).sum()
 
 
@@ -55,7 +55,7 @@ def offdiag_penalty(C: torch.Tensor) -> torch.Tensor:
 class FactorEncoderConfig:
     n_genes: int
     n_anchor: int                    # number of anchored factors (rows from membership)
-    n_free: int = 16                 # number of free factors
+    n_free: int = 64                 # number of free factors
     add_junk: bool = True            # one junk factor to absorb uncovered genes
     mlp_hidden: int = 64
     mlp_layers: int = 2
@@ -65,7 +65,7 @@ class FactorEncoderConfig:
     lambda_out: float = 5e-3         # L1 outside-pathway
     lambda_in: float = 1e-4          # gentle anchor inside
     beta_recon: float = 1e-2         # optional recon on scaled xbar
-    gamma_cov: float = 1e-3          # decorrelate factor activations
+    gamma_cov: float = 0             # decorrelate factor activations
     # numerics
     eps_norm: float = 1e-8
 
