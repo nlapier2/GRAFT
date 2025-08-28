@@ -83,10 +83,21 @@ def main():
     model_dir = os.path.join(args.outdir, f"scvi_{cell_type}")
     os.makedirs(model_dir, exist_ok=True)
 
+    if "dataset_id" in adata.obs and "batch_id" in adata.obs:
+        adata.obs["tech_batch_id"] = (
+            adata.obs["dataset_id"].astype(str) + "_" + adata.obs["batch_id"].astype(str)
+        ).astype("category")
+    else:
+        # Fallback to batch_id if dataset_id is missing (shouldn't happen with current pipeline)
+        fallback = adata.obs["batch_id"].astype(str) if "batch_id" in adata.obs else pd.Series(["batch0"] * adata.n_obs, index=adata.obs_names)
+        adata.obs["tech_batch_id"] = pd.Categorical(fallback)
+
+    covs = [c for c in ["dataset_id", "cell_type", "lab_id"] if c in adata.obs]
+
     scvi.model.SCVI.setup_anndata(
         adata,
-        batch_key="batch_id",
-        categorical_covariate_keys=[c for c in ["dataset_id","cell_type"] if c in adata.obs]
+        batch_key="tech_batch_id",
+        categorical_covariate_keys=covs
     )
     model = scvi.model.SCVI(adata, n_latent=args.n_latent, gene_likelihood="nb", dispersion="gene")
     model.train(max_epochs=args.max_epochs, batch_size=args.batch_size,
@@ -100,9 +111,9 @@ def main():
     pd.DataFrame(z, index=adata.obs_names).to_parquet(os.path.join(args.outdir, f"scvi_z_{cell_type}.parquet"))
 
     # Denoised (optional; chunked)
-    if args.save_denosed if hasattr(args, "save_denosed") else args.save_denosed:  # compat guard
-        args.save_denosed = args.save_denosed  # no-op
-    if args.save_denosed if hasattr(args, "save_denosed") else args.save_denosed:
+    if args.save_denoised if hasattr(args, "save_denoised") else args.save_denoised:
+        args.save_denoised = args.save_denoised  # no-op
+    if args.save_denoised if hasattr(args, "save_denoised") else args.save_denoised:
         pass  # dead guard
 
     if args.save_denoised:
