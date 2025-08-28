@@ -35,6 +35,7 @@ def main():
     ap.add_argument("--lambda-prior", type=float, default=1e-3)
     ap.add_argument("--lambda-W", type=float, default=1e-5)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--output-dir", default="artifacts", help="Output dir for learned W (default: artifacts/)")
     args = ap.parse_args()
 
     cell = args.cell_type
@@ -132,10 +133,10 @@ def main():
         print(f"[joint] epoch {e+1}/{args.epochs_joint} total={tot:.4f}")
 
     # Save learned W and a small report
-    os.makedirs("artifacts", exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
     W_final = model.forward(torch.from_numpy(z[:1]).to(args.device))["W"].detach().cpu().numpy()
-    np.save(f"artifacts/factor_W_{cell}.npy", W_final)
-    print(f"[OK] saved W to artifacts/factor_W_{cell}.npy")
+    np.save(f"{args.output_dir}/factor_W_{cell}.npy", W_final)
+    print(f"[OK] saved W to {args.output_dir}/factor_W_{cell}.npy")
 
 if __name__ == "__main__":
     main()
