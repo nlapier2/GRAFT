@@ -7,6 +7,7 @@ import os
 import numpy as np
 import anndata as ad
 import scvi
+import pandas as pd
 
 class ScviOnTheFly:
     def __init__(
@@ -28,8 +29,21 @@ class ScviOnTheFly:
 
         # Load AnnData in-memory (scVI expects an in-memory manager)
         self.adata = ad.read_h5ad(scvi_input_h5ad)
+        obs = self.adata.obs
+        if "tech_batch_id" not in obs.columns:
+            # expect dataset_id and batch_id from your make_scvi_input.py
+            if "dataset_id" in obs.columns:
+                ds = obs["dataset_id"].astype(str)
+            else:
+                ds = pd.Series(["ds0"] * self.adata.n_obs, index=obs.index)
+            if "batch_id" in obs.columns:
+                b = obs["batch_id"].astype(str).fillna("b1")
+            else:
+                b = pd.Series(["b1"] * self.adata.n_obs, index=obs.index)
+            self.adata.obs["tech_batch_id"] = pd.Categorical(ds + "_" + b)
         self.model = scvi.model.SCVI.load(model_dir, adata=self.adata)
-        self.model.eval()
+        if hasattr(self.model, "module") and hasattr(self.model.module, "eval"):
+            self.model.module.eval()
 
         self.library_size = library_size
         self.transform_batch = transform_batch

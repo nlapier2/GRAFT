@@ -19,13 +19,62 @@ def batch_index_loader(n_obs: int, batch_size: int, shuffle: bool, seed: int = 1
               else SequentialSampler(range(n_obs))
     return BatchSampler(sampler, batch_size=batch_size, drop_last=False)
 
+
+def _load_z_any(z_path: str, obs_index: pd.Index) -> np.ndarray:
+    """
+    Load Z from .npz (preferred), .parquet, or .npy and align rows to obs_index.
+    For .npz, expects 'z' and optional 'cell_ids'.
+    """
+    ext = os.path.splitext(z_path)[1].lower()
+
+    if ext == ".npz":
+        try:
+            d = np.load(z_path, allow_pickle=False)
+        except ValueError:
+            d = np.load(z_path, allow_pickle=True)
+        z = np.asarray(d["z"], dtype=np.float32)
+        if "cell_ids" in d.files:
+            idx = pd.Index(np.asarray(d["cell_ids"], dtype="U"))
+        else:
+            idx = pd.RangeIndex(z.shape[0])
+        z_df = pd.DataFrame(z, index=idx)
+
+    elif ext == ".parquet":
+        try:
+            df = pd.read_parquet(z_path)
+        except Exception:
+            df = pd.read_parquet(z_path, engine="fastparquet")
+        if "cell_id" in df.columns:
+            df = df.set_index("cell_id")
+        z_df = df
+
+    elif ext == ".npy":
+        z = np.load(z_path, allow_pickle=False).astype(np.float32)
+        z_df = pd.DataFrame(z, index=pd.RangeIndex(z.shape[0]))
+
+    else:
+        raise SystemExit(f"Unsupported Z format: {ext}. Use .npz (preferred), .parquet, or .npy.")
+
+    # align to AnnData obs order
+    if len(z_df.index.intersection(obs_index)) == 0:
+        raise SystemExit("No overlapping cell ids between Z and AnnData.obs_names.")
+    z_df = z_df.loc[obs_index]  # will raise if any are missing
+    if z_df.isna().any().any():
+        bad = z_df.index[z_df.isna().any(axis=1)].tolist()[:5]
+        raise SystemExit(f"Some AnnData rows missing in Z; first few: {bad}")
+    return z_df.values.astype(np.float32, copy=False)
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--cell-type", required=True)
     ap.add_argument("--model-dir", default=None, help="scVI model dir (default: artifacts/scvi_<CELLTYPE>/)")
     ap.add_argument("--scvi-input", default=None, help="scVI input h5ad (default: artifacts/scvi_input_<CELLTYPE>.h5ad)")
-    ap.add_argument("--z-parquet", default=None, help="Latent parquet (default: artifacts/scvi_z_<CELLTYPE>.parquet)")
+    ap.add_argument("--z-path", required=False,
+                    help="Path to scVI latent Z; **preferred** format is .npz (with keys 'z' and optional 'cell_ids').")
+    ap.add_argument("--z-parquet", required=False,
+                    help="(Deprecated) Parquet path for Z; kept for backward compatibility.")
     ap.add_argument("--membership-npy", required=True, help="Path to membership matrix M.npy (F_anchor x G)")
     ap.add_argument("--epochs-warm", type=int, default=5)
     ap.add_argument("--epochs-joint", type=int, default=50)
@@ -41,22 +90,20 @@ def main():
     cell = args.cell_type
     model_dir  = args.model_dir  or f"artifacts/scvi_{cell}"
     scvi_input = args.scvi_input or f"artifacts/scvi_input_{cell}.h5ad"
-    z_path     = args.z_parquet  or f"artifacts/scvi_z_{cell}.parquet"
-
-    # Load z latents (float32) and align to AnnData order
-    z_df = pd.read_parquet(z_path)
-    z_df = z_df.astype(np.float32)
-    z = z_df.values
-    z_idx = z_df.index
 
     # scVI streaming helper
     scvi_stream = ScviOnTheFly(model_dir=model_dir, scvi_input_h5ad=scvi_input, library_size=1e4)
-    # Reindex z to match scVI anndata order (required!)
-    pos = scvi_stream.align_z_index(z_idx)
-    if (pos < 0).any():
-        missing = int((pos < 0).sum())
-        raise RuntimeError(f"{missing} z rows not found in scVI AnnData obs_names.")
-    z = z[pos, :]  # reorder to match scVI adata
+    # Resolve z path with preference to --z-path
+    z_path = args.z_path or args.z_parquet
+    if z_path is None:
+        raise SystemExit("Provide --z-path (preferred .npz) or --z-parquet.")
+    scvi_stream = ScviOnTheFly(model_dir=model_dir, scvi_input_h5ad=scvi_input, library_size=1e4)
+    # robustly get obs index from the stream (newer: .adata; older: .A)
+    try:
+        obs_index = scvi_stream.adata.obs_names
+    except AttributeError:
+        obs_index = scvi_stream.A.obs_names  # fallback for legacy attribute
+    z = _load_z_any(z_path, pd.Index(obs_index))  # (N, d)
     n_obs, z_dim = z.shape
     G = scvi_stream.n_vars
 
