@@ -1,13 +1,13 @@
+# temporary workaround for script visibility
+import os, sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 import os, json
 import anndata as ad
 import pandas as pd
 from utils.config import load_datasets_yaml
 from utils.normalize import normalize_hgnc
 from pathlib import Path
-
-# temporary workaround for script visibility
-import os, sys
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 def main(yaml_path: str, out_dir: str = "artifacts", min_gene_len: int = 2000):
     cfg = load_datasets_yaml(yaml_path)

@@ -10,7 +10,7 @@
 
 defaults:
   # Values & logic reused unless overridden per dataset
-  control_tokens: ["control", "NTC", "non-targeting", "neg_control", "DMSO"]
+  control_tokens: ["control", "ntc", "non-targeting", "neg_control", "dmso", "ctrl", "untreated", "neg", "", "nan", "none", "null"]
   target_normalize: "hgnc"   # normalize gene symbols to HGNC upper-case
   env_key: "batch_id"        # use batch as environment (IRM/REx); switch to lab_id later if you have it
   pert_type_guess: "crispri" # most of these are CRISPRi; override where needed
@@ -58,7 +58,7 @@ datasets:
       target_id: "target"
       perturbation: "target"
     fixed:
-      pert_type: "crispri"
+      pert_type: "crispr"
       batch_id: "DixitRegev2016"
 
   NormanWeissman2019_filtered:
