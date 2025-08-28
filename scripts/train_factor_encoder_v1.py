@@ -32,6 +32,8 @@ def main():
     ap.add_argument("--batch-size", type=int, default=2048)
     ap.add_argument("--lr-enc", type=float, default=1e-3)
     ap.add_argument("--lr-W", type=float, default=1e-4)
+    ap.add_argument("--lambda-prior", type=float, default=1e-3)
+    ap.add_argument("--lambda-W", type=float, default=1e-5)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -68,9 +70,14 @@ def main():
     cfg = FactorEncoderConfig(
         n_genes=G, n_anchor=M.shape[0], n_free=16, add_junk=True,
         mlp_hidden=64, mlp_layers=2,
-        alpha_cons=1.0, lambda_ridge=0.1, lambda_out=5e-3, lambda_in=1e-4,
+        alpha_cons=1.0, lambda_ridge=0.1,
+        # turn off L1-style anchors for v1
+        lambda_out=0.0, lambda_in=0.0,
         beta_recon=1e-2, gamma_cov=1e-3,
+        # NEW: simple dense anchor regularization
+        lambda_prior=args.lambda_prior, lambda_W=args.lambda_W,
     )
+
     model = FactorEncoder(W0=W0, anchor_mask=anchor_mask, z_dim=z_dim, cfg=cfg).to(args.device)
 
     # Optims

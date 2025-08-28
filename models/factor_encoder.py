@@ -68,6 +68,9 @@ class FactorEncoderConfig:
     gamma_cov: float = 0             # decorrelate factor activations
     # numerics
     eps_norm: float = 1e-8
+    # Simple anchor regularization
+    lambda_prior: float = 1e-3   # pull W toward W0 (dense prior)
+    lambda_W: float = 1e-5       # small ridge on W
 
 
 def build_W0_from_membership(
@@ -192,15 +195,15 @@ class FactorEncoder(nn.Module):
         # Consistency loss
         L_cons = self.cfg.alpha_cons * F.mse_loss(a, a_lin)
 
-        # Masked L1 on W (outside-pathway heavy, inside gentle anchor to W0)
-        W_abs = torch.abs(W)
-        outside_mask = (~self.anchor_mask).to(W.dtype)
-        inside_mask = self.anchor_mask.to(W.dtype)
-
-        L_out = self.cfg.lambda_out * (W_abs * outside_mask).sum()
-
-        # Gentle anchor inside: |W - W0|
-        L_in = self.cfg.lambda_in * (torch.abs(W - self.W0) * inside_mask).sum()
+        # --- Anchor regularization: simple, dense L2-to-prior (no masks) ---
+        L_prior = torch.tensor(0.0, device=z.device)
+        L_W = torch.tensor(0.0, device=z.device)
+        if not freeze_W:
+            W0 = self.W0.to(W.device, dtype=W.dtype)
+            if self.cfg.lambda_prior > 0:
+                L_prior = self.cfg.lambda_prior * torch.sum((W - W0) ** 2)
+            if self.cfg.lambda_W > 0:
+                L_W = self.cfg.lambda_W * torch.sum(W ** 2)
 
         # Optional reconstruction (use scaled xbar if provided)
         L_recon = torch.tensor(0.0, device=z.device)
@@ -215,19 +218,14 @@ class FactorEncoder(nn.Module):
             C = (a_center.T @ a_center) / (a_center.shape[0] - 1 + 1e-6)
             L_cov = self.cfg.gamma_cov * offdiag_penalty(C)
 
-        L = L_cons + L_out + L_in + L_recon + L_cov
-
-        # If freezing W, stop gradients to W_param (but still compute losses numerically)
-        if freeze_W:
-            L = L.detach() + (L_cons + L_recon + L_cov)  # drop L_out/L_in grads to W by detaching L
-            # A stricter alternative:
-            # with torch.no_grad(): _ = colnorm_nonneg(self.W_param)  # ensure same numerics but no grad to W
+        # Total
+        L = L_cons + L_prior + L_W + L_recon + L_cov
 
         parts = {
             "L_total": L.detach(),
             "L_cons": L_cons.detach(),
-            "L_out": L_out.detach(),
-            "L_in": L_in.detach(),
+            "L_prior": L_prior.detach(),
+            "L_W": L_W.detach(),
             "L_recon": L_recon.detach(),
             "L_cov": L_cov.detach(),
         }

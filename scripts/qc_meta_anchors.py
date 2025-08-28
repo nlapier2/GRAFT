@@ -267,8 +267,12 @@ def main():
 
         # pre-index tables for quick lookup
         tg = top_genes_df.set_index("meta_idx")
-        if top_paths_csv:
-            tp = pd.read_csv(top_paths_csv).groupby("meta_idx")
+        top_paths_csv = os.path.join(args.outdir, "meta_top_paths_by_weight.csv")
+        if os.path.exists(top_paths_csv):
+            tp_df = pd.read_csv(top_paths_csv)
+            if "meta_idx" in tp_df.columns:
+                tp_df["meta_idx"] = tp_df["meta_idx"].astype(int)
+            tp = tp_df.groupby("meta_idx", sort=False)
         else:
             tp = None
         enr = enrich_df.groupby("meta_idx")
@@ -290,7 +294,7 @@ def main():
                 fh.write(etab.to_markdown(index=False))
                 fh.write("\n\n")
             # top-by-weight from path2meta
-            if tp is not None and r in tp.groups.groups:
+            if tp is not None and r in tp.groups:
                 wtab = tp.get_group(r).sort_values("weight", ascending=False).head(10)
                 fh.write("**Top raw pathways by meta weight (from path2meta)**\n\n")
                 fh.write(wtab.to_markdown(index=False))
