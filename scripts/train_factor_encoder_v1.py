@@ -114,9 +114,9 @@ def main():
     M_t = torch.from_numpy(M).to(args.device)
 
     # Build W0 and mask; init model
-    W0, anchor_mask = build_W0_from_membership(M_t, n_free=16, add_junk=True)
+    W0, anchor_mask = build_W0_from_membership(M_t, n_free=64, add_junk=True)
     cfg = FactorEncoderConfig(
-        n_genes=G, n_anchor=M.shape[0], n_free=16, add_junk=True,
+        n_genes=G, n_anchor=M.shape[0], n_free=64, add_junk=True,
         mlp_hidden=64, mlp_layers=2,
         alpha_cons=1.0, lambda_ridge=0.1,
         # turn off L1-style anchors for v1
