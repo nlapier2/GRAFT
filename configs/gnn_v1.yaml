@@ -1,0 +1,35 @@
+
+# Example config for GRAFT GNN v1 (skeleton)
+paths:
+  scvi_input: artifacts_v2/scvi_input_K562_max200k_controls.h5ad
+  scvi_latent: artifacts_v2/scvi_k562_mak200k_control_only/scvi_z_K562.parquet
+  scvi_meta: artifacts_v2/scvi_k562_mak200k_control_only/scvi_meta.parquet
+  factor_U: artifacts_v2/learned_factor_encoders/factor_W_K562.npy  # shape (F, G)
+  train_perturb: artifacts_v2/perturb_train.parquet  # rows: cells (perturbed+controls), include lab_id, dataset_id, target_gene, is_control
+  val_perturb: artifacts_v2/perturb_val.parquet
+
+model:
+  n_programs: 256           # F (should match factor_U rows)
+  hidden: 256
+  gnn_layers: 2             # placeholder MLP layers for propagation (swap to PyG later)
+  use_factor_features: false  # if true, include a(z) besides z
+  step0_soft_do: true
+  step0_init_efficacy: 0.9  # initial CRISPRi clamp strength (learned per lab/gene)
+
+training:
+  batch_size: 2048
+  lab_balanced: true
+  max_epochs: 50
+  lr: 1.0e-3
+  lr_U_head: 5.0e-4         # if/when we ever unfreeze U (not recommended for v1)
+  rex_weight: 0.1           # invariance on residuals across labs
+  dist_loss_weight: 1.0     # distribution matching weight
+  kd_consistency_weight: 0.5
+  antisymmetry_weight: 0.0  # >0 if training with CRISPRa/i pairs
+
+eval:
+  re_noise:
+    use: true
+    library_size_ref: by_lab  # by_lab | global
+    nb_dispersion_source: scvi_gene  # constant per gene from scVI
+    cells: 10000
