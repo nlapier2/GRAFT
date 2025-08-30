@@ -74,12 +74,25 @@ def main():
     # print("✓ Dataset ids:", ds_ids)
     # print("✓ All required files present.")
 
-    # 3) Coherence with index parquet
-    import pandas as pd
-    df_index = pd.read_parquet(cfg["paths"]["index_parquet"])
-    print("\n=== Index parquet ===")
-    print("Index columns (first 10):", list(df_index.columns)[:10])
-    if "dataset_id" in df_index.columns:
+    # 3) Coherence with index (parquet OR npz)
+    idx_path = Path(cfg["paths"]["index_parquet"])
+    df_index = None
+    if idx_path.suffix.lower() == ".npz":
+        import numpy as np, pandas as pd
+        with np.load(idx_path, allow_pickle=False) as npz:
+            assert "cell_ids" in npz.files, "NPZ must contain 'cell_ids'"
+            cell_ids = npz["cell_ids"].astype(str)
+            df_index = pd.DataFrame(index=pd.Index(cell_ids, name="cell_id"))
+            if "dataset_id" in npz.files:
+                df_index["dataset_id"] = pd.Index(npz["dataset_id"]).astype(str).values
+        print("\n=== Index (NPZ) ===")
+        print("Rows:", len(df_index), "| Columns:", list(df_index.columns))
+    else:
+        import pandas as pd
+        df_index = pd.read_parquet(cfg["paths"]["index_parquet"])
+        print("\n=== Index parquet ===")
+        print("Index columns (first 10):", list(df_index.columns)[:10])
+    if "dataset_id" in getattr(df_index, "columns", []):
         have = set(df_index["dataset_id"].astype(str).unique())
         want = {d["id"] for d in cfg["paths"]["datasets"]}
         print("Datasets in index :", sorted(list(have)))
@@ -88,7 +101,7 @@ def main():
         assert not missing, f"Config refers to dataset ids not in index: {missing}"
         print("✓ Index/config coherence OK.")
     else:
-        print("Note: no 'dataset_id' column; train_gnn will rely on per-dataset parquets (OK for v1).")
+        print("Note: no 'dataset_id' available; dataset coherence check skipped (OK for Phase 0).")
 
     # 4) Module init & shape smoke (CPU)
     print("\n=== Module init & shape smoke ===")
