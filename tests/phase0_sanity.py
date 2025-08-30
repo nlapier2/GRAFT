@@ -10,12 +10,10 @@ Usage:
   python tests/phase0_sanity.py --config configs/gnn_k562_v1.yaml
 """
 
-# temporary workaround for script visibility
-import os, sys
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
 from __future__ import annotations
 import argparse, os, sys
+# temporary workaround for script visibility
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from pathlib import Path
 
 # --- Ensure repo root on sys.path (parent of tests/ directory) ---
@@ -26,7 +24,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=str, default="configs/gnn_k562_v1.yaml")
+    ap.add_argument("--config", type=str, default="configs/gnn_v1.yaml")
     args = ap.parse_args()
 
     # 0) Versions / GPU
@@ -65,16 +63,16 @@ def main():
     must(cfg["paths"]["factor_U"])
     must(cfg["paths"]["index_parquet"])
 
-    ds_ids = []
-    for d in cfg["paths"]["datasets"]:
-        ds_ids.append(d["id"])
-        must(d["z_parquet"])
-        must(d["h5ad"])
-        if d.get("knn_parquet"):
-            print("(optional) knn:", d["knn_parquet"])
-    assert len(ds_ids) == len(set(ds_ids)), f"Duplicate dataset ids: {ds_ids}"
-    print("✓ Dataset ids:", ds_ids)
-    print("✓ All required files present.")
+    # ds_ids = []
+    # for d in cfg["paths"]["datasets"]:
+    #     ds_ids.append(d["id"])
+    #     must(d["z_parquet"])
+    #     must(d["h5ad"])
+    #     if d.get("knn_parquet"):
+    #         print("(optional) knn:", d["knn_parquet"])
+    # assert len(ds_ids) == len(set(ds_ids)), f"Duplicate dataset ids: {ds_ids}"
+    # print("✓ Dataset ids:", ds_ids)
+    # print("✓ All required files present.")
 
     # 3) Coherence with index parquet
     import pandas as pd

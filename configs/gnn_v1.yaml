@@ -3,9 +3,9 @@ batch_size: 1024
 epochs: 10
 
 paths:
-  scvi_model_dir: artifacts_v2/scvi_k562_mak200k_control_only/scvi_K562/
+  scvi_model_dir: artifacts_v2/scvi_k562_max200k_control_only/scvi_K562/
   factor_U: artifacts_v2/learned_factor_encoders/factor_W_K562.npy
-  index_parquet: artifacts_v2/scvi_k562_mak200k_control_only/scvi_z_K562_index.parquet
+  index_parquet: artifacts_v2/scvi_k562_max200k_control_only/scvi_z_K562.parquet
   datasets:
     - id: ReplogleWeissmanGWPS
       z_parquet: artifacts_v2/ReplogleWeissmanGWPS/z_K562.parquet
