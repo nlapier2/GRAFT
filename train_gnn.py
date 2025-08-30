@@ -1,475 +1,258 @@
 #!/usr/bin/env python3
-"""
-Train GRAFT GNN (dataset-centric v1, per-dataset shards)
-
-Key changes vs. earlier skeleton:
-- No merged scvi_input H5AD. We keep **per-dataset** shards:
-    * z parquet per dataset (from encode_query_z.py)
-    * original dataset H5AD path (to decode normalized means on the fly via scVI.load_query_data)
-    * optional precomputed kNN neighbors per dataset (from build_knn_controls.py)
-- The trainer aggregates z across datasets into a single index=cell_id DataFrame,
-  but decodes x̄ directly from each dataset's H5AD chunk-by-chunk at batch time.
-
-Config shape (see YAML example):
-paths:
-  index_parquet: artifacts/cell_index.parquet
-  scvi_model_dir: artifacts/scvi_K562_controls/scvi_K562
-  datasets:
-    - id: K562_ReplogleWeissman
-      z_parquet: artifacts/z_by_dataset/K562_ReplogleWeissman.parquet
-      h5ad: /data/K562_ReplogleWeissman.h5ad
-      knn_parquet: artifacts/knn_by_dataset/K562_ReplogleWeissman.knn.parquet  # optional
-    - id: DixitRegev
-      z_parquet: artifacts/z_by_dataset/DixitRegev.parquet
-      h5ad: /data/DixitRegev.h5ad
-
-  train_perturb: artifacts/train_rows.parquet
-  val_perturb: artifacts/val_rows.parquet
-
-model:
-  n_programs: 256
-  hidden: 256
-  gnn_layers: 2
-  use_factor_features: false
-  transform_batch: null          # optional reference batch category for decoding
-
-training:
-  mode: distribution             # or "paired_controls"
-  batch_size: 2048
-  steps_per_epoch: 200
-  max_epochs: 50
-  lr: 1.0e-3
-  dist_loss_weight: 1.0
-  kd_consistency_weight: 0.5
-  rex_weight: 0.1
-  l1_direct_weight: 0.0
-  interleave_global: false
-  p_global: 0.2
-  seed: 13
-
-Notes:
-- For paired_controls mode, if a dataset has knn_parquet, we use rank-0 neighbors;
-  if missing, we fallback to random in-dataset controls.
-- Decoding x̄ uses scVI.load(model_dir) once, then load_query_data on the needed subset
-  of a dataset H5AD per batch. To speed this up further, add a query cache later.
-"""
-
 from __future__ import annotations
-import os, sys, math, argparse, gc
-from collections import defaultdict
+import argparse, os, math
+from typing import Dict, Any, Optional, List
 
+import yaml
 import numpy as np
 import pandas as pd
-import anndata as ad
 import torch
 import torch.nn as nn
-import scvi
-import yaml
+import torch.optim as optim
 
-from graft.data.dataset import GraftDataset
-from graft.data.samplers import DatasetBalancedSampler, InterleavedGlobalSampler
-from graft.models.step0 import StepZeroClamp
 from graft.models.gnn_core import StatePropagator
+from graft.models.step0 import StepZeroClamp
 from graft.models.heads import MediatedHead, SparseDirectHead
-from graft.losses.distribution import sliced_wasserstein
-from graft.losses.invariance import risk_extrapolation
+
+from graft.losses.distribution import sliced_wasserstein, mmd_rbf, energy_distance
 from graft.losses.consistency import target_knockdown_consistency
+from graft.losses.invariance import risk_extrapolation, irmv1_penalty
 
+from graft.utils.common import read_parquet_indexed, encode_categories, seed_everything
 
-# ------------------ Helpers ------------------
-def load_U(path: str) -> torch.Tensor:
-    U = np.load(path).astype(np.float32)
-    if U.shape[0] < U.shape[1]:
-        U = U.T  # (G, F)
-    return torch.from_numpy(U)
-
-
-def _resolve_index(df: pd.DataFrame) -> pd.DataFrame:
-    if "cell_id" in df.columns:
-        df = df.set_index("cell_id", drop=True)
-    return df
-
-
-def load_multi_z(datasets_cfg, needed_cell_ids: pd.Index | None = None) -> pd.DataFrame:
-    """
-    Concatenate per-dataset z parquets into a single DataFrame (index=cell_id).
-    If needed_cell_ids is provided, filter rows to that set for efficiency.
-    """
-    frames = []
-    for entry in datasets_cfg:
-        zp = entry["z_parquet"]
-        Z = pd.read_parquet(zp)
-        Z = _resolve_index(Z)
-        if needed_cell_ids is not None:
-            keep = Z.index.intersection(needed_cell_ids)
-            Z = Z.loc[keep]
-        frames.append(Z.astype("float32"))
-    Zall = pd.concat(frames, axis=0)
-    Zall = Zall.loc[~Zall.index.duplicated(keep="first")]
-    return Zall
+try:
+    import anndata as ad
+    import scvi
+except Exception:
+    scvi = None
+    ad = None
 
 
 class PerDatasetDecoder:
-    """
-    Minimal decoder that uses a control-trained scVI model to decode normalized means
-    for arbitrary subsets of cells from per-dataset H5AD shards.
-    """
-    def __init__(self, scvi_model_dir: str, datasets_cfg, transform_batch=None, forward_batch_size: int = 4096):
-        self.base_model = scvi.model.SCVI.load(scvi_model_dir, adata=None)
-        self.ds_to_h5 = {d["id"]: d["h5ad"] for d in datasets_cfg}
+    def __init__(self, model_dir: str, transform_batch: Optional[str] = None):
+        if scvi is None:
+            raise RuntimeError("scvi/anndata not available.")
+        self.model_dir = model_dir
         self.transform_batch = transform_batch
-        self.forward_bs = forward_batch_size
+        self.cache: Dict[str, tuple] = {}
 
-    def get_xbar(self, ds_id: str, cell_ids: np.ndarray) -> np.ndarray:
-        """
-        Decode normalized means for given cell_ids belonging to dataset ds_id.
-        We load the dataset H5AD, subset to requested ids, attach via load_query_data, then decode.
-        """
-        # Load dataset adata and subset to cell_ids
-        A = ad.read_h5ad(self.ds_to_h5[ds_id])
-        # Align and subset
-        # Ensure requested ids exist
-        ids_set = set(A.obs_names.astype(str))
-        have = np.array([cid for cid in cell_ids if cid in ids_set], dtype=str)
-        if len(have) == 0:
-            # nothing to decode
-            return np.zeros((0, A.n_vars), dtype=np.float32)
-        Aq = A[have].copy()
-        qmodel = self.base_model.load_query_data(Aq, inplace=False)
-        X = qmodel.get_normalized_expression(transform_batch=self.transform_batch, batch_size=self.forward_bs)
-        if isinstance(X, np.ndarray):
-            X = X.astype(np.float32, copy=False)
-        else:
-            X = X.astype(np.float32).values
-        del qmodel, A, Aq
-        gc.collect()
-        return X
+    def _get(self, dataset_id: str, h5ad_path: str):
+        key = str(dataset_id)
+        if key in self.cache:
+            return self.cache[key]
+        adata = ad.read_h5ad(h5ad_path)
+        model = scvi.model.SCVI.load(self.model_dir, adata=None).load_query_data(adata)
+        model.eval()
+        self.cache[key] = (adata, model)
+        return self.cache[key]
+
+    @torch.no_grad()
+    def xbar(self, dataset_id: str, h5ad_path: str, row_idx: np.ndarray, device: torch.device) -> torch.Tensor:
+        adata, model = self._get(dataset_id, h5ad_path)
+        xbar = model.get_normalized_expression(adata[row_idx], transform_batch=self.transform_batch)
+        return torch.tensor(xbar.values, dtype=torch.float32, device=device)
 
 
-def load_knn_map(datasets_cfg) -> dict[str, pd.DataFrame]:
-    """
-    Load optional knn neighbor tables per dataset (long form).
-    Returns dict ds_id -> DataFrame or {} if none.
-    """
-    out = {}
-    for d in datasets_cfg:
-        p = d.get("knn_parquet", None)
-        if p and os.path.exists(p):
-            df = pd.read_parquet(p)
-            out[d["id"]] = df
-    return out
+def build_U(path: str, device: torch.device) -> torch.Tensor:
+    arr = np.load(path, allow_pickle=False)
+    return torch.tensor(arr, dtype=torch.float32, device=device)
 
 
-def sample_matched_controls(ds_id: str, pert_cell_ids: np.ndarray, knn_tables: dict, train_df: pd.DataFrame) -> np.ndarray:
-    """
-    For each perturbed cell id, pick a matched control id within the same dataset.
-    Prefer rank-0 from precomputed KNN if available; else fall back to random control from that dataset.
-    Returns an array of control ids aligned to pert_cell_ids.
-    """
-    out = np.empty(len(pert_cell_ids), dtype=object)
-    knn = knn_tables.get(ds_id, None)
-    # pool of controls in-train for fallback
-    pool = train_df[(train_df["dataset_id"].astype(str) == ds_id) & (train_df["is_control"])].index.values
-    if len(pool) == 0:
-        # fallback global controls
-        pool = train_df[train_df["is_control"]].index.values
-    if len(pool) == 0:
-        # no controls at all
-        return np.array([None] * len(pert_cell_ids), dtype=object)
-
-    if knn is not None and not knn.empty:
-        # make a quick lookup of rank-0 neighbor
-        g = knn[knn["rank"] == 0].set_index("cell_id")["control_id"]
-        for i, cid in enumerate(pert_cell_ids):
-            if cid in g.index:
-                out[i] = g.loc[cid]
-            else:
-                out[i] = np.random.choice(pool)
-    else:
-        # pure random fallback
-        for i in range(len(pert_cell_ids)):
-            out[i] = np.random.choice(pool)
-    return out.astype(str)
+def make_optimizer(params, cfg: Dict[str, Any]):
+    name = cfg.get("name", "adamw").lower()
+    lr = float(cfg.get("lr", 2e-4))
+    wd = float(cfg.get("weight_decay", 1e-4))
+    if name == "adamw":
+        return optim.AdamW(params, lr=lr, weight_decay=wd, betas=(0.9, 0.999))
+    if name == "adam":
+        return optim.Adam(params, lr=lr, weight_decay=wd, betas=(0.9, 0.999))
+    raise ValueError(f"Unknown optimizer {name}")
 
 
-# ------------------ Model wrapper ------------------
-class GraftCore(nn.Module):
-    def __init__(self, z_dim: int, G: int, U: torch.Tensor, hidden=256, gnn_layers=2, use_factor=False, a_dim=0, n_envs=1):
-        super().__init__()
-        self.U = nn.Parameter(U, requires_grad=False)  # freeze for v1
-        self.propagator = StatePropagator(z_dim, hidden=hidden, layers=gnn_layers)
-        self.med = MediatedHead(z_dim, F=U.size(1), hidden=hidden, use_factor_feats=use_factor, a_dim=a_dim)
-        self.dir = SparseDirectHead(z_dim, G=G, hidden=hidden)
-        self.step0 = StepZeroClamp(z_dim=z_dim, n_labs=n_envs, hidden=64, init_eff=0.9)
-
-    def forward(self, z, x0, env_codes, target_idx, a=None):
-        z_ref = self.propagator(z)
-        x_clamped, eff = self.step0(x0, z_ref, env_codes, target_idx)
-        m = self.med(z_ref, a)
-        dx_med = torch.matmul(m, self.U.T)
-        dx_dir = self.dir(z_ref)
-        x_pred = x_clamped + dx_med + dx_dir
-        return x_pred, {"eff": eff, "m": m, "dx_med": dx_med, "dx_dir": dx_dir, "x_clamped": x_clamped}
+def pick_dist(name: str):
+    name = (name or "swd").lower()
+    return {"swd": sliced_wasserstein, "sliced": sliced_wasserstein,
+            "mmd": mmd_rbf, "rbf": mmd_rbf,
+            "energy": energy_distance, "ed": energy_distance}.get(name, sliced_wasserstein)
 
 
-# ------------------ Main ------------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True, help="YAML config")
-    args = ap.parse_args()
-    cfg = yaml.safe_load(open(args.config))
-
+def train(cfg: Dict[str, Any]) -> None:
+    seed_everything(int(cfg.get("seed", 13)))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load index & splits
-    index_df = pd.read_parquet(cfg["paths"]["index_parquet"])
-    index_df = _resolve_index(index_df)
-    train_df = pd.read_parquet(cfg["paths"]["train_perturb"])
-    train_df = _resolve_index(train_df)
-    val_df   = pd.read_parquet(cfg["paths"]["val_perturb"])
-    val_df   = _resolve_index(val_df)
+    G = int(cfg["data"]["n_genes"])
+    F = int(cfg["model"]["mediated"]["F"])
+    z_dim = int(cfg["model"]["z_dim"])
 
-    # Only keep rows that exist in index
-    train_df = train_df.loc[train_df.index.intersection(index_df.index)]
-    val_df   = val_df.loc[val_df.index.intersection(index_df.index)]
+    datasets_cfg = cfg["paths"]["datasets"]
+    index_parquet = cfg["paths"]["index_parquet"]
+    df_index = read_parquet_indexed(index_parquet)
+    ds_ids = [d["id"] for d in datasets_cfg]
+    ds_id_to_code = {ds: i for i, ds in enumerate(ds_ids)}
+    n_envs = len(ds_ids)
 
-    # Load per-dataset z and concatenate only for rows we need (train+val)
-    needed_ids = train_df.index.union(val_df.index)
-    Zall = load_multi_z(cfg["paths"]["datasets"], needed_cell_ids=needed_ids)
+    decoder = PerDatasetDecoder(model_dir=cfg["paths"]["scvi_model_dir"],
+                                transform_batch=cfg["data"].get("transform_batch"))
 
-    # Get gene list from first dataset h5ad and assert compatibility
-    first_h5ad = cfg["paths"]["datasets"][0]["h5ad"]
-    A0 = ad.read_h5ad(first_h5ad, backed="r")
-    genes = A0.var_names.to_numpy()
-    # (Optional) check others match
-    for d in cfg["paths"]["datasets"][1:]:
-        Ai = ad.read_h5ad(d["h5ad"], backed="r")
-        if Ai.n_vars != len(genes) or not np.array_equal(Ai.var_names.to_numpy(), genes):
-            print(f"[warn] Gene list mismatch in dataset {d['id']}; ensure harmonized gene maps prior to training.")
-        del Ai
-    del A0
+    U = build_U(cfg["paths"]["factor_U"], device=device)   # (F, G)
+    U_t = U.t().contiguous()                               # (G, F)
 
-    # Wrap datasets (dataset-centric)
-    train = GraftDataset(train_df, Zall, meta=None, genes=genes, dataset_col="dataset_id")
-    val   = GraftDataset(val_df,   Zall, meta=None, genes=genes, dataset_col="dataset_id")
-    print(f"[info] Train rows: {train.n_cells} across {train.n_datasets} datasets")
-    print(f"[info] Val rows:   {val.n_cells} across {val.n_datasets} datasets")
-
-    # Sampler
-    ds_map = train.split_by_dataset()
-    if cfg["training"].get("interleave_global", False):
-        sampler = InterleavedGlobalSampler(ds_map, batch_size=cfg["training"]["batch_size"],
-                                           p_global=cfg["training"].get("p_global", 0.2),
-                                           seed=cfg["training"].get("seed", 13))
-    else:
-        sampler = DatasetBalancedSampler(ds_map, batch_size=cfg["training"]["batch_size"],
-                                         with_replacement_small=True,
-                                         seed=cfg["training"].get("seed", 13))
-
-    # Decoder & knn maps
-    decoder = PerDatasetDecoder(
-        scvi_model_dir=cfg["paths"]["scvi_model_dir"],
-        datasets_cfg=cfg["paths"]["datasets"],
-        transform_batch=cfg["model"].get("transform_batch", None),
-        forward_batch_size=cfg["training"].get("forward_batch_size", 4096),
-    )
-    knn_tables = load_knn_map(cfg["paths"]["datasets"])
-
-    # Model
-    U = load_U(cfg["paths"]["factor_U"]).to(device)
-    model = GraftCore(
-        z_dim=Zall.shape[1],
-        G=len(genes),
-        U=U,
-        hidden=cfg["model"]["hidden"],
-        gnn_layers=cfg["model"]["gnn_layers"],
-        use_factor=cfg["model"].get("use_factor_features", False),
-        a_dim=0,
-        n_envs=train.n_datasets,
+    prop = StatePropagator(
+        z_dim=z_dim,
+        hidden=int(cfg["model"]["propagator"].get("hidden", 256)),
+        layers=int(cfg["model"]["propagator"].get("layers", 2)),
+        steps=int(cfg["model"]["propagator"].get("steps", 2)),
+        dropout=float(cfg["model"]["propagator"].get("dropout", 0.0)),
+        use_env_film=bool(cfg["model"]["propagator"].get("use_env_film", True)),
+        use_target_cond=bool(cfg["model"]["propagator"].get("use_target_cond", True)),
+        target_embed_dim=int(cfg["model"]["propagator"].get("target_embed_dim", 32)),
+        n_envs=n_envs,
+        n_genes=G,
     ).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=cfg["training"]["lr"])
 
-    # Weights
-    w_dist = float(cfg["training"].get("dist_loss_weight", 1.0))
-    w_kd   = float(cfg["training"].get("kd_consistency_weight", 0.5))
-    w_rex  = float(cfg["training"].get("rex_weight", 0.1))
-    l1_direct = float(cfg["training"].get("l1_direct_weight", 0.0))
+    step0 = StepZeroClamp(
+        z_dim=z_dim,
+        n_labs=n_envs,
+        hidden=int(cfg["model"]["step0"].get("hidden", 64)),
+        init_eff=float(cfg["model"]["step0"].get("init_eff", 0.9)),
+        mode=str(cfg["model"]["step0"].get("mode", "down")),
+    ).to(device)
 
-    train_mode = cfg["training"].get("mode", "distribution")
-    steps_per_epoch = int(cfg["training"].get("steps_per_epoch", 200))
-    max_epochs = int(cfg["training"].get("max_epochs", 50))
+    head_med = MediatedHead(
+        z_dim=z_dim,
+        F=F,
+        hidden=int(cfg["model"]["mediated"].get("hidden", 256)),
+        use_factor_feats=bool(cfg["model"]["mediated"].get("use_factor_feats", False)),
+        a_dim=int(cfg["model"]["mediated"].get("a_dim", 0)),
+        nonneg=bool(cfg["model"]["mediated"].get("nonneg", True)),
+        dropout=float(cfg["model"]["mediated"].get("dropout", 0.0)),
+    ).to(device)
 
-    # Main loop
-    for epoch in range(1, max_epochs + 1):
-        model.train()
-        sampler.set_seed(epoch)
-        running = defaultdict(float)
+    head_dir = SparseDirectHead(
+        z_dim=z_dim,
+        G=G,
+        hidden=int(cfg["model"]["direct"].get("hidden", 256)),
+        dropout=float(cfg["model"]["direct"].get("dropout", 0.0)),
+        bound=None,
+    ).to(device)
 
-        for step, idx in zip(range(steps_per_epoch), sampler):
-            b = train.batch_dict(idx)
-            z_b = torch.from_numpy(b["z"]).to(device)
-            ds_codes = torch.from_numpy(b["dataset_codes"]).long().to(device)
-            tgt_idx = torch.from_numpy(b["target_idx"]).long().to(device)
-            ds_labels = train.datasets[idx]  # str labels aligned to idx
-            cell_ids = b["cell_ids"]         # str cell ids aligned to idx
+    opt = make_optimizer(
+        list(prop.parameters()) + list(step0.parameters()) + list(head_med.parameters()) + list(head_dir.parameters()),
+        cfg.get("optim", {})
+    )
 
-            # Build x0,y
-            if train_mode == "paired_controls":
-                # split per-dataset to decode in fewer calls
-                x0_list = []
-                y_list = []
-                order_mask = []
-                is_ctrl = train.is_control[idx]
-                pert_mask = ~is_ctrl
-                idx_arr = np.asarray(idx, dtype=int)
+    dist_fn = pick_dist(cfg["loss"]["distribution"].get("type", "swd"))
+    w_dist = float(cfg["loss"]["distribution"].get("weight", 1.0))
+    w_rex  = float(cfg["loss"]["rex"].get("weight", 0.1))
+    w_irm  = float(cfg["loss"]["irm"].get("weight", 0.0))
+    irm_target_only = bool(cfg["loss"]["irm"].get("use_target_only", True))
+    w_cons = float(cfg["loss"]["consistency"].get("weight", 0.5))
+    w_l1   = float(cfg["loss"]["direct"].get("l1", 1e-4))
+    w_orth = float(cfg["loss"]["direct"].get("orth_to_U", 0.0))
 
-                # For perturbed: match controls via knn (or random fallback)
-                pert_ids = cell_ids[pert_mask]
-                pert_ds  = ds_labels[pert_mask]
-                # Group by dataset for decoding
-                for ds in np.unique(pert_ds):
-                    m = (pert_ds == ds)
-                    matched_ctrl_ids = sample_matched_controls(ds, pert_ids[m], knn_tables, train.df)
-                    # decode matched controls (x0) and perturbed (y) for this subset
-                    x0_ds = decoder.get_xbar(ds, matched_ctrl_ids)
-                    y_ds  = decoder.get_xbar(ds, pert_ids[m])
-                    x0_list.append(x0_ds)
-                    y_list.append(y_ds)
-                    order_mask.append(("pert", ds, m))
+    parts = []
+    for ds in datasets_cfg:
+        z_df = read_parquet_indexed(ds["z_parquet"])
+        z_df["__dataset_id__"] = ds["id"]
+        parts.append(z_df)
+    Z = pd.concat(parts, axis=0, join="inner")
+    Z = Z.loc[Z.index.intersection(read_parquet_indexed(index_parquet).index)].copy()
 
-                # For controls: x0=y=control
-                ctrl_ids = cell_ids[is_ctrl]
-                ctrl_ds  = ds_labels[is_ctrl]
-                for ds in np.unique(ctrl_ds):
-                    m = (ctrl_ds == ds)
-                    xc = decoder.get_xbar(ds, ctrl_ids[m])
-                    x0_list.append(xc)
-                    y_list.append(xc)
-                    order_mask.append(("ctrl", ds, m))
+    train_mask = read_parquet_indexed(index_parquet).loc[Z.index].get("is_train", True).values if "is_train" in read_parquet_indexed(index_parquet).columns else np.ones(len(Z), dtype=bool)
+    Z_train = Z.loc[train_mask]
 
-                # Stitch into batch order
-                B, G = len(idx_arr), len(genes)
-                x0 = np.zeros((B, G), dtype=np.float32)
-                y  = np.zeros((B, G), dtype=np.float32)
-                cursor = 0
-                # Fill pert subsets first in same order as we appended
-                for kind, ds, m in order_mask:
-                    nrows = np.sum(m)
-                    block_x = x0_list[cursor]
-                    block_y = y_list[cursor]
-                    cursor += 1
-                    # place into correct positions within the full batch
-                    if kind == "pert":
-                        # places correspond to positions where pert_mask True and in this ds
-                        x0[pert_mask][m, :] = block_x
-                        y[pert_mask][m, :]  = block_y
-                    else:
-                        x0[is_ctrl][m, :] = block_x
-                        y[is_ctrl][m, :]  = block_y
+    batch_size = int(cfg.get("batch_size", 1024))
+    epochs = int(cfg.get("epochs", 10))
 
+    def df_to_tensor_batch(df_batch: pd.DataFrame) -> Dict[str, torch.Tensor]:
+        z_cols = [c for c in df_batch.columns if c.startswith("z")]
+        z = torch.tensor(df_batch[z_cols].values, dtype=torch.float32, device=device)
+        env = torch.tensor([ds_id_to_code[s] for s in df_batch["__dataset_id__"].values], dtype=torch.long, device=device)
+        idx_df = read_parquet_indexed(index_parquet).loc[df_batch.index]
+        tgt = torch.tensor(idx_df.get("target_gene_idx", pd.Series(-1, index=idx_df.index)).fillna(-1).astype(int).values, dtype=torch.long, device=device)
+        return {"z": z, "env": env, "target_idx": tgt, "cell_ids": df_batch.index.values}
+
+    def fetch_xbars(df_batch: pd.DataFrame) -> (torch.Tensor, torch.Tensor):
+        x0_list, yt_list = [], []
+        for ds in datasets_cfg:
+            msk = (df_batch["__dataset_id__"].values == ds["id"])
+            if not msk.any(): 
+                continue
+            cell_ids = df_batch.index.values[msk]
+            adata, model = decoder._get(ds["id"], ds["h5ad"])
+            pos = {k: i for i, k in enumerate(adata.obs_names.tolist())}
+            rows = np.array([pos[c] for c in cell_ids], dtype=int)
+            yt = decoder.xbar(ds["id"], ds["h5ad"], rows, device)
+            if "knn_parquet" in ds and ds["knn_parquet"] and os.path.exists(ds["knn_parquet"]):
+                knn = read_parquet_indexed(ds["knn_parquet"])
+                ctrl_ids = knn.loc[cell_ids, "ctrl_id"].values
+                rows0 = np.array([pos[c] for c in ctrl_ids], dtype=int)
+                x0 = decoder.xbar(ds["id"], ds["h5ad"], rows0, device)
             else:
-                # distribution mode: decode each dataset slice for the same cells
-                B = len(idx)
-                Gdim = len(genes)
-                x0 = np.zeros((B, Gdim), dtype=np.float32)
-                y  = np.zeros((B, Gdim), dtype=np.float32)
-                for ds in np.unique(ds_labels):
-                    m = (ds_labels == ds)
-                    ids_ds = cell_ids[m]
-                    X = decoder.get_xbar(ds, ids_ds)
-                    x0[m, :] = X
-                    y[m,  :] = X
+                x0 = yt.clone()
+            x0_list.append(x0); yt_list.append(yt)
+        return torch.cat(x0_list, 0), torch.cat(yt_list, 0)
 
-            x0_t = torch.from_numpy(x0).to(device)
-            y_t  = torch.from_numpy(y).to(device)
+    for epoch in range(1, epochs + 1):
+        prop.train(); step0.train(); head_med.train(); head_dir.train()
+        idx = np.arange(len(Z_train)); np.random.shuffle(idx)
+        n_steps = int(math.ceil(len(idx) / batch_size))
+        sums = dict(dist=0.0, rex=0.0, irm=0.0, cons=0.0, l1=0.0, orth=0.0)
 
-            # Forward
-            y_pred, aux = model(z_b, x0_t, ds_codes, tgt_idx)
+        for s in range(n_steps):
+            bs = idx[s*batch_size:(s+1)*batch_size]
+            df_b = Z_train.iloc[bs]
+            batch = df_to_tensor_batch(df_b)
 
-            # Per-dataset losses
-            per_ds_losses = []
-            for ds_int in torch.unique(ds_codes).tolist():
-                m = (ds_codes == ds_int)
-                if torch.count_nonzero(m) > 1:
-                    per_ds_losses.append(sliced_wasserstein(y_pred[m], y_t[m], n_proj=32))
-                else:
-                    per_ds_losses.append(torch.nn.functional.mse_loss(y_pred[m], y_t[m]))
-            L_dist = torch.stack(per_ds_losses).mean()
-            L_rex  = torch.stack(per_ds_losses).var(unbiased=False)
-            L_kd   = target_knockdown_consistency(y_pred, y_t, tgt_idx, weight=1.0)
-            L_l1   = l1_direct * torch.mean(torch.abs(aux["dx_dir"]))
+            x0, y_true = fetch_xbars(df_b)
+            z_ref = prop(batch["z"], target_idx=batch["target_idx"], env_codes=batch["env"])
+            x_clamp, eff = step0(x0, z_ref, batch["env"], batch["target_idx"])
+            m = head_med(z_ref); dx_med = m @ U_t
+            dx_dir = head_dir(z_ref)
+            y_pred = x_clamp + dx_med + dx_dir
 
-            L = w_dist * L_dist + w_kd * L_kd + w_rex * L_rex + L_l1
-            opt.zero_grad(set_to_none=True)
-            L.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            per_env = []
+            for ds in ds_ids:
+                msk = (df_b["__dataset_id__"].values == ds)
+                if not msk.any(): 
+                    continue
+                per_env.append(pick_dist(cfg["loss"]["distribution"]["type"])(y_pred[msk], y_true[msk]))
+
+            loss_dist = w_dist * (torch.stack(per_env).mean() if per_env else y_pred.new_tensor(0.0))
+            loss_rex  = w_rex  * (risk_extrapolation(per_env, unbiased=False) if len(per_env) > 1 else y_pred.new_tensor(0.0))
+            loss_irm  = w_irm  * irmv1_penalty(y_pred, y_true, batch["env"], use_target_only=irm_target_only, target_idx=batch["target_idx"]) if w_irm > 0 else y_pred.new_tensor(0.0)
+            loss_cons = w_cons * target_knockdown_consistency(y_pred, y_true, batch["target_idx"], mode="mse")
+            loss_l1   = w_l1   * dx_dir.abs().mean()
+            loss_orth = y_pred.new_tensor(0.0)
+            if w_orth > 0.0:
+                loss_orth = w_orth * ((dx_dir @ U) ** 2).mean()
+
+            loss = loss_dist + loss_rex + loss_irm + loss_cons + loss_l1 + loss_orth
+
+            optim_params = list(prop.parameters()) + list(step0.parameters()) + list(head_med.parameters()) + list(head_dir.parameters())
+            opt.zero_grad(set_to_none=True); loss.backward()
+            torch.nn.utils.clip_grad_norm_(optim_params, 5.0)
             opt.step()
 
-            running["loss"] += float(L)
-            running["dist"] += float(L_dist)
-            running["kd"]   += float(L_kd)
-            running["rex"]  += float(L_rex)
-            running["l1"]   += float(L_l1)
+            sums["dist"] += float(loss_dist.item())
+            sums["rex"]  += float(loss_rex.item())
+            sums["irm"]  += float(loss_irm.item())
+            sums["cons"] += float(loss_cons.item())
+            sums["l1"]   += float(loss_l1.item())
+            sums["orth"] += float(loss_orth.item())
 
-        steps = float(steps_per_epoch)
-        print(f"[epoch {epoch:03d}] loss={running['loss']/steps:.4f} "
-              f"(dist={running['dist']/steps:.4f}, kd={running['kd']/steps:.4f}, "
-              f"rex={running['rex']/steps:.4f}, l1={running['l1']/steps:.4f})")
+        denom = max(n_steps, 1)
+        print(f"[epoch {epoch:03d}] dist={sums['dist']/denom:.4f} rex={sums['rex']/denom:.4f} irm={sums['irm']/denom:.4f} cons={sums['cons']/denom:.4f} l1={sums['l1']/denom:.4f} orth={sums['orth']/denom:.4f}")
+    print("Training finished.")
 
-        # ---------- Validation (light) ----------
-        model.eval()
-        with torch.no_grad():
-            val_map = val.split_by_dataset()
-            val_sampler = DatasetBalancedSampler(val_map, batch_size=min(len(val.df), cfg['training']['batch_size']))
-            val_running = defaultdict(float)
-            for step, vidx in zip(range(min(steps_per_epoch//4, 50)), val_sampler):
-                b = val.batch_dict(vidx)
-                z_b = torch.from_numpy(b["z"]).to(device)
-                ds_codes = torch.from_numpy(b["dataset_codes"]).long().to(device)
-                tgt_idx = torch.from_numpy(b["target_idx"]).long().to(device)
-                ds_labels = val.datasets[vidx]
-                cell_ids = b["cell_ids"]
 
-                # decode per dataset
-                B = len(vidx); Gdim = len(genes)
-                x0 = np.zeros((B, Gdim), dtype=np.float32)
-                y  = np.zeros((B, Gdim), dtype=np.float32)
-                for ds in np.unique(ds_labels):
-                    m = (ds_labels == ds)
-                    ids_ds = cell_ids[m]
-                    X = decoder.get_xbar(ds, ids_ds)
-                    x0[m, :] = X
-                    y[m,  :] = X
-
-                x0_t = torch.from_numpy(x0).to(device)
-                y_t  = torch.from_numpy(y).to(device)
-
-                y_pred, _ = model(z_b, x0_t, ds_codes, tgt_idx)
-                per_ds_losses = []
-                for ds_int in torch.unique(ds_codes).tolist():
-                    m = (ds_codes == ds_int)
-                    if torch.count_nonzero(m) > 1:
-                        per_ds_losses.append(sliced_wasserstein(y_pred[m], y_t[m], n_proj=32))
-                    else:
-                        per_ds_losses.append(torch.nn.functional.mse_loss(y_pred[m], y_t[m]))
-                L_dist = torch.stack(per_ds_losses).mean()
-                L_kd = target_knockdown_consistency(y_pred, y_t, tgt_idx, weight=1.0)
-                L_rex = torch.stack(per_ds_losses).var(unbiased=False)
-                L = w_dist * L_dist + w_kd * L_kd + w_rex * L_rex
-
-                val_running["loss"] += float(L)
-                val_running["dist"] += float(L_dist)
-                val_running["kd"]   += float(L_kd)
-                val_running["rex"]  += float(L_rex)
-
-            denom = max(1.0, float(min(steps_per_epoch//4, 50)))
-            print(f"          val: loss={val_running['loss']/denom:.4f} "
-                  f"(dist={val_running['dist']/denom:.4f}, kd={val_running['kd']/denom:.4f}, "
-                  f"rex={val_running['rex']/denom:.4f})")
-
-    print("[DONE] Training finished.")
-    # Optional: save weights
-    # torch.save(model.state_dict(), cfg["paths"].get("gnn_ckpt", "artifacts/gnn_core.pt"))
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", type=str, default="configs/gnn_k562_v1.yaml")
+    args = ap.parse_args()
+    with open(args.config, "r") as f:
+        cfg = yaml.safe_load(f)
+    train(cfg)
 
 
 if __name__ == "__main__":

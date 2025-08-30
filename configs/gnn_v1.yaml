@@ -1,42 +1,68 @@
+seed: 13
+batch_size: 1024
+epochs: 10
 
-# Dataset-centric GRAFT GNN config (per-dataset shards)
 paths:
-  index_parquet: artifacts_v2/cell_index.parquet
-  scvi_model_dir: artifacts_v2/scvi_k562_controls/scvi_K562
+  scvi_model_dir: artifacts_v2/scvi_k562_mak200k_control_only/scvi_K562/
   factor_U: artifacts_v2/learned_factor_encoders/factor_W_K562.npy
-
-  # Per-dataset shards (repeat entries as needed)
+  index_parquet: artifacts_v2/scvi_k562_mak200k_control_only/scvi_z_K562_index.parquet
   datasets:
-    - id: K562_ReplogleWeissman
-      z_parquet: artifacts_v2/z_by_dataset/K562_ReplogleWeissman.parquet
-      h5ad: /data/K562_ReplogleWeissman.h5ad
-      knn_parquet: artifacts_v2/knn_by_dataset/K562_ReplogleWeissman.knn.parquet
+    - id: ReplogleWeissmanGWPS
+      z_parquet: artifacts_v2/ReplogleWeissmanGWPS/z_K562.parquet
+      h5ad: artifacts_v2/ReplogleWeissmanGWPS/adata_K562.h5ad
+      knn_parquet: artifacts_v2/ReplogleWeissmanGWPS/knn_controls.parquet
     - id: DixitRegev
-      z_parquet: artifacts_v2/z_by_dataset/DixitRegev.parquet
-      h5ad: /data/DixitRegev.h5ad
+      z_parquet: artifacts_v2/DixitRegev/z_K562.parquet
+      h5ad: artifacts_v2/DixitRegev/adata_K562.h5ad
+      knn_parquet: artifacts_v2/DixitRegev/knn_controls.parquet
 
-  # Train/val rows (subset of index_parquet)
-  train_perturb: artifacts_v2/perturb_train.parquet
-  val_perturb: artifacts_v2/perturb_val.parquet
+data:
+  n_genes: 6281
+  L_ref: 1.0e4
+  transform_batch: null
+  gene_names: []
 
 model:
-  n_programs: 256
-  hidden: 256
-  gnn_layers: 2
-  use_factor_features: false
-  transform_batch: null   # set to a reference batch ID if desired
+  z_dim: 32
+  propagator:
+    hidden: 256
+    layers: 2
+    steps: 2
+    dropout: 0.0
+    use_env_film: true
+    use_target_cond: true
+    target_embed_dim: 32
+  step0:
+    hidden: 64
+    init_eff: 0.9
+    mode: down
+  mediated:
+    F: 273
+    hidden: 256
+    use_factor_feats: false
+    a_dim: 0
+    nonneg: true
+    dropout: 0.0
+  direct:
+    hidden: 256
+    dropout: 0.0
 
-training:
-  mode: distribution      # "distribution" or "paired_controls"
-  batch_size: 2048
-  steps_per_epoch: 200
-  max_epochs: 50
-  lr: 1.0e-3
-  dist_loss_weight: 1.0
-  kd_consistency_weight: 0.5
-  rex_weight: 0.1
-  l1_direct_weight: 0.0
-  interleave_global: false
-  p_global: 0.2
-  seed: 13
-  forward_batch_size: 4096
+optim:
+  name: adamw
+  lr: 2.0e-4
+  weight_decay: 1.0e-4
+
+loss:
+  distribution:
+    type: swd     # swd | mmd | energy
+    weight: 1.0
+  rex:
+    weight: 0.1
+  irm:
+    weight: 0.0
+    use_target_only: true
+  consistency:
+    weight: 0.5
+  direct:
+    l1: 1.0e-4
+    orth_to_U: 0.0
