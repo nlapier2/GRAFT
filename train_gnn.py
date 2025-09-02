@@ -248,7 +248,7 @@ def train(cfg: Dict[str, Any]) -> None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=str, default="configs/gnn_k562_v1.yaml")
+    ap.add_argument("--config", type=str, default="configs/gnn_v1.yaml")
     args = ap.parse_args()
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
