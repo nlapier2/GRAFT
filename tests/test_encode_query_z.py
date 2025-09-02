@@ -28,6 +28,10 @@ def main():
     datasets = cfg["paths"]["datasets"]
     if not datasets:
         print("SKIP: no datasets in config"); return
+    
+    scvi_input_h5ad = Path(cfg["paths"].get("scvi_input_h5ad"))
+    if not scvi_input_h5ad or not scvi_input_h5ad.exists():
+        print("SKIP: scVI input h5ad missing:", scvi_input_h5ad); return
 
     h5ad = Path(datasets[0]["h5ad"])
     if not h5ad.exists():
@@ -44,6 +48,7 @@ def main():
 
     args = [sys.executable, str(script),
             "--scvi-model-dir", str(model_dir),
+            "--scvi-input-h5ad", str(scvi_input_h5ad),
             "--query-h5ad", str(h5ad),
             "--out-parquet", str(out_parquet),
             "--transform-batch", "None",

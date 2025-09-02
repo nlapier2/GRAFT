@@ -4,6 +4,7 @@ epochs: 10
 
 paths:
   scvi_model_dir: artifacts_v2/scvi_k562_max200k_control_only/scvi_K562/
+  scvi_input_h5ad: artifacts_v2/scvi_input_K562_max200k_controls.h5ad
   factor_U: artifacts_v2/learned_factor_encoders/factor_W_K562.npy
   index_parquet: artifacts_v2/scvi_k562_max200k_control_only/scvi_z_K562.npz #parquet
   datasets:
