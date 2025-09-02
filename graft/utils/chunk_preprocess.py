@@ -143,5 +143,7 @@ def preprocess_chunk(
     # 5) assemble output AnnData
     var = pd.DataFrame(index=pd.Index(gene_list, name=A.var_names.name))
     obs = pd.DataFrame(index=global_ids)  # keep minimal; downstream can join metadata as needed
+    if "tech_batch_id" not in obs.columns and dataset_id is not None and {"batch_id"}.issubset(obs.columns):
+        obs["tech_batch_id"] = (obs["dataset_id"].astype(str) + "_" + obs["batch_id"].astype(str)).astype("category")
     out = ad.AnnData(X=X_aligned, obs=obs, var=var)
     return out
