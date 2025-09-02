@@ -47,8 +47,9 @@ def main():
     args = [sys.executable, str(script),
             "--z-parquet", str(z_path),
             "--index-parquet", str(idx_path),
-            "--out", str(out_path),
-            "--k", "1"]
+            "--out-parquet", str(out_path),
+            "--k", "1",
+            "--max-perturbed", "1000",]
     print(">>", " ".join(args))
     proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     print(proc.stdout)

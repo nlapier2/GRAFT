@@ -7,14 +7,14 @@ paths:
   factor_U: artifacts_v2/learned_factor_encoders/factor_W_K562.npy
   index_parquet: artifacts_v2/scvi_k562_max200k_control_only/scvi_z_K562.npz #parquet
   datasets:
-    - id: ReplogleWeissmanGWPS
-      z_parquet: artifacts_v2/ReplogleWeissmanGWPS/z_K562.parquet
-      h5ad: artifacts_v2/ReplogleWeissmanGWPS/adata_K562.h5ad
-      knn_parquet: artifacts_v2/ReplogleWeissmanGWPS/knn_controls.parquet
     - id: DixitRegev
       z_parquet: artifacts_v2/DixitRegev/z_K562.parquet
-      h5ad: artifacts_v2/DixitRegev/adata_K562.h5ad
+      h5ad: /data/scperturb/DixitRegev2016.h5ad
       knn_parquet: artifacts_v2/DixitRegev/knn_controls.parquet
+    - id: ReplogleWeissmanGWPS
+      z_parquet: artifacts_v2/ReplogleWeissmanGWPS/z_K562.parquet
+      h5ad: /data/scperturb/ReplogleWeissman2022_K562_gwps.h5ad
+      knn_parquet: artifacts_v2/ReplogleWeissmanGWPS/knn_controls.parquet
 
 data:
   n_genes: 6281

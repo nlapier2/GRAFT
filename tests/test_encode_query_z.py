@@ -17,7 +17,7 @@ def main():
         print("SKIP: scvi-tools not importable:", e); return
 
     import yaml
-    cfg_path = _REPO_ROOT / "configs" / "gnn_k562_v1.yaml"
+    cfg_path = _REPO_ROOT / "configs" / "gnn_v1.yaml" 
     if not cfg_path.exists():
         print("SKIP: config not found:", cfg_path); return
     cfg = yaml.safe_load(cfg_path.read_text())
@@ -43,10 +43,11 @@ def main():
         print("SKIP: encode_query_z.py not found at", script); return
 
     args = [sys.executable, str(script),
-            "--model-dir", str(model_dir),
-            "--h5ad", str(h5ad),
-            "--out", str(out_parquet),
-            "--transform-batch", "None"]
+            "--scvi-model-dir", str(model_dir),
+            "--query-h5ad", str(h5ad),
+            "--out-parquet", str(out_parquet),
+            "--transform-batch", "None",
+            "--max-chunks", "1"]
     print(">>", " ".join(args))
     proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     print(proc.stdout)

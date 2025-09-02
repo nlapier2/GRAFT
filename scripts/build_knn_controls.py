@@ -120,6 +120,7 @@ def main():
     ap.add_argument("--k", type=int, default=32, help="Top-K neighbors to save")
     ap.add_argument("--metric", choices=["euclidean", "cosine"], default="euclidean")
     ap.add_argument("--chunk", type=int, default=20000, help="Query chunk size for distance blocks")
+    ap.add_argument("--max-perturbed", type=int, default=None, help="If set, limit to first N perturbed cells (fast path)")
     args = ap.parse_args()
 
     # Load index and filter to this dataset
@@ -145,6 +146,9 @@ def main():
     cell_ids = idx_ds.index.to_numpy()
     ctrl_ids = cell_ids[is_ctrl]
     pert_ids = cell_ids[~is_ctrl]
+    # Fast-path: optionally limit the number of perturbed cells processed
+    if args.max_perturbed is not None and len(pert_ids) > args.max_perturbed:
+        pert_ids = pert_ids[: args.max_perturbed]
     if len(ctrl_ids) == 0:
         raise ValueError("This dataset has zero controls; cannot build control neighbor index.")
     if len(pert_ids) == 0:

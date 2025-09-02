@@ -35,7 +35,7 @@ def test_parquet_roundtrip(tmp_path: Path = None):
 
 def test_encode_categories():
     labels = ["A","B","A","C","B","A"]
-    codes, mapping = encode_categories(labels)
+    codes, mapping, inv_orig = encode_categories(labels)
     # codes should be ints 0..k-1
     assert codes.dtype.kind in "iu"
     assert set(mapping.keys()) == {"A","B","C"}

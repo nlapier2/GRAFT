@@ -2,41 +2,37 @@
 """
 encode_query_z.py
 -----------------
-Map a *single* dataset's AnnData (.h5ad) into a control-trained scVI model to produce
-per-cell latents `z` (and optionally normalized means x̄) in the *same* space as controls.
+Encode a single dataset's AnnData (.h5ad) into a control-trained scVI model to produce
+per-cell latents `z` (and optionally normalized means x̄) in the same space as controls.
 
-You run this once per dataset shard. The outputs (parquet files) can then be
-consumed by the GRAFT trainer, without ever concatenating all cells into one AnnData.
+Key features in this version:
+- Opens the query AnnData in **backed='r'** mode and materializes **only the current chunk**.
+- Optional `--max-chunks` to process just the first N chunks (useful for quick tests).
+- Keeps memory usage low and avoids loading huge H5ADs at once.
 
-Typical usage:
-  python scripts/encode_query_z.py     --scvi-model-dir artifacts_v2/scvi_k562_controls/scvi_K562     --query-h5ad /data/K562_ReplogleWeissman_perturb.h5ad     --out-parquet artifacts_v2/z_by_dataset/K562_ReplogleWeissman.parquet     --cell-id-key cell_id     --forward-batch-size 4096     --chunk-size 20000     --ensure-obs-cols tech_batch_id=ref     --save-xbar false
-
-Notes
------
-- We do not require that the query AnnData contains the *same* batch covariates as
-  the training controls. If the scVI registry expects a key (e.g., 'tech_batch_id'),
-  add it here via --ensure-obs-cols to avoid KeyErrors. A single default category is fine.
-- For x̄ (normalized means), set --save-xbar true and optionally --transform-batch
-  to decode under a reference batch (recommended for invariance).
+Usage:
+  python scripts/encode_query_z.py     --scvi-model-dir artifacts_v2/scvi_k562_controls/scvi_K562     --query-h5ad /data/dataset.h5ad     --out-parquet artifacts_v2/MyDataset/z.parquet     --cell-id-key cell_id     --forward-batch-size 4096     --chunk-size 20000     --ensure-obs-cols tech_batch_id=ref     --save-xbar false     --transform-batch None     --max-chunks 1
 """
-
 from __future__ import annotations
+
 import argparse
+import gc
+import os
+from typing import Dict, List, Optional
+
+import anndata as ad
 import numpy as np
 import pandas as pd
-import anndata as ad
-import os, sys, gc
-from typing import Dict, Optional, List
-
+import scipy.sparse as sp
 import scvi
 
 
 def parse_kv_list(items: List[str]) -> Dict[str, str]:
     out = {}
     for it in items or []:
-        if '=' not in it:
+        if "=" not in it:
             raise argparse.ArgumentError(None, f"--ensure-obs-cols expects key=value, got '{it}'")
-        k, v = it.split('=', 1)
+        k, v = it.split("=", 1)
         out[k] = v
     return out
 
@@ -45,6 +41,28 @@ def add_missing_obs_cols(adata: ad.AnnData, required: Dict[str, str]) -> None:
     for k, v in (required or {}).items():
         if k not in adata.obs.columns:
             adata.obs[k] = v
+
+
+def to_memory_chunk(A_backed: ad.AnnData, idx_slice: slice) -> ad.AnnData:
+    """Materialize a backed AnnData slice into memory.
+
+    Uses .to_memory() when available; otherwise constructs a fresh AnnData.
+    """
+    Aview = A_backed[idx_slice]
+    if hasattr(Aview, "to_memory"):
+        return Aview.to_memory()
+
+    X = A_backed.X[idx_slice, :]
+    if sp.issparse(X):
+        X = X.tocsr().copy()
+    else:
+        X = np.array(X, copy=True)
+    obs = A_backed.obs.iloc[range(*idx_slice.indices(A_backed.n_obs))].copy()
+    var = A_backed.var.copy()
+    out = ad.AnnData(X=X, obs=obs, var=var)
+    out.obs_names = Aview.obs_names.copy()
+    out.var_names = Aview.var_names.copy()
+    return out
 
 
 def main():
@@ -56,39 +74,62 @@ def main():
     ap.add_argument("--filter-obs-query", default=None, help="Optional pandas query string to subset obs before encoding")
     ap.add_argument("--forward-batch-size", type=int, default=4096, help="scVI forward batch size")
     ap.add_argument("--chunk-size", type=int, default=20000, help="Process query AnnData in chunks of this many rows")
-    ap.add_argument("--ensure-obs-cols", nargs='*', default=[], help="List of key=value obs columns to inject if missing (e.g., tech_batch_id=ref)")
+    ap.add_argument("--max-chunks", type=int, default=None, help="If set, process only the first N chunks (for quick tests)")
+    ap.add_argument("--ensure-obs-cols", nargs="*", default=[], help="List of key=value obs columns to inject if missing (e.g., tech_batch_id=ref)")
     ap.add_argument("--save-xbar", type=str, default="false", help="Also save normalized means x̄ alongside z (true/false)")
     ap.add_argument("--transform-batch", default=None, help="If saving x̄, decode under this reference batch/category")
     args = ap.parse_args()
 
-    save_xbar = str(args.save_xbar).lower() in ("1","true","yes","y")
+    save_xbar = str(args.save_xbar).lower() in ("1", "true", "yes", "y")
 
-    # Load base model (trained on controls)
-    model = scvi.model.SCVI.load(args.scvi_model_dir, adata=None)  # we'll attach query adata per-chunk
+    # Load base model (trained on controls). We'll attach per-chunk query data.
 
-    # Open query AnnData (can be big; we slice into chunks)
-    A = ad.read_h5ad(args.query_h5ad)
+    # Open query AnnData in backed mode
+    A = ad.read_h5ad(args.query_h5ad, backed="r")
+
+    # Build integer positions to process (optionally filtered by obs query)
     if args.filter_obs_query:
-        A = A[A.obs.query(args.filter_obs_query).index].copy()
-
-    # Prepare output accumulators
-    z_frames: List[pd.DataFrame] = []
-    xbar_frames: List[pd.DataFrame] = []
+        sel_idx = A.obs.query(args.filter_obs_query).index
+        name_to_pos = {name: i for i, name in enumerate(A.obs_names)}
+        pos = np.array([name_to_pos[n] for n in sel_idx], dtype=np.int64)
+    else:
+        pos = np.arange(A.n_obs, dtype=np.int64)
 
     ensure = parse_kv_list(args.ensure_obs_cols)
 
-    # Process in chunks to keep memory in check
-    N = A.shape[0]
+    # Prepare accumulators
+    z_frames: List[pd.DataFrame] = []
+    xbar_frames: List[pd.DataFrame] = []
+
+    # Process in chunks (materialize only the current slice)
     bs = int(args.chunk_size)
-    for start in range(0, N, bs):
-        stop = min(start + bs, N)
-        sl = slice(start, stop)
-        Aq = A[sl].copy()
-        # Inject missing obs cols if needed
+    chunk_count = 0
+    for start in range(0, len(pos), bs):
+        stop = min(start + bs, len(pos))
+        rows = pos[start:stop]
+
+        # Build runs of consecutive indices to reduce slicing calls
+        groups = []
+        run_start = rows[0]
+        prev = rows[0]
+        for r in rows[1:]:
+            if r == prev + 1:
+                prev = r
+            else:
+                groups.append(slice(run_start, prev + 1))
+                run_start = r
+                prev = r
+        groups.append(slice(run_start, prev + 1))
+
+        # Concatenate in-memory chunks
+        chunks = [to_memory_chunk(A, g) for g in groups]
+        Aq = chunks[0].concatenate(*chunks[1:], join="outer", index_unique=None) if len(chunks) > 1 else chunks[0]
+
+        # Inject missing obs cols if required by the model registry
         add_missing_obs_cols(Aq, ensure)
 
-        # Attach query data to model
-        qmodel = model.load_query_data(Aq, inplace=False)
+        # Attach query data and run scVI
+        qmodel = scvi.model.SCVI.load_query_data(Aq, args.scvi_model_dir, inplace_subset_query_vars=True)
 
         # Latents
         z = qmodel.get_latent_representation(batch_size=args.forward_batch_size)
@@ -98,8 +139,8 @@ def main():
 
         # Optional normalized means (decoded under a reference batch)
         if save_xbar:
-            xbar = qmodel.get_normalized_expression(transform_batch=args.transform_batch, batch_size=args.forward_batch_size)
-            # scvi may return ndarray or DataFrame
+            xbar = qmodel.get_normalized_expression(transform_batch=(None if args.transform_batch in [None, "None"] else args.transform_batch),
+                                                    batch_size=args.forward_batch_size)
             if isinstance(xbar, np.ndarray):
                 xbar_df = pd.DataFrame(xbar, index=ids, columns=Aq.var_names)
             else:
@@ -111,6 +152,11 @@ def main():
         del qmodel, Aq, z
         gc.collect()
 
+        chunk_count += 1
+        if args.max_chunks is not None and chunk_count >= int(args.max_chunks):
+            print(f"[note] Reached --max-chunks={args.max_chunks}; stopping early for quick test.")
+            break
+
     # Concatenate and write z
     Z = pd.concat(z_frames, axis=0)
     Z = Z.loc[~Z.index.duplicated(keep="first")]
@@ -119,7 +165,7 @@ def main():
     print(f"[ok] wrote z parquet: {args.out_parquet}  (rows={len(Z)}, dim={Z.shape[1]})")
 
     # Optional: write x̄ in a sibling file
-    if save_xbar:
+    if save_xbar and xbar_frames:
         X = pd.concat(xbar_frames, axis=0)
         X = X.loc[Z.index]  # align to kept z
         out_x = os.path.splitext(args.out_parquet)[0] + ".xbar.parquet"
