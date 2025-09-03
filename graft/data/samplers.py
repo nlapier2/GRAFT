@@ -1,181 +1,181 @@
+# graft/data/samplers.py
+# Lightweight "dataset chooser" utilities for the streamed pipeline.
+# These yield dataset_ids (environments) in the desired order/policy.
 from __future__ import annotations
-from typing import Dict, Iterable, Iterator, List, Optional
+
+from dataclasses import dataclass
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence
+
 import numpy as np
+import pandas as pd
+import random
 
 
-def _as_int_array(x) -> np.ndarray:
-    arr = np.asarray(x)
-    if arr.dtype != np.int64 and arr.dtype != np.int32:
-        arr = arr.astype(np.int64, copy=False)
-    return arr
+# ------------------------------ helper: weights ------------------------------ #
+
+def normalize_weights(w: Dict[str, float]) -> Dict[str, float]:
+    total = float(sum(max(0.0, v) for v in w.values()))
+    if total <= 0.0:
+        # fall back to uniform
+        n = len(w)
+        return {k: 1.0 / n for k in w}
+    return {k: max(0.0, v) / total for k, v in w.items()}
 
 
-class DatasetBalancedSampler:
+def derive_weights_from_sizes(
+    sizes: Dict[str, int],
+    mode: str = "sqrt",
+    floor: float = 1e-6,
+) -> Dict[str, float]:
     """
-    Uniformly picks a dataset (environment), then samples a mini-batch of rows
-    from that dataset's index pool.
+    Turn per-dataset sizes into sampling weights.
 
-    Use this when you want equal influence per dataset in the objective—even if
-    some datasets have many more cells.
-
-    Parameters
-    ----------
-    dataset_to_idx : Dict[str, np.ndarray]
-        Mapping from dataset_id -> 1D array of row indices (into your GraftDataset).
-        You can get this from `GraftDataset.split_by_dataset()`.
-    batch_size : int
-        Number of rows per batch.
-    with_replacement_small : bool
-        If a dataset has < batch_size rows, sample with replacement from that pool.
-    seed : int
-        RNG seed for reproducibility.
+    mode:
+      - "uniform" -> equal probability for all datasets
+      - "count"   -> proportional to size
+      - "sqrt"    -> proportional to sqrt(size) (less dominance by huge datasets)
     """
+    if not sizes:
+        return {}
+    if mode == "uniform":
+        return {k: 1.0 for k in sizes}
+    if mode == "count":
+        return {k: float(max(0, int(v))) for k, v in sizes.items()}
+    if mode == "sqrt":
+        return {k: float(np.sqrt(max(0, int(v))) + floor) for k, v in sizes.items()}
+    raise ValueError(f"Unknown mode: {mode}")
 
-    def __init__(
-        self,
-        dataset_to_idx: Dict[str, np.ndarray],
-        batch_size: int,
-        with_replacement_small: bool = True,
-        seed: int = 13,
-    ):
-        pools = {k: _as_int_array(v) for k, v in dataset_to_idx.items() if len(v) > 0}
-        if not pools:
-            raise ValueError("No non-empty dataset pools provided.")
-        self.pools: Dict[str, np.ndarray] = pools
-        self.datasets: List[str] = list(pools.keys())
-        self.batch_size = int(batch_size)
-        self.with_replacement_small = bool(with_replacement_small)
-        self.rng = np.random.default_rng(seed)
 
-    def __iter__(self) -> Iterator[np.ndarray]:
-        """
-        Infinite generator of index batches (np.ndarray[int] of length batch_size).
-        """
-        while True:
-            ds = self.rng.choice(self.datasets)
-            pool = self.pools[ds]
-            if (len(pool) >= self.batch_size) or (not self.with_replacement_small):
-                replace = len(pool) < self.batch_size
+# -------------------------- policies: dataset chooser ------------------------ #
+
+@dataclass
+class BalancedRoundRobin:
+    """
+    Cycles through dataset_ids in a stable, balanced order.
+    Optionally shuffles order per epoch.
+    """
+    dataset_ids: Sequence[str]
+    steps: Optional[int] = None      # total number of ids to emit; None -> infinite
+    shuffle_each_epoch: bool = False
+    seed: int = 123
+
+    def __iter__(self) -> Iterator[str]:
+        rng = random.Random(self.seed)
+        ids = list(self.dataset_ids)
+        if not ids:
+            return
+        produced = 0
+        while self.steps is None or produced < self.steps:
+            if self.shuffle_each_epoch:
+                rng.shuffle(ids)
+            for dsid in ids:
+                yield dsid
+                produced += 1
+                if self.steps is not None and produced >= self.steps:
+                    break
+
+
+@dataclass
+class WeightedDatasetSampler:
+    """
+    Samples dataset_ids i.i.d. from a probability distribution.
+    Useful when you want to dampen dominance of large datasets (e.g., sqrt-size).
+    """
+    dataset_ids: Sequence[str]
+    weights: Optional[Dict[str, float]] = None  # dict[dsid] -> weight
+    steps: Optional[int] = None                 # total number of ids to emit; None -> infinite
+    seed: int = 123
+
+    def __iter__(self) -> Iterator[str]:
+        if not self.dataset_ids:
+            return
+        rng = np.random.default_rng(self.seed)
+        ids = np.array(self.dataset_ids, dtype=object)
+        if self.weights is None:
+            p = np.ones(len(ids), dtype=np.float64) / len(ids)
+        else:
+            w = np.array([float(self.weights.get(d, 0.0)) for d in ids], dtype=np.float64)
+            if (w <= 0).all():
+                w = np.ones_like(w) / len(w)
             else:
-                replace = True
-            yield self.rng.choice(pool, size=self.batch_size, replace=replace)
-
-    def set_seed(self, seed: int) -> None:
-        """Reset RNG seed (useful for epoch-to-epoch shuffling)."""
-        self.rng = np.random.default_rng(int(seed))
-
-
-class DatasetWeightedSampler:
-    """
-    Like DatasetBalancedSampler, but lets you specify a **probability weight**
-    per dataset when picking which dataset supplies the next batch.
-
-    Use cases
-    ---------
-    - Slightly downweight massive datasets without making them rare.
-    - Curriculum schedules (e.g., start balanced, then anneal toward empirical).
-
-    Parameters
-    ----------
-    dataset_to_idx : Dict[str, np.ndarray]
-        Mapping dataset_id -> index pool.
-    weights : Dict[str, float]
-        Non-negative weights per dataset. They will be normalized internally.
-        Datasets missing from this dict default to weight=0 (excluded).
-    batch_size : int
-        Rows per batch.
-    seed : int
-        RNG seed.
-    """
-
-    def __init__(
-        self,
-        dataset_to_idx: Dict[str, np.ndarray],
-        weights: Dict[str, float],
-        batch_size: int,
-        seed: int = 13,
-    ):
-        pools = {k: _as_int_array(v) for k, v in dataset_to_idx.items() if len(v) > 0}
-        if not pools:
-            raise ValueError("No non-empty dataset pools provided.")
-        # Keep only datasets with positive weight
-        w = {k: float(weights.get(k, 0.0)) for k in pools.keys()}
-        w = {k: v for k, v in w.items() if v > 0}
-        if not w:
-            raise ValueError("All dataset weights are zero or missing.")
-        total = sum(w.values())
-        self.probs = np.array([w[k] / total for k in w.keys()], dtype=np.float64)
-        self.datasets: List[str] = list(w.keys())
-        self.pools = {k: pools[k] for k in self.datasets}
-        self.batch_size = int(batch_size)
-        self.rng = np.random.default_rng(seed)
-
-    def __iter__(self) -> Iterator[np.ndarray]:
-        while True:
-            i = self.rng.choice(len(self.datasets), p=self.probs)
-            ds = self.datasets[i]
-            pool = self.pools[ds]
-            replace = len(pool) < self.batch_size
-            yield self.rng.choice(pool, size=self.batch_size, replace=replace)
-
-    def set_seed(self, seed: int) -> None:
-        self.rng = np.random.default_rng(int(seed))
+                w = w / w.sum()
+            p = w
+        produced = 0
+        while self.steps is None or produced < self.steps:
+            # draw in vectorized chunks for speed
+            chunk = min(1024, (self.steps - produced) if self.steps is not None else 1024)
+            idx = rng.choice(len(ids), size=chunk, replace=True, p=p)
+            for j in idx:
+                yield str(ids[j])
+                produced += 1
+                if self.steps is not None and produced >= self.steps:
+                    break
 
 
+@dataclass
 class InterleavedGlobalSampler:
     """
-    Interleave **dataset-balanced** batches with occasional **global** batches.
-
-    Motivation
-    ----------
-    - Balanced batches keep the objective from being dominated by big datasets.
-    - Global batches let the optimizer see more cross-dataset variability and
-      speed up convergence (especially when some datasets are tiny).
-
-    Parameters
-    ----------
-    dataset_to_idx : Dict[str, np.ndarray]
-        Mapping dataset_id -> index pool.
-    batch_size : int
-        Rows per batch.
-    p_global : float in [0,1]
-        Probability that a drawn batch is a global batch (from all rows).
-        e.g., p_global=0.2 means ~1 in 5 batches uses the full pool.
-    seed : int
-        RNG seed.
+    Wrap another chooser and interleave periodic 'global' steps (e.g., for global invariance penalties).
+    Emits strings that are either a dataset_id or the sentinel '__GLOBAL__'.
     """
+    base: Iterable[str]
+    every: int = 8  # insert a global step after every `every` dataset-specific steps
 
-    def __init__(
-        self,
-        dataset_to_idx: Dict[str, np.ndarray],
-        batch_size: int,
-        p_global: float = 0.2,
-        seed: int = 13,
-    ):
-        if not (0.0 <= p_global <= 1.0):
-            raise ValueError("p_global must be in [0, 1].")
-        pools = {k: _as_int_array(v) for k, v in dataset_to_idx.items() if len(v) > 0}
-        if not pools:
-            raise ValueError("No non-empty dataset pools provided.")
-        self.pools = pools
-        self.datasets = list(pools.keys())
-        self.all_idx = np.concatenate(list(pools.values()), axis=0)
-        self.batch_size = int(batch_size)
-        self.p_global = float(p_global)
-        self.rng = np.random.default_rng(seed)
+    def __iter__(self) -> Iterator[str]:
+        c = 0
+        for dsid in self.base:
+            yield dsid
+            c += 1
+            if self.every > 0 and (c % self.every == 0):
+                yield "__GLOBAL__"
 
-    def __iter__(self) -> Iterator[np.ndarray]:
-        while True:
-            if self.rng.random() < self.p_global:
-                # Global batch
-                replace = len(self.all_idx) < self.batch_size
-                yield self.rng.choice(self.all_idx, size=self.batch_size, replace=replace)
-            else:
-                # Dataset-balanced batch
-                ds = self.rng.choice(self.datasets)
-                pool = self.pools[ds]
-                replace = len(pool) < self.batch_size
-                yield self.rng.choice(pool, size=self.batch_size, replace=replace)
 
-    def set_seed(self, seed: int) -> None:
-        self.rng = np.random.default_rng(int(seed))
+# ------------------------------- factory helpers ----------------------------- #
+
+def make_dataset_chooser(
+    dataset_ids: Sequence[str],
+    sizes: Optional[Dict[str, int]] = None,
+    policy: str = "balanced",            # "balanced" | "weighted"
+    weight_mode: str = "sqrt",           # for weighted: "uniform" | "count" | "sqrt"
+    steps: Optional[int] = None,
+    shuffle_each_epoch: bool = False,
+    seed: int = 123,
+):
+    """
+    Build a chooser iterator over dataset_ids.
+
+    Typical usage in train loop:
+        chooser = make_dataset_chooser(ds.get_dataset_ids(), sizes=ds_sizes, policy="weighted", weight_mode="sqrt", steps=total_steps)
+        for key in chooser:
+            if key == "__GLOBAL__":
+                # run any global step
+                continue
+            for batch in ds.iter_batches([key]):
+                train_step(batch)   # your trainer consumes one mini-batch
+                break               # consume exactly one batch per dataset step
+    """
+    if policy == "balanced":
+        return BalancedRoundRobin(dataset_ids=dataset_ids, steps=steps, shuffle_each_epoch=shuffle_each_epoch, seed=seed)
+    elif policy == "weighted":
+        if sizes is None:
+            weights = {dsid: 1.0 for dsid in dataset_ids}
+        else:
+            weights = derive_weights_from_sizes(sizes, mode=weight_mode)
+        weights = normalize_weights(weights)
+        return WeightedDatasetSampler(dataset_ids=dataset_ids, weights=weights, steps=steps, seed=seed)
+    else:
+        raise ValueError(f"Unknown policy: {policy}")
+
+
+def estimate_dataset_sizes(by_ds: Dict[str, "pd.DataFrame"]) -> Dict[str, int]:
+    """
+    Convenience helper to compute per-dataset sizes from the streaming dataset's internal tables.
+    (We keep the import optional to avoid a hard pandas dependency here.)
+    """
+    sizes: Dict[str, int] = {}
+    for dsid, df in by_ds.items():
+        try:
+            sizes[dsid] = int(getattr(df, "shape", [0])[0])
+        except Exception:
+            sizes[dsid] = 0
+    return sizes
