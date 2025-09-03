@@ -1,259 +1,323 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-import argparse, os, math
-from typing import Dict, Any, Optional, List
+"""
+train_gnn.py (streaming)
+========================
 
-import yaml
+Trainer wired to the new streaming data pipeline:
+
+- Streams raw H5AD per-dataset in backed mode via GraftStreamingDataset
+- Computes scVI z and normalized x̄ on the fly per mini-batch
+- Matches controls via a prebuilt ANN index over control z
+- Feeds batches into the gated-MLP "GNN-ish" core model
+- Optimizes a simple consistency loss by default, with hooks for invariance / distribution
+
+Config YAML (example):
+----------------------
+paths:
+  datasets_yaml: artifacts/datasets.yaml
+  index_parquet: artifacts/cell_index.parquet
+  gene_list_tsv: artifacts/gene_list.tsv
+  scvi_model_dir: artifacts/scvi_K562
+  control_index_dir: artifacts/control_index
+  control_z_npz: artifacts/scvi_z_controls.npz
+  output_dir: artifacts/gnn_runs/run1
+
+training:
+  epochs: 5
+  steps_per_epoch: 2000
+  batch_size: 2048
+  chunk_size: 50000
+  lr: 1.0e-3
+  weight_decay: 0.0
+  sampler_policy: "weighted"       # "balanced" | "weighted"
+  sampler_weight_mode: "sqrt"      # "uniform" | "count" | "sqrt"
+  seed: 1337
+  log_every: 50
+  ckpt_every: 500
+
+loss:
+  w_consistency: 1.0
+  w_invariance: 0.0
+  w_distribution: 0.0
+  distribution: "energy"           # "energy" | "swd"
+
+model:
+  dim_z: 32                        # inferred at runtime if None
+  hidden: 256
+  depth: 2
+  dropout: 0.0
+
+Notes:
+- Invariance and distribution losses are optional; start with consistency for smoke tests.
+- The dataset enforces environment = dataset_id. The sampler picks which dataset to draw next.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any, Dict
+
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import yaml
 
-from graft.models.gnn_core import StatePropagator
-from graft.models.step0 import StepZeroClamp
-from graft.models.heads import MediatedHead, SparseDirectHead
+from graft.data.dataset import GraftStreamingConfig, GraftStreamingDataset
+from graft.data.samplers import make_dataset_chooser, estimate_dataset_sizes
 
-from graft.losses.distribution import sliced_wasserstein, mmd_rbf, energy_distance
-from graft.losses.consistency import target_knockdown_consistency
-from graft.losses.invariance import risk_extrapolation, irmv1_penalty
-
-from graft.utils.common import read_parquet_indexed, encode_categories, seed_everything
+# Optional losses (graceful fallback if modules are absent)
+try:
+    from graft.losses.distribution import energy_distance, sliced_wasserstein_distance
+except Exception:
+    energy_distance = None
+    sliced_wasserstein_distance = None
 
 try:
-    import anndata as ad
-    import scvi
+    from graft.losses.invariance import rex_penalty, irm_penalty
 except Exception:
-    scvi = None
-    ad = None
+    rex_penalty = None
+    irm_penalty = None
+
+# Core model
+try:
+    from graft.models.gnn_core import GraftCore
+except Exception:
+    GraftCore = None
 
 
-class PerDatasetDecoder:
-    def __init__(self, model_dir: str, transform_batch: Optional[str] = None):
-        if scvi is None:
-            raise RuntimeError("scvi/anndata not available.")
-        self.model_dir = model_dir
-        self.transform_batch = transform_batch
-        self.cache: Dict[str, tuple] = {}
-
-    def _get(self, dataset_id: str, h5ad_path: str):
-        key = str(dataset_id)
-        if key in self.cache:
-            return self.cache[key]
-        adata = ad.read_h5ad(h5ad_path)
-        model = scvi.model.SCVI.load(self.model_dir, adata=None).load_query_data(adata)
-        model.eval()
-        self.cache[key] = (adata, model)
-        return self.cache[key]
-
-    @torch.no_grad()
-    def xbar(self, dataset_id: str, h5ad_path: str, row_idx: np.ndarray, device: torch.device) -> torch.Tensor:
-        adata, model = self._get(dataset_id, h5ad_path)
-        xbar = model.get_normalized_expression(adata[row_idx], transform_batch=self.transform_batch)
-        return torch.tensor(xbar.values, dtype=torch.float32, device=device)
+def set_seed(seed: int = 1337):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
-def build_U(path: str, device: torch.device) -> torch.Tensor:
-    arr = np.load(path, allow_pickle=False)
-    return torch.tensor(arr, dtype=torch.float32, device=device)
-
-
-def make_optimizer(params, cfg: Dict[str, Any]):
-    name = cfg.get("name", "adamw").lower()
-    lr = float(cfg.get("lr", 2e-4))
-    wd = float(cfg.get("weight_decay", 1e-4))
-    if name == "adamw":
-        return optim.AdamW(params, lr=lr, weight_decay=wd, betas=(0.9, 0.999))
-    if name == "adam":
-        return optim.Adam(params, lr=lr, weight_decay=wd, betas=(0.9, 0.999))
-    raise ValueError(f"Unknown optimizer {name}")
-
-
-def pick_dist(name: str):
-    name = (name or "swd").lower()
-    return {"swd": sliced_wasserstein, "sliced": sliced_wasserstein,
-            "mmd": mmd_rbf, "rbf": mmd_rbf,
-            "energy": energy_distance, "ed": energy_distance}.get(name, sliced_wasserstein)
-
-
-def train(cfg: Dict[str, Any]) -> None:
-    seed_everything(int(cfg.get("seed", 13)))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    G = int(cfg["data"]["n_genes"])
-    F = int(cfg["model"]["mediated"]["F"])
-    z_dim = int(cfg["model"]["z_dim"])
-
-    datasets_cfg = cfg["paths"]["datasets"]
-    index_parquet = cfg["paths"]["index_parquet"]
-    df_index = read_parquet_indexed(index_parquet)
-    ds_ids = [d["id"] for d in datasets_cfg]
-    ds_id_to_code = {ds: i for i, ds in enumerate(ds_ids)}
-    n_envs = len(ds_ids)
-
-    decoder = PerDatasetDecoder(model_dir=cfg["paths"]["scvi_model_dir"],
-                                transform_batch=cfg["data"].get("transform_batch"))
-
-    U = build_U(cfg["paths"]["factor_U"], device=device)   # (F, G)
-    U_t = U.t().contiguous()                               # (G, F)
-
-    prop = StatePropagator(
-        z_dim=z_dim,
-        hidden=int(cfg["model"]["propagator"].get("hidden", 256)),
-        layers=int(cfg["model"]["propagator"].get("layers", 2)),
-        steps=int(cfg["model"]["propagator"].get("steps", 2)),
-        dropout=float(cfg["model"]["propagator"].get("dropout", 0.0)),
-        use_env_film=bool(cfg["model"]["propagator"].get("use_env_film", True)),
-        use_target_cond=bool(cfg["model"]["propagator"].get("use_target_cond", True)),
-        target_embed_dim=int(cfg["model"]["propagator"].get("target_embed_dim", 32)),
-        n_envs=n_envs,
-        n_genes=G,
-    ).to(device)
-
-    step0 = StepZeroClamp(
-        z_dim=z_dim,
-        n_labs=n_envs,
-        hidden=int(cfg["model"]["step0"].get("hidden", 64)),
-        init_eff=float(cfg["model"]["step0"].get("init_eff", 0.9)),
-        mode=str(cfg["model"]["step0"].get("mode", "down")),
-    ).to(device)
-
-    head_med = MediatedHead(
-        z_dim=z_dim,
-        F=F,
-        hidden=int(cfg["model"]["mediated"].get("hidden", 256)),
-        use_factor_feats=bool(cfg["model"]["mediated"].get("use_factor_feats", False)),
-        a_dim=int(cfg["model"]["mediated"].get("a_dim", 0)),
-        nonneg=bool(cfg["model"]["mediated"].get("nonneg", True)),
-        dropout=float(cfg["model"]["mediated"].get("dropout", 0.0)),
-    ).to(device)
-
-    head_dir = SparseDirectHead(
-        z_dim=z_dim,
-        G=G,
-        hidden=int(cfg["model"]["direct"].get("hidden", 256)),
-        dropout=float(cfg["model"]["direct"].get("dropout", 0.0)),
-        bound=None,
-    ).to(device)
-
-    opt = make_optimizer(
-        list(prop.parameters()) + list(step0.parameters()) + list(head_med.parameters()) + list(head_dir.parameters()),
-        cfg.get("optim", {})
-    )
-
-    dist_fn = pick_dist(cfg["loss"]["distribution"].get("type", "swd"))
-    w_dist = float(cfg["loss"]["distribution"].get("weight", 1.0))
-    w_rex  = float(cfg["loss"]["rex"].get("weight", 0.1))
-    w_irm  = float(cfg["loss"]["irm"].get("weight", 0.0))
-    irm_target_only = bool(cfg["loss"]["irm"].get("use_target_only", True))
-    w_cons = float(cfg["loss"]["consistency"].get("weight", 0.5))
-    w_l1   = float(cfg["loss"]["direct"].get("l1", 1e-4))
-    w_orth = float(cfg["loss"]["direct"].get("orth_to_U", 0.0))
-
-    parts = []
-    for ds in datasets_cfg:
-        z_df = read_parquet_indexed(ds["z_parquet"])
-        z_df["__dataset_id__"] = ds["id"]
-        parts.append(z_df)
-    Z = pd.concat(parts, axis=0, join="inner")
-    Z = Z.loc[Z.index.intersection(read_parquet_indexed(index_parquet).index)].copy()
-
-    train_mask = read_parquet_indexed(index_parquet).loc[Z.index].get("is_train", True).values if "is_train" in read_parquet_indexed(index_parquet).columns else np.ones(len(Z), dtype=bool)
-    Z_train = Z.loc[train_mask]
-
-    batch_size = int(cfg.get("batch_size", 1024))
-    epochs = int(cfg.get("epochs", 10))
-
-    def df_to_tensor_batch(df_batch: pd.DataFrame) -> Dict[str, torch.Tensor]:
-        z_cols = [c for c in df_batch.columns if c.startswith("z")]
-        z = torch.tensor(df_batch[z_cols].values, dtype=torch.float32, device=device)
-        env = torch.tensor([ds_id_to_code[s] for s in df_batch["__dataset_id__"].values], dtype=torch.long, device=device)
-        idx_df = read_parquet_indexed(index_parquet).loc[df_batch.index]
-        tgt = torch.tensor(idx_df.get("target_gene_idx", pd.Series(-1, index=idx_df.index)).fillna(-1).astype(int).values, dtype=torch.long, device=device)
-        return {"z": z, "env": env, "target_idx": tgt, "cell_ids": df_batch.index.values}
-
-    def fetch_xbars(df_batch: pd.DataFrame) -> (torch.Tensor, torch.Tensor):
-        x0_list, yt_list = [], []
-        for ds in datasets_cfg:
-            msk = (df_batch["__dataset_id__"].values == ds["id"])
-            if not msk.any(): 
+def to_device(batch: Dict[str, np.ndarray], device: torch.device) -> Dict[str, torch.Tensor]:
+    out = {}
+    for k, v in batch.items():
+        if isinstance(v, np.ndarray):
+            dtype = torch.float32 if v.dtype.kind in ("f",) else torch.int64 if v.dtype.kind in ("i", "u", "b") else None
+            if dtype is None:
                 continue
-            cell_ids = df_batch.index.values[msk]
-            adata, model = decoder._get(ds["id"], ds["h5ad"])
-            pos = {k: i for i, k in enumerate(adata.obs_names.tolist())}
-            rows = np.array([pos[c] for c in cell_ids], dtype=int)
-            yt = decoder.xbar(ds["id"], ds["h5ad"], rows, device)
-            if "knn_parquet" in ds and ds["knn_parquet"] and os.path.exists(ds["knn_parquet"]):
-                knn = read_parquet_indexed(ds["knn_parquet"])
-                ctrl_ids = knn.loc[cell_ids, "ctrl_id"].values
-                rows0 = np.array([pos[c] for c in ctrl_ids], dtype=int)
-                x0 = decoder.xbar(ds["id"], ds["h5ad"], rows0, device)
-            else:
-                x0 = yt.clone()
-            x0_list.append(x0); yt_list.append(yt)
-        return torch.cat(x0_list, 0), torch.cat(yt_list, 0)
+            out[k] = torch.as_tensor(v, dtype=dtype, device=device)
+    return out
 
-    for epoch in range(1, epochs + 1):
-        prop.train(); step0.train(); head_med.train(); head_dir.train()
-        idx = np.arange(len(Z_train)); np.random.shuffle(idx)
-        n_steps = int(math.ceil(len(idx) / batch_size))
-        sums = dict(dist=0.0, rex=0.0, irm=0.0, cons=0.0, l1=0.0, orth=0.0)
 
-        for s in range(n_steps):
-            bs = idx[s*batch_size:(s+1)*batch_size]
-            df_b = Z_train.iloc[bs]
-            batch = df_to_tensor_batch(df_b)
+def build_model(dim_z: int, dim_g: int, cfg_model: Dict[str, Any], device: torch.device) -> nn.Module:
+    if GraftCore is not None:
+        model = GraftCore(
+            dim_z=dim_z,
+            dim_g=dim_g,
+            hidden=int(cfg_model.get("hidden", 256)),
+            depth=int(cfg_model.get("depth", 2)),
+            dropout=float(cfg_model.get("dropout", 0.0)),
+        )
+        return model.to(device)
+    # Fallback minimal MLP: z -> xbar_hat
+    hidden = int(cfg_model.get("hidden", 256))
+    depth = int(cfg_model.get("depth", 2))
+    layers = [nn.Linear(dim_z, hidden), nn.ReLU()]
+    for _ in range(depth - 1):
+        layers += [nn.Linear(hidden, hidden), nn.ReLU()]
+    layers += [nn.Linear(hidden, dim_g)]
+    model = nn.Sequential(*layers)
+    return model.to(device)
 
-            x0, y_true = fetch_xbars(df_b)
-            z_ref = prop(batch["z"], target_idx=batch["target_idx"], env_codes=batch["env"])
-            x_clamp, eff = step0(x0, z_ref, batch["env"], batch["target_idx"])
-            m = head_med(z_ref); dx_med = m @ U_t
-            dx_dir = head_dir(z_ref)
-            y_pred = x_clamp + dx_med + dx_dir
 
-            per_env = []
-            for ds in ds_ids:
-                msk = (df_b["__dataset_id__"].values == ds)
-                if not msk.any(): 
-                    continue
-                per_env.append(pick_dist(cfg["loss"]["distribution"]["type"])(y_pred[msk], y_true[msk]))
+def compute_losses(
+    pred_xbar: torch.Tensor,
+    true_xbar: torch.Tensor,
+    env_code: torch.Tensor,
+    loss_cfg: Dict[str, Any],
+) -> Dict[str, torch.Tensor]:
+    """Compose total loss from consistency + optional invariance/distribution."""
+    losses: Dict[str, torch.Tensor] = {}
+    w_cons = float(loss_cfg.get("w_consistency", 1.0))
+    w_inv = float(loss_cfg.get("w_invariance", 0.0))
+    w_dist = float(loss_cfg.get("w_distribution", 0.0))
+    dist_kind = str(loss_cfg.get("distribution", "energy"))
 
-            loss_dist = w_dist * (torch.stack(per_env).mean() if per_env else y_pred.new_tensor(0.0))
-            loss_rex  = w_rex  * (risk_extrapolation(per_env, unbiased=False) if len(per_env) > 1 else y_pred.new_tensor(0.0))
-            loss_irm  = w_irm  * irmv1_penalty(y_pred, y_true, batch["env"], use_target_only=irm_target_only, target_idx=batch["target_idx"]) if w_irm > 0 else y_pred.new_tensor(0.0)
-            loss_cons = w_cons * target_knockdown_consistency(y_pred, y_true, batch["target_idx"], mode="mse")
-            loss_l1   = w_l1   * dx_dir.abs().mean()
-            loss_orth = y_pred.new_tensor(0.0)
-            if w_orth > 0.0:
-                loss_orth = w_orth * ((dx_dir @ U) ** 2).mean()
+    # Consistency: L1
+    l_cons = torch.mean(torch.abs(pred_xbar - true_xbar))
+    losses["consistency"] = l_cons
 
-            loss = loss_dist + loss_rex + loss_irm + loss_cons + loss_l1 + loss_orth
+    # Invariance (REx as default if available, otherwise skip)
+    if w_inv > 0 and rex_penalty is not None:
+        # Group by env within the batch
+        envs = env_code.detach().cpu().numpy()
+        uniq = np.unique(envs)
+        per_env = []
+        for e in uniq:
+            m = (env_code == int(e)).float().view(-1, 1)
+            # mean absolute error per env
+            num = torch.sum(m * torch.abs(pred_xbar - true_xbar))
+            den = torch.clamp(torch.sum(m), min=1.0)
+            per_env.append(num / den)
+        if per_env:
+            per_env_losses = torch.stack(per_env, dim=0)
+            l_inv = rex_penalty(per_env_losses)
+            losses["invariance"] = l_inv
+        else:
+            losses["invariance"] = torch.tensor(0.0, device=pred_xbar.device)
+    else:
+        losses["invariance"] = torch.tensor(0.0, device=pred_xbar.device)
 
-            optim_params = list(prop.parameters()) + list(step0.parameters()) + list(head_med.parameters()) + list(head_dir.parameters())
-            opt.zero_grad(set_to_none=True); loss.backward()
-            torch.nn.utils.clip_grad_norm_(optim_params, 5.0)
-            opt.step()
+    # Distributional
+    if w_dist > 0:
+        if dist_kind == "energy" and energy_distance is not None:
+            l_dist = energy_distance(pred_xbar, true_xbar)
+        elif dist_kind == "swd" and sliced_wasserstein_distance is not None:
+            l_dist = sliced_wasserstein_distance(pred_xbar, true_xbar, n_projections=64)
+        else:
+            l_dist = torch.tensor(0.0, device=pred_xbar.device)
+        losses["distribution"] = l_dist
+    else:
+        losses["distribution"] = torch.tensor(0.0, device=pred_xbar.device)
 
-            sums["dist"] += float(loss_dist.item())
-            sums["rex"]  += float(loss_rex.item())
-            sums["irm"]  += float(loss_irm.item())
-            sums["cons"] += float(loss_cons.item())
-            sums["l1"]   += float(loss_l1.item())
-            sums["orth"] += float(loss_orth.item())
+    total = w_cons * losses["consistency"] + w_inv * losses["invariance"] + w_dist * losses["distribution"]
+    losses["total"] = total
+    return losses
 
-        denom = max(n_steps, 1)
-        print(f"[epoch {epoch:03d}] dist={sums['dist']/denom:.4f} rex={sums['rex']/denom:.4f} irm={sums['irm']/denom:.4f} cons={sums['cons']/denom:.4f} l1={sums['l1']/denom:.4f} orth={sums['orth']/denom:.4f}")
-    print("Training finished.")
+
+def save_checkpoint(model: nn.Module, opt: optim.Optimizer, step: int, outdir: Path):
+    outdir.mkdir(parents=True, exist_ok=True)
+    ckpt = {
+        "model": model.state_dict(),
+        "opt": opt.state_dict(),
+        "step": step,
+    }
+    torch.save(ckpt, outdir / f"ckpt_{step:07d}.pt")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=str, default="configs/gnn_v1.yaml")
+    ap.add_argument("--config", required=True, help="Path to train config YAML")
     args = ap.parse_args()
+
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
-    train(cfg)
 
+    paths = cfg["paths"]
+    train_cfg = cfg.get("training", {})
+    loss_cfg = cfg.get("loss", {})
+    model_cfg = cfg.get("model", {})
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    set_seed(int(train_cfg.get("seed", 1337)))
+
+    # Build streaming dataset
+    ds_cfg = GraftStreamingConfig(
+        datasets_yaml=paths["datasets_yaml"],
+        index_parquet=paths["index_parquet"],
+        gene_list_tsv=paths["gene_list_tsv"],
+        scvi_model_dir=paths["scvi_model_dir"],
+        control_index_dir=paths["control_index_dir"],
+        control_z_npz=paths["control_z_npz"],
+        batch_size=int(train_cfg.get("batch_size", 2048)),
+        chunk_size=int(train_cfg.get("chunk_size", 50000)),
+        k_controls=int(train_cfg.get("k_controls", 16)) if "k_controls" in train_cfg else 16,
+        oversample=int(train_cfg.get("oversample", 5)) if "oversample" in train_cfg else 5,
+        match_within=str(train_cfg.get("match_within", "dataset")),
+        forward_batch_size=int(train_cfg.get("forward_batch_size", 4096)) if "forward_batch_size" in train_cfg else 4096,
+        include_controls_in_query=bool(train_cfg.get("include_controls_in_query", False)),
+    )
+    ds = GraftStreamingDataset(ds_cfg)
+
+    # Infer dims
+    dim_g = len(ds.gene_list)
+    # dim_z is unknown until we pull first batch; we can defer model build after first batch
+
+    # Sampler / chooser over dataset_ids
+    ds_ids = ds.get_dataset_ids()
+    sizes = estimate_dataset_sizes(ds.by_ds)
+    total_steps = int(train_cfg.get("epochs", 1)) * int(train_cfg.get("steps_per_epoch", 1000))
+    chooser = make_dataset_chooser(
+        dataset_ids=ds_ids,
+        sizes=sizes,
+        policy=str(train_cfg.get("sampler_policy", "weighted")),
+        weight_mode=str(train_cfg.get("sampler_weight_mode", "sqrt")),
+        steps=total_steps,
+        shuffle_each_epoch=bool(train_cfg.get("shuffle_each_epoch", False)),
+        seed=int(train_cfg.get("seed", 1337)),
+    )
+
+    # Optimizer will be created after we see the first batch (to know dim_z)
+    model: nn.Module = None  # type: ignore
+    opt: optim.Optimizer = None  # type: ignore
+
+    outdir = Path(paths.get("output_dir", "./gnn_out"))
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    step = 0
+    log_every = int(train_cfg.get("log_every", 50))
+    ckpt_every = int(train_cfg.get("ckpt_every", 500))
+
+    # Training loop
+    for dsid in chooser:
+        # Ask dataset to yield ONE mini-batch from this dataset_id
+        batch = None
+        for b in ds.iter_batches([dsid]):
+            batch = b
+            break
+        if batch is None:
+            continue
+
+        # Lazily create model/optimizer once we know dim_z
+        if model is None:
+            dim_z = batch["z_q"].shape[1]
+            model = build_model(dim_z=dim_z, dim_g=dim_g, cfg_model=model_cfg, device=device)
+            opt = optim.Adam(model.parameters(),
+                             lr=float(train_cfg.get("lr", 1e-3)),
+                             weight_decay=float(train_cfg.get("weight_decay", 0.0)))
+
+        model.train()
+        tb = to_device(batch, device)
+        z_q = tb["z_q"]            # (B, d)
+        xbar_q = tb["xbar_q"]      # (B, G)
+        # target_idx, env_code etc. are available in tb if needed by your model
+
+        # Forward
+        if hasattr(model, "forward"):
+            pred_xbar = model(z_q)  # GraftCore maps z->gene residuals or direct xbar; adapt as needed
+            if isinstance(pred_xbar, tuple):
+                pred_xbar = pred_xbar[0]
+        else:
+            raise RuntimeError("Model has no forward().")
+
+        # Loss
+        losses = compute_losses(pred_xbar, xbar_q, tb.get("env_code", torch.zeros(z_q.size(0), dtype=torch.long, device=device)), loss_cfg)
+
+        opt.zero_grad()
+        losses["total"].backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        opt.step()
+
+        step += 1
+        if step % log_every == 0:
+            msg = {k: float(v.detach().cpu().item()) for k, v in losses.items()}
+            msg["step"] = step
+            msg["dataset"] = dsid
+            print(json.dumps(msg))
+
+        if step % ckpt_every == 0:
+            save_checkpoint(model, opt, step, outdir)
+
+        # Stop after total_steps
+        if step >= total_steps:
+            break
+
+    # final checkpoint
+    save_checkpoint(model, opt, step, outdir)
+    print(f"[done] total steps: {step}, saved to {outdir}")
 
 if __name__ == "__main__":
     main()
