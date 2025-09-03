@@ -121,7 +121,7 @@ def preprocess_chunk(
         else:
             # Compose "dataset_id::local_id"
             global_ids = pd.Index([f"{dataset_id}::{cid}" for cid in A.obs_names.astype(str)], name="cell_id")
-        mask = pd.Index(global_ids).isin(allowed_cell_ids).to_numpy()
+        mask = pd.Index(global_ids).isin(allowed_cell_ids)
         if mask.any():
             A = A[mask, :].copy()
             global_ids = pd.Index(np.array(global_ids)[mask], name="cell_id")
