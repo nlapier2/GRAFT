@@ -101,6 +101,13 @@ def main():
     ap.add_argument("--max-cells", type=int, default=None, help="Optional cap on total cells (for smoke tests)")
     args = ap.parse_args()
 
+    # Define the exact columns to keep in the final obs table
+    FINAL_OBS_COLS = [
+        "dataset_id", "cell_id", "lab_id", "batch_id", "cell_type",
+        "is_control", "pert_type", "target_gene", "guide_id",
+        "target_id", "perturbation"
+    ]
+
     # 1) Load datasets config (mapping datasets -> {raw_path, ...})
     ds_tbl = load_datasets_yaml(args.datasets_yaml)
     gene_list = load_gene_list(args.gene_list_tsv)
@@ -118,8 +125,7 @@ def main():
     # Map of dataset_id -> rows to include (for fast membership tests)
     want_by_ds = {dsid: g.copy() for dsid, g in idx.groupby("dataset_id")}
 
-    X_blocks = []
-    cell_ids_collected: List[str] = []
+    X_blocks, obs_blocks = [], []
     n_total = 0
 
     # 3) For each dataset, stream its H5AD and extract the needed cells via preprocess_chunk
@@ -130,9 +136,9 @@ def main():
 
         if dsid not in want_by_ds:
             continue
+        print(f"[info] processing dataset {dsid} from {raw_path}")
 
         rows_meta = want_by_ds[dsid]
-        allowed = set(rows_meta["cell_id"].astype(str).tolist())
 
         A_b = ad.read_h5ad(raw_path, backed="r")
         n_obs = A_b.n_obs
@@ -145,14 +151,15 @@ def main():
                 row_index=slice(start, end),
                 gene_list=gene_list,
                 dataset_id=dsid,
-                allowed_cell_ids=allowed,
+                index_df=rows_meta,
                 counts_layer=counts_layer,
+                keep_cols=FINAL_OBS_COLS,
             )
             if A_chunk.n_obs == 0:
                 continue
 
-            X_blocks.append(A_chunk.X.tocsr() if hasattr(A_chunk.X, "tocsr") else sparse.csr_matrix(A_chunk.X))
-            cell_ids_collected.extend(list(map(str, A_chunk.obs_names)))
+            X_blocks.append(A_chunk.X)
+            obs_blocks.append(A_chunk.obs)
 
             n_total += A_chunk.n_obs
             if args.max_cells is not None and n_total >= args.max_cells:
@@ -166,20 +173,21 @@ def main():
 
     # 4) Concatenate and impose a single stable row order
     X = sparse.vstack(X_blocks, format="csr")
-    collected = pd.Index(cell_ids_collected, name="cell_id")
-    order = np.argsort(collected.values)  # stable deterministic order
+    obs = pd.concat(obs_blocks, axis=0)
+    order = np.argsort(obs.index.values)
     X = X[order, :]
-    cell_ids_final = collected.values[order]
+    obs = obs.iloc[order, :]
 
-    # 5) Build obs from the index parquet (authoritative)
-    obs = idx.set_index("cell_id").loc[cell_ids_final].copy()
+    # 5) Build final obs table and ensure types are safe for writing
     if "tech_batch_id" not in obs.columns and {"dataset_id", "batch_id"}.issubset(obs.columns):
         obs["tech_batch_id"] = (obs["dataset_id"].astype(str) + "_" + obs["batch_id"].astype(str)).astype("category")
+    
+    for col in obs.select_dtypes(include=['object', 'category']).columns:
+        obs[col] = obs[col].astype(str).astype('category')
 
     # 6) Assemble AnnData and write
     var = pd.DataFrame(index=pd.Index(gene_list, name="gene"))
     A_out = ad.AnnData(X=X, obs=obs, var=var)
-    A_out.obs_names = pd.Index(cell_ids_final, name="cell_id")
 
     os.makedirs(os.path.dirname(args.out_h5ad), exist_ok=True)
     A_out.write_h5ad(args.out_h5ad)

@@ -89,9 +89,10 @@ def preprocess_chunk(
     A_backed: ad.AnnData,
     row_index: Sequence[int] | slice,
     gene_list: Sequence[str],
-    dataset_id: Optional[str] = None,
-    allowed_cell_ids: Optional[set[str]] = None,
+    dataset_id: str,
+    index_df: pd.DataFrame,
     counts_layer: Optional[str] = None,
+    keep_cols: Optional[Iterable[str]] = None,
 ) -> ad.AnnData:
     """
     Core routine:
@@ -103,46 +104,41 @@ def preprocess_chunk(
 
     Returns an in-memory AnnData with X aligned to gene_list order.
     """
-    # 1) to memory
+    if keep_cols is None:
+        keep_cols = ["dataset_id","cell_id","lab_id","batch_id","cell_type",
+                     "is_control","pert_type","target_gene","guide_id",
+                     "target_id","perturbation"]
     A = _materialize_rows(A_backed, row_index)
+    if A.n_obs == 0:
+        return A
 
-    # 2) use raw counts layer if requested
+    # use raw counts layer if requested
     if counts_layer is not None and counts_layer in (A.layers.keys() if A.layers is not None else {}):
-        X = A.layers[counts_layer]
-        A = ad.AnnData(X=X, obs=A.obs.copy(), var=A.var.copy())
-        A.obs_names = A_backed[row_index, :].obs_names.copy()
-        A.var_names = A_backed.var_names.copy()
+        X_new = A.layers[counts_layer]
+        A = ad.AnnData(X=X_new, obs=A.obs.copy(), var=A.var.copy())
+        A.obs_names = A.obs_names.copy()
+        A.var_names = A.var_names.copy()
 
-    # 3) filter by allowed global cell_ids
-    if allowed_cell_ids is not None:
-        if dataset_id is None:
-            # Assume obs_names were already global
-            global_ids = A.obs_names.astype(str)
-        else:
-            # Compose "dataset_id::local_id"
-            global_ids = pd.Index([f"{dataset_id}::{cid}" for cid in A.obs_names.astype(str)], name="cell_id")
-        mask = pd.Index(global_ids).isin(allowed_cell_ids)
-        if mask.any():
-            A = A[mask, :].copy()
-            global_ids = pd.Index(np.array(global_ids)[mask], name="cell_id")
-        else:
-            # No allowed cells in this slice
-            return A[:0, :].copy()
-    else:
-        # still standardize global_ids if dataset_id provided
-        global_ids = pd.Index([f"{dataset_id}::{cid}" for cid in A.obs_names.astype(str)], name="cell_id") if dataset_id is not None else A.obs_names.astype(str)
+    # filter by allowed global cell_ids from the provided index
+    allowed_cell_ids = set(index_df["cell_id"])
+    global_ids = pd.Index([f"{dataset_id}::{cid}" for cid in A.obs_names.astype(str)], name="cell_id")
+    mask = global_ids.isin(allowed_cell_ids)
+    
+    if not mask.any():
+        return A[:0, :].copy()  # No allowed cells in this slice
+    
+    A = A[mask, :].copy()
+    kept_global_ids = global_ids[mask]
 
-    # 4) gene alignment by name using sparse projection
+    # gene alignment by name using sparse projection
     P = _build_projection(A.var_names.astype(str), gene_list)
-    X = A.X
-    if sparse.issparse(X):
-        X_aligned = X @ P
-    else:
-        X_aligned = sparse.csr_matrix(X) @ P  # cast to sparse for big G
+    X_aligned = A.X @ P
 
-    # 5) assemble output AnnData
-    var = pd.DataFrame(index=pd.Index(gene_list, name=A.var_names.name))
-    obs = pd.DataFrame(index=global_ids)  # keep minimal; downstream can join metadata as needed
+    # assemble output AnnData with authoritative obs from the index
+    obs = index_df.set_index("cell_id").loc[kept_global_ids].copy()
+    obs = obs[[c for c in keep_cols if c in obs.columns]].copy()
+    var = pd.DataFrame(index=pd.Index(gene_list, name="gene"))
+
     if "tech_batch_id" not in obs.columns and dataset_id is not None and {"batch_id"}.issubset(obs.columns):
         obs["tech_batch_id"] = (obs["dataset_id"].astype(str) + "_" + obs["batch_id"].astype(str)).astype("category")
     out = ad.AnnData(X=X_aligned, obs=obs, var=var)
