@@ -1,0 +1,42 @@
+# configs/gnn_smoke.yaml
+paths:
+  datasets_yaml: configs/datasets.yaml  # <- specifies datasets to use
+  index_parquet: artifacts_v2/cell_index.parquet  # <- full index with controls+perturbed
+  gene_list_tsv: artifacts_v2/gene_list.tsv  # <- from build_gene_maps.py
+  scvi_model_dir: artifacts_v2/scvi_k562_max200k_control_only_v2/scvi_K562/  # <- trained control-only scVI
+  scvi_input_h5ad: artifacts_v2/scvi_input_K562_max200k_controls.h5ad  # <- input to scVI (with controls)
+  control_index_dir: artifacts_v2/knn_control_index/  # <- contains knn.index, ctrl_ids.parquet, knn_meta.json
+  control_z_npz: artifacts_v2/scvi_k562_max200k_control_only_v2/scvi_K562/scvi_z_K562.npz  # <- from train_scvi output
+  factor_U: artifacts_v2/learned_factor_encoders/factor_W_K562.npy
+  output_dir: artifacts/gnn_runs/smoke
+
+
+training:
+  epochs: 1
+  steps_per_epoch: 300          # small; we just want to see it train
+  batch_size: 512
+  chunk_size: 20000             # per-dataset backed chunk
+  forward_batch_size: 4096      # scVI internal forward size (per chunk)
+  lr: 1.0e-3
+  weight_decay: 0.0
+  sampler_policy: "weighted"    # "balanced" | "weighted"
+  sampler_weight_mode: "sqrt"   # damp huge datasets
+  match_within: "dataset"       # restrict ANN to same dataset for now
+  include_controls_in_query: false
+  k_controls: 8
+  oversample: 4
+  seed: 1337
+  log_every: 25
+  ckpt_every: 150
+
+loss:
+  w_consistency: 1.0
+  w_invariance: 0.0             # start off
+  w_distribution: 0.0           # start off
+  distribution: "energy"        # or "swd"
+
+model:
+  dim_z: null                   # inferred on first batch
+  hidden: 256
+  depth: 2
+  dropout: 0.0
