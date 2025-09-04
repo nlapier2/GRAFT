@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import yaml
 import os
 from dataclasses import dataclass
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
@@ -69,6 +70,7 @@ class ControlANN:
         control_z_npz: str,
         index_parquet: str,
     ) -> "ControlANN":
+        """ Load ANN index, control IDs from parquet, and control Z from scVI NPZ """
         meta_path = os.path.join(control_index_dir, "knn_meta.json")
         ids_path = os.path.join(control_index_dir, "ctrl_ids.parquet")
         idx_path = os.path.join(control_index_dir, "knn.index")
@@ -137,6 +139,7 @@ class ControlANN:
         caliper: Optional[float] = None, # optional distance threshold (after normalization if cosine)
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
+        Given query z for perturbed cells, find k nearest control cells.
         Returns (ctrl_idx, ctrl_ids, ctrl_dist) for each query row.
         ctrl_idx are integer labels into self.z_ctrl / self.ctrl_ids.
         """
@@ -382,7 +385,6 @@ class GraftStreamingDataset:
 
 def _yaml_safe_load(text: str) -> dict:
     """Very small helper to load YAML as a Python dict (mapping datasets -> config)."""
-    import yaml
     cfg = yaml.safe_load(text)
     if not isinstance(cfg, dict):
         raise ValueError("datasets.yaml must be a mapping.")
