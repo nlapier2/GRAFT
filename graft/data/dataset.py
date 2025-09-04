@@ -31,6 +31,13 @@ except Exception:
 
 from graft.utils.chunk_preprocess import preprocess_chunk, load_gene_list
 
+# Define the exact columns to keep in the final obs table
+FINAL_OBS_COLS = [
+        "dataset_id", "cell_id", "lab_id", "batch_id", "cell_type",
+        "is_control", "pert_type", "target_gene", "guide_id",
+        "target_id", "perturbation"
+]
+
 
 # ----------------------------- Control ANN loader ----------------------------- #
 
@@ -295,9 +302,6 @@ class GraftStreamingDataset:
             if rows_meta.empty:
                 continue
 
-            # Allowed query cell_ids for this dataset
-            allowed = set(rows_meta["cell_id"].astype(str).tolist())
-
             # Stream the raw H5AD in chunks
             A_b = ad.read_h5ad(raw_path, backed="r")
             n_obs = A_b.n_obs
@@ -311,8 +315,9 @@ class GraftStreamingDataset:
                     row_index=slice(start, end),
                     gene_list=self.gene_list,
                     dataset_id=dsid,
-                    allowed_cell_ids=allowed,
+                    index_df=rows_meta,
                     counts_layer=None,
+                    keep_cols=FINAL_OBS_COLS,
                 )
                 if A_chunk.n_obs == 0:
                     continue
