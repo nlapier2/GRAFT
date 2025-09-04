@@ -71,24 +71,12 @@ import yaml
 from graft.data.dataset import GraftStreamingConfig, GraftStreamingDataset
 from graft.data.samplers import make_dataset_chooser, estimate_dataset_sizes
 
-# Optional losses (graceful fallback if modules are absent)
-try:
-    from graft.losses.distribution import energy_distance, sliced_wasserstein_distance
-except Exception:
-    energy_distance = None
-    sliced_wasserstein_distance = None
+from graft.losses.distribution import energy_distance, sliced_wasserstein_distance
+from graft.losses.invariance import rex_penalty, irm_penalty
 
-try:
-    from graft.losses.invariance import rex_penalty, irm_penalty
-except Exception:
-    rex_penalty = None
-    irm_penalty = None
 
 # Core model
-try:
-    from graft.models.gnn_core import GraftCore
-except Exception:
-    GraftCore = None
+from graft.models.gnn_core import GraftCore
 
 
 def set_seed(seed: int = 1337):
@@ -113,23 +101,13 @@ def to_device(batch: Dict[str, np.ndarray], device: torch.device) -> Dict[str, t
 
 
 def build_model(dim_z: int, dim_g: int, cfg_model: Dict[str, Any], device: torch.device) -> nn.Module:
-    if GraftCore is not None:
-        model = GraftCore(
-            dim_z=dim_z,
-            dim_g=dim_g,
-            hidden=int(cfg_model.get("hidden", 256)),
-            depth=int(cfg_model.get("depth", 2)),
-            dropout=float(cfg_model.get("dropout", 0.0)),
-        )
-        return model.to(device)
-    # Fallback minimal MLP: z -> xbar_hat
-    hidden = int(cfg_model.get("hidden", 256))
-    depth = int(cfg_model.get("depth", 2))
-    layers = [nn.Linear(dim_z, hidden), nn.ReLU()]
-    for _ in range(depth - 1):
-        layers += [nn.Linear(hidden, hidden), nn.ReLU()]
-    layers += [nn.Linear(hidden, dim_g)]
-    model = nn.Sequential(*layers)
+    model = GraftCore(
+        dim_z=dim_z,
+        dim_g=dim_g,
+        hidden=int(cfg_model.get("hidden", 256)),
+        depth=int(cfg_model.get("depth", 2)),
+        dropout=float(cfg_model.get("dropout", 0.0)),
+    )
     return model.to(device)
 
 
@@ -151,7 +129,7 @@ def compute_losses(
     losses["consistency"] = l_cons
 
     # Invariance (REx as default if available, otherwise skip)
-    if w_inv > 0 and rex_penalty is not None:
+    if w_inv > 0:
         # Group by env within the batch
         envs = env_code.detach().cpu().numpy()
         uniq = np.unique(envs)
@@ -173,9 +151,9 @@ def compute_losses(
 
     # Distributional
     if w_dist > 0:
-        if dist_kind == "energy" and energy_distance is not None:
+        if dist_kind == "energy":
             l_dist = energy_distance(pred_xbar, true_xbar)
-        elif dist_kind == "swd" and sliced_wasserstein_distance is not None:
+        elif dist_kind == "swd":
             l_dist = sliced_wasserstein_distance(pred_xbar, true_xbar, n_projections=64)
         else:
             l_dist = torch.tensor(0.0, device=pred_xbar.device)
