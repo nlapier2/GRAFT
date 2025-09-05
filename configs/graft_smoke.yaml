@@ -1,12 +1,12 @@
 # configs/gnn_smoke.yaml
 paths:
-  datasets_yaml: configs/datasets.yaml  # <- specifies datasets to use
+  datasets_yaml: configs/data_smoke.yaml  # <- specifies datasets to use
   index_parquet: artifacts_v2/cell_index.parquet  # <- full index with controls+perturbed
   gene_list_tsv: artifacts_v2/gene_list.tsv  # <- from build_gene_maps.py
   scvi_model_dir: artifacts_v2/scvi_k562_max200k_control_only_v2/scvi_K562/  # <- trained control-only scVI
   scvi_input_h5ad: artifacts_v2/scvi_input_K562_max200k_controls.h5ad  # <- input to scVI (with controls)
   control_index_dir: artifacts_v2/knn_control_index/  # <- contains knn.index, ctrl_ids.parquet, knn_meta.json
-  control_z_npz: artifacts_v2/scvi_k562_max200k_control_only_v2/scvi_K562/scvi_z_K562.npz  # <- from train_scvi output
+  control_z_npz: artifacts_v2/scvi_k562_max200k_control_only_v2/scvi_z_K562.npz  # <- from train_scvi output
   factor_U: artifacts_v2/learned_factor_encoders/factor_W_K562.npy
   output_dir: artifacts/gnn_runs/smoke
 

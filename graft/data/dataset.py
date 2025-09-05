@@ -210,10 +210,29 @@ class BatchQuery:
     def encode_and_decode(self, A_chunk: ad.AnnData) -> Tuple[np.ndarray, np.ndarray]:
         # Attach chunk to scVI registry (no retraining). Inplace subset of vars is fine because
         # preprocess_chunk already aligned genes to the reference order.
-        qmodel = scvi.model.SCVI.load_query_data(A_chunk, self.scvi_model_dir, inplace_subset_query_vars=True)
+        qmodel = scvi.model.SCVI.load_query_data(
+            A_chunk, self.scvi_model_dir, inplace_subset_query_vars=True
+        )
+
+        # IMPORTANT: scVI requires a zero-epoch "train" to initialize amortized inference
+        # state for the *query* cells, otherwise get_latent_representation() will error.
+        # This is a no-op optimization-wise, but flips the internal "trained" flags.
+        qmodel.train(max_epochs=0, plan_kwargs={"weight_decay": 0.0}, check_val_every_n_epoch=None)
+
+        # Keep the module in eval for inference-time calls.
+        try:
+            qmodel.module.eval()
+        except Exception:
+            pass
+
+        # Latents (z) and normalized expression means (x̄)
         z = qmodel.get_latent_representation(batch_size=self.forward_bs)
-        # Normalized expression means (x̄); expensive but necessary when needed.
-        xbar = qmodel.get_normalized_expression(transform_batch=None, n_samples=1, library_size=1e4)  # np.ndarray
+        xbar = qmodel.get_normalized_expression(
+            transform_batch=None,
+            n_samples=1,
+            library_size="latent",
+            batch_size=self.forward_bs,
+        )
         if not isinstance(xbar, np.ndarray):
             xbar = xbar.to_numpy()
         xbar = xbar.astype(np.float32, copy=False)
