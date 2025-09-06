@@ -202,34 +202,17 @@ def main():
         
         prop.train(); step0.train(); head_med.train(); head_dir.train()
         tb = to_device(batch, device)
-
-        # --- Restored Forward Pass ---
-        # NOTE: To make StepZeroClamp work correctly, your data loader `dataset.py` must be
-        # modified to also return 'xbar_ctrl' (B, k, G), the decoded expression for matched controls.
-        # Here, we approximate x0 by taking the mean of matched control latents (`z_ctrl`)
-        # and decoding them. A more direct approach is to have the loader provide `xbar_ctrl`.
-        # For now, we'll use the mean of the controls' latents and decode, which is an approximation.
-        # A simpler, though less accurate, temporary proxy would be to use y_true (xbar_q) itself.
-        # Let's use the mean of control latents decoded, as it's closer to the original intent.
-        
-        # As a robust placeholder, we'll average the control latents and decode them to get x0.
-        # This part assumes your `GraftStreamingDataset` provides `z_ctrl`.
-        # TODO: A better solution is to have the data loader provide `xbar_ctrl` directly.
-        if 'z_ctrl' in tb and tb['z_ctrl'].shape[1] > 0:
-             with torch.no_grad():
-                # A simple proxy for x0 is the expression of the mean control latent state.
-                mean_z_ctrl = tb['z_ctrl'].mean(dim=1)
-                # To get x0, we need to decode this. A full decoding is complex.
-                # As a simpler but less accurate proxy, we will use the true value `xbar_q`
-                # as the base for the clamp. This is not ideal but avoids complex changes.
-                x0 = tb["xbar_q"]
-        else:
-            x0 = tb["xbar_q"] # Fallback if no controls found
-
         y_true = tb["xbar_q"]
-        
+
+        # Calculate x0 as the mean expression of the matched controls (k neighbors)
+        if "xbar_ctrl" in tb and tb["xbar_ctrl"].shape[1] > 0:
+            x0 = tb["xbar_ctrl"].mean(dim=1)  # Average across k neighbors -> shape (B, G)
+        else:
+            x0 = y_true # Fallback if no controls were found for this batch
+
         z_ref = prop(tb["z_q"], target_idx=tb["target_idx"], env_codes=tb["env_code"])
         x_clamp, _ = step0(x0, z_ref, tb["env_code"], tb["target_idx"])
+
         m = head_med(z_ref)
         dx_med = m @ U
         dx_dir = head_dir(z_ref)

@@ -359,7 +359,7 @@ class GraftStreamingDataset:
                 
                 # Use the single cached model to encode/decode the new data chunk
                 z_chunk = qmodel.get_latent_representation(A_chunk, batch_size=self.cfg.forward_batch_size)
-                xbar_chunk = qmodel.get_normalized_expression(A_chunk, batch_size=self.cfg.forward_batch_size, n_samples=1, library_size=1e4)
+                xbar_chunk = qmodel.get_normalized_expression(A_chunk, batch_size=self.cfg.forward_batch_size, n_samples=1, library_size="latent")
                 if not isinstance(xbar_chunk, np.ndarray):
                     xbar_chunk = xbar_chunk.to_numpy()
 
@@ -373,6 +373,34 @@ class GraftStreamingDataset:
                 )
                 z_ctrl_chunk = self.ann.z_ctrl[ctrl_idx_chunk.clip(min=0)]
 
+                # Fetch the normalized expression (xbar) for the matched control cells.
+                # We need to get unique indices and then map them back to the batch shape.
+                unique_ctrl_indices = np.unique(ctrl_idx_chunk[ctrl_idx_chunk >= 0])
+                if len(unique_ctrl_indices) > 0:
+                    # Retrieve xbar for all unique controls needed for this chunk.
+                    xbar_ctrl_flat = qmodel.get_normalized_expression(
+                        indices=unique_ctrl_indices,
+                        batch_size=self.cfg.forward_batch_size,
+                        n_samples=1,
+                        library_size=1e4,
+                    ).to_numpy()
+                    
+                    # Create a mapping from index to expression data
+                    index_to_xbar_map = {idx: xbar_ctrl_flat[i] for i, idx in enumerate(unique_ctrl_indices)}
+                    
+                    # Reconstruct the batch shape (B, k, G)
+                    B, k = ctrl_idx_chunk.shape
+                    G = xbar_ctrl_flat.shape[1]
+                    xbar_ctrl_chunk = np.zeros((B, k, G), dtype=np.float32)
+                    for i in range(B):
+                        for j in range(k):
+                            idx = ctrl_idx_chunk[i, j]
+                            if idx in index_to_xbar_map:
+                                xbar_ctrl_chunk[i, j] = index_to_xbar_map[idx]
+                else:
+                    print(f"[warn] No valid controls found for dataset {dsid} in this chunk.")
+                    xbar_ctrl_chunk = np.zeros((B, k, G), dtype=np.float32) # Fallback if no controls found
+
                 # Break chunk into mini-batches
                 B = int(self.cfg.batch_size)
                 N = A_chunk.n_obs
@@ -385,6 +413,7 @@ class GraftStreamingDataset:
                     ctrl_idx = ctrl_idx_chunk[i0:i1]
                     ctrl_ids = ctrl_ids_chunk[i0:i1]
                     z_ctrl = z_ctrl_chunk[i0:i1]
+                    x_bar_ctrl = xbar_ctrl_chunk[i0:i1]
                     ctrl_dist = ctrl_dist_chunk[i0:i1]
                     
                     batch = {
@@ -397,6 +426,7 @@ class GraftStreamingDataset:
                         "ctrl_idx": ctrl_idx,             # (b, k), labels into z_ctrl/ctrl_ids
                         "ctrl_ids": ctrl_ids,             # (b, k)
                         "z_ctrl": z_ctrl,                 # (b, k, d)
+                        "xbar_ctrl": x_bar_ctrl,          # (b, k, G)
                         "ctrl_dist": ctrl_dist,           # (b, k)
                         "dataset_id": dsid,               # string for reference
                     }

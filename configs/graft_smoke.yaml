@@ -14,7 +14,7 @@ paths:
 training:
   epochs: 1
   steps_per_epoch: 10          # small; we just want to see it train
-  batch_size: 512
+  batch_size: 4096
   chunk_size: 20000             # per-dataset backed chunk
   forward_batch_size: 4096      # scVI internal forward size (per chunk)
   lr: 1.0e-3
