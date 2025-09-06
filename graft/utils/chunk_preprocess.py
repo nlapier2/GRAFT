@@ -130,6 +130,10 @@ def preprocess_chunk(
     A = A[mask, :].copy()
     kept_global_ids = global_ids[mask]
 
+    # Ensure the matrix is in CSR format for efficient row-slicing during training.
+    if sparse.issparse(A.X):
+        A.X = A.X.tocsr()
+
     # gene alignment by name using sparse projection
     P = _build_projection(A.var_names.astype(str), gene_list)
     X_aligned = A.X @ P

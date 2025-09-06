@@ -13,7 +13,7 @@ paths:
 
 training:
   epochs: 1
-  steps_per_epoch: 300          # small; we just want to see it train
+  steps_per_epoch: 100          # small; we just want to see it train
   batch_size: 512
   chunk_size: 20000             # per-dataset backed chunk
   forward_batch_size: 4096      # scVI internal forward size (per chunk)
@@ -26,8 +26,8 @@ training:
   k_controls: 8
   oversample: 4
   seed: 1337
-  log_every: 25
-  ckpt_every: 150
+  log_every: 5
+  ckpt_every: 25
 
 loss:
   distribution:

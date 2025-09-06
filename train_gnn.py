@@ -114,6 +114,7 @@ def main():
     data_cfg = cfg.get("data", {})
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
     set_seed(int(train_cfg.get("seed", 1337)))
 
     # --- New Streaming Dataset Setup ---
