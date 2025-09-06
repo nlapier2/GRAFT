@@ -198,47 +198,6 @@ class ControlANN:
         out_ids = self.ctrl_ids[out_idx.clip(min=0)]  # bogus rows will index 0; trainer should mask -1 if needed
         return out_idx, out_ids, out_dist
 
-
-# ------------------------------- Batch encoder ------------------------------- #
-
-class BatchQuery:
-    """Helper to attach a chunk to the saved scVI registry, then fetch z and xbar."""
-    def __init__(self, scvi_model_dir: str, forward_bs: int = 4096):
-        self.scvi_model_dir = scvi_model_dir
-        self.forward_bs = int(forward_bs)
-
-    def encode_and_decode(self, A_chunk: ad.AnnData) -> Tuple[np.ndarray, np.ndarray]:
-        # Attach chunk to scVI registry (no retraining). Inplace subset of vars is fine because
-        # preprocess_chunk already aligned genes to the reference order.
-        qmodel = scvi.model.SCVI.load_query_data(
-            A_chunk, self.scvi_model_dir, inplace_subset_query_vars=True
-        )
-
-        # IMPORTANT: scVI requires a zero-epoch "train" to initialize amortized inference
-        # state for the *query* cells, otherwise get_latent_representation() will error.
-        # This is a no-op optimization-wise, but flips the internal "trained" flags.
-        qmodel.train(max_epochs=0, plan_kwargs={"weight_decay": 0.0}, check_val_every_n_epoch=None)
-
-        # Keep the module in eval for inference-time calls.
-        try:
-            qmodel.module.eval()
-        except Exception:
-            pass
-
-        # Latents (z) and normalized expression means (x̄)
-        z = qmodel.get_latent_representation(batch_size=self.forward_bs)
-        xbar = qmodel.get_normalized_expression(
-            transform_batch=None,
-            n_samples=1,
-            library_size="latent",
-            batch_size=self.forward_bs,
-        )
-        if not isinstance(xbar, np.ndarray):
-            xbar = xbar.to_numpy()
-        xbar = xbar.astype(np.float32, copy=False)
-        return z.astype(np.float32, copy=False), xbar
-
-
 # ------------------------------ Streaming dataset --------------------------- #
 
 @dataclass
@@ -247,6 +206,7 @@ class GraftStreamingConfig:
     index_parquet: str
     gene_list_tsv: str
     scvi_model_dir: str
+    scvi_input_h5ad: str
     control_index_dir: str
     control_z_npz: str
 
@@ -299,9 +259,25 @@ class GraftStreamingDataset:
             y = json.loads(json.dumps(_yaml_safe_load(f.read())))
         ds_map = y.get("datasets", {})
         self.ds_paths: Dict[str, str] = {str(k): str(v["raw_path"]) for k, v in ds_map.items() if isinstance(v, dict) and "raw_path" in v}
+        
+        # Cache for initialized scVI models, one per dataset
+        self.scvi_model_cache: Dict[str, scvi.model.SCVI] = {}
 
-        # Batch encoder (scVI)
-        self.enc = BatchQuery(cfg.scvi_model_dir, forward_bs=cfg.forward_batch_size)
+        # Load the reference AnnData for scvi model loading once
+        print(f"[info] Loading reference AnnData for scVI: {self.cfg.scvi_input_h5ad}")
+        self.scvi_reference_adata = ad.read_h5ad(self.cfg.scvi_input_h5ad)
+
+        # Ensure the reference adata has the tech_batch_id scVI was trained on.
+        # This makes the loader robust to older scvi_input files.
+        if "tech_batch_id" not in self.scvi_reference_adata.obs.columns:
+            print("[warn] 'tech_batch_id' not found in scvi_reference_adata.obs. Creating it on the fly.")
+            obs = self.scvi_reference_adata.obs
+            if "dataset_id" in obs.columns and "batch_id" in obs.columns:
+                obs["tech_batch_id"] = (
+                    obs["dataset_id"].astype(str) + "_" + obs["batch_id"].astype(str)
+                ).astype("category")
+            else:
+                raise KeyError("Cannot create 'tech_batch_id'; missing 'dataset_id' or 'batch_id' in reference adata.obs.")
 
         # Control ANN
         self.ann = ControlANN.load(cfg.control_index_dir, cfg.control_z_npz, cfg.index_parquet)
@@ -323,6 +299,23 @@ class GraftStreamingDataset:
             rows_meta = self.by_ds[dsid]
             if rows_meta.empty:
                 continue
+            
+            # Check cache for an initialized scVI model.
+            # The model object is now shared across all datasets.
+            if "model" not in self.scvi_model_cache:
+                print(f"[info] Initializing shared scVI model.")
+                # Load the base scVI model, providing the reference AnnData it was trained on.
+                # This is the crucial fix for the ValueError.
+                model = scvi.model.SCVI.load(
+                    self.cfg.scvi_model_dir, 
+                    adata=self.scvi_reference_adata
+                )
+                model.module.eval()
+                # Store the initialized, ready-to-use model in the cache
+                self.scvi_model_cache["model"] = model
+            
+            # Retrieve the cached model
+            qmodel = self.scvi_model_cache["model"]
 
             # Stream the raw H5AD in chunks
             A_b = ad.read_h5ad(raw_path, backed="r")
@@ -343,36 +336,42 @@ class GraftStreamingDataset:
                 )
                 if A_chunk.n_obs == 0:
                     continue
-
-                # Encode / decode this chunk via scVI
-                z_chunk, xbar_chunk = self.enc.encode_and_decode(A_chunk)
+                
+                # Use the single cached model to encode/decode the new data chunk
+                z_chunk = qmodel.get_latent_representation(A_chunk, batch_size=self.cfg.forward_batch_size)
+                xbar_chunk = qmodel.get_normalized_expression(A_chunk, batch_size=self.cfg.forward_batch_size, n_samples=1, library_size=1e4)
+                if not isinstance(xbar_chunk, np.ndarray):
+                    xbar_chunk = xbar_chunk.to_numpy()
 
                 # Map per-row targets
-                tgt_idx = self._targets_for_ids(A_chunk.obs_names.astype(str))
+                tgt_idx_chunk = self._targets_for_ids(A_chunk.obs_names.astype(str))
+
+                # Match controls for the ENTIRE CHUNK at once
+                match_ds = dsid if (self.cfg.match_within == "dataset") else None
+                ctrl_idx_chunk, ctrl_ids_chunk, ctrl_dist_chunk = self.ann.query(
+                    z_chunk, k=self.cfg.k_controls, match_dataset=match_ds, oversample=self.cfg.oversample
+                )
+                z_ctrl_chunk = self.ann.z_ctrl[ctrl_idx_chunk.clip(min=0)]
 
                 # Break chunk into mini-batches
                 B = int(self.cfg.batch_size)
                 N = A_chunk.n_obs
                 for i0 in range(0, N, B):
                     i1 = min(i0 + B, N)
+                    # Slice the pre-computed chunk-level results for this mini-batch
                     z_q = z_chunk[i0:i1]
                     xbar_q = xbar_chunk[i0:i1]
                     ids_q = np.array(A_chunk.obs_names[i0:i1], dtype=str)
-
-                    # Match controls for this mini-batch (within same dataset if requested)
-                    match_ds = dsid if (self.cfg.match_within == "dataset") else None
-                    ctrl_idx, ctrl_ids, ctrl_dist = self.ann.query(
-                        z_q, k=self.cfg.k_controls, match_dataset=match_ds, oversample=self.cfg.oversample
-                    )
-                    # Fetch z_ctrl rows by label (labels are row indices)
-                    # Any -1 rows remain -1; trainer should mask.
-                    z_ctrl = self.ann.z_ctrl[ctrl_idx.clip(min=0)]
-
+                    ctrl_idx = ctrl_idx_chunk[i0:i1]
+                    ctrl_ids = ctrl_ids_chunk[i0:i1]
+                    z_ctrl = z_ctrl_chunk[i0:i1]
+                    ctrl_dist = ctrl_dist_chunk[i0:i1]
+                    
                     batch = {
                         "z_q": z_q,                       # (b, d)
                         "xbar_q": xbar_q,                 # (b, G)
                         "cell_ids": ids_q,                # (b,)
-                        "target_idx": tgt_idx[i0:i1],     # (b,)
+                        "target_idx": tgt_idx_chunk[i0:i1], # (b,)
                         "env_code": np.full((i1 - i0,), self.env_codes[dsid], dtype=np.int64),
                         # control matches:
                         "ctrl_idx": ctrl_idx,             # (b, k), labels into z_ctrl/ctrl_ids

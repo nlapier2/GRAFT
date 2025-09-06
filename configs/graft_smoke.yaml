@@ -8,7 +8,7 @@ paths:
   control_index_dir: artifacts_v2/knn_control_index/  # <- contains knn.index, ctrl_ids.parquet, knn_meta.json
   control_z_npz: artifacts_v2/scvi_k562_max200k_control_only_v2/scvi_z_K562.npz  # <- from train_scvi output
   factor_U: artifacts_v2/learned_factor_encoders/factor_W_K562.npy
-  output_dir: artifacts/gnn_runs/smoke
+  output_dir: artifacts_v2/gnn_runs/smoke
 
 
 training:
@@ -30,13 +30,41 @@ training:
   ckpt_every: 150
 
 loss:
-  w_consistency: 1.0
-  w_invariance: 0.0             # start off
-  w_distribution: 0.0           # start off
-  distribution: "energy"        # or "swd"
+  distribution:
+    type: swd     # swd | mmd | energy
+    weight: 1.0
+  rex:
+    weight: 0.1
+  irm:
+    weight: 0.0
+    use_target_only: true
+  consistency:
+    weight: 0.5
+  direct:
+    l1: 1.0e-4
+    orth_to_U: 0.0
 
 model:
-  dim_z: null                   # inferred on first batch
-  hidden: 256
-  depth: 2
-  dropout: 0.0
+  # z_dim is inferred from data, no need to set it here
+  propagator:
+    hidden: 256
+    layers: 2
+    steps: 2
+    dropout: 0.0
+    use_env_film: true
+    use_target_cond: true
+    target_embed_dim: 32
+  step0:
+    hidden: 64
+    init_eff: 0.9
+    mode: "down"
+  mediated:
+    F: 273  # NOTE: This must match the number of factors in your factor_U.npy
+    hidden: 256
+    use_factor_feats: false
+    a_dim: 0
+    nonneg: true
+    dropout: 0.0
+  direct:
+    hidden: 256
+    dropout: 0.0
