@@ -234,9 +234,29 @@ class GraftStreamingDataset:
         self.gene_to_idx: Dict[str, int] = {g: i for i, g in enumerate(self.gene_list)}
 
         # Index parquet (authoritative metadata)
-        idx = pd.read_parquet(cfg.index_parquet)
-        idx["cell_id"] = idx["cell_id"].astype(str)
-        idx["dataset_id"] = idx["dataset_id"].astype(str)
+        idx_all = pd.read_parquet(cfg.index_parquet)
+        idx_all["cell_id"] = idx_all["cell_id"].astype(str)
+        idx_all["dataset_id"] = idx_all["dataset_id"].astype(str)
+
+        # Load the reference AnnData used for scVI training first to get valid datasets
+        print(f"[info] Loading reference AnnData for scVI: {self.cfg.scvi_input_h5ad}")
+        self.scvi_reference_adata = ad.read_h5ad(cfg.scvi_input_h5ad)
+        
+        # Get the set of datasets actually present in the scVI reference file.
+        valid_scvi_datasets = set(self.scvi_reference_adata.obs['dataset_id'].astype(str).unique())
+        
+        # Filter the main index to include ONLY datasets known to scVI.
+        original_count = len(idx_all['dataset_id'].unique())
+        idx = idx_all[idx_all["dataset_id"].isin(valid_scvi_datasets)].copy()
+        filtered_count = len(idx['dataset_id'].unique())
+        
+        if filtered_count < original_count:
+            print(f"[warn] Filtered index from {original_count} to {filtered_count} datasets "
+                  f"to match scvi reference AnnData.")
+        if idx.empty:
+            raise ValueError("No overlapping datasets found between index_parquet and scvi_reference_adata.")
+        
+        # Proceed with the filtered index from now on
         self.index = idx
 
         # Target gene → index mapping (best-effort; absent targets → -1)

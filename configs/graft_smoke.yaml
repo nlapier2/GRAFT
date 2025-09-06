@@ -1,6 +1,6 @@
 # configs/gnn_smoke.yaml
 paths:
-  datasets_yaml: configs/data_smoke.yaml  # <- specifies datasets to use
+  datasets_yaml: configs/datasets.yaml  # <- specifies datasets to use
   index_parquet: artifacts_v2/cell_index.parquet  # <- full index with controls+perturbed
   gene_list_tsv: artifacts_v2/gene_list.tsv  # <- from build_gene_maps.py
   scvi_model_dir: artifacts_v2/scvi_k562_max200k_control_only_v2/scvi_K562/  # <- trained control-only scVI
@@ -13,7 +13,7 @@ paths:
 
 training:
   epochs: 1
-  steps_per_epoch: 100          # small; we just want to see it train
+  steps_per_epoch: 10          # small; we just want to see it train
   batch_size: 512
   chunk_size: 20000             # per-dataset backed chunk
   forward_batch_size: 4096      # scVI internal forward size (per chunk)
@@ -27,7 +27,7 @@ training:
   oversample: 4
   seed: 1337
   log_every: 5
-  ckpt_every: 25
+  ckpt_every: 5
 
 loss:
   distribution:
