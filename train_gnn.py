@@ -27,6 +27,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import yaml
+import time
 
 # --- Imports from the new data pipeline ---
 from graft.data.dataset import GraftStreamingConfig, GraftStreamingDataset
@@ -40,6 +41,14 @@ from graft.losses.distribution import sliced_wasserstein, mmd_rbf, energy_distan
 from graft.losses.consistency import target_knockdown_consistency
 from graft.losses.invariance import risk_extrapolation, irmv1_penalty
 from graft.utils.common import seed_everything
+
+
+# --- Initialize accumulators outside the loop ---
+timings = {
+    "data_fetch": [],
+    "model_forward": [],
+    "loss_backward": []
+}
 
 
 def set_seed(seed: int = 1337):
@@ -183,6 +192,7 @@ def main():
     # --- Main Training Loop (New Data Loading + Old Model/Loss Logic) ---
     print("Starting training loop...")
     for dsid in chooser:
+        start_fetch = time.time()
         batch = next(iter(ds.iter_batches([dsid])), None)
         if batch is None:
             continue
@@ -203,8 +213,10 @@ def main():
         prop.train(); step0.train(); head_med.train(); head_dir.train()
         tb = to_device(batch, device)
         y_true = tb["xbar_q"]
+        timings["data_fetch"].append(time.time() - start_fetch)
 
         # Calculate x0 as the mean expression of the matched controls (k neighbors)
+        start_forward = time.time()
         if "xbar_ctrl" in tb and tb["xbar_ctrl"].shape[1] > 0:
             x0 = tb["xbar_ctrl"].mean(dim=1)  # Average across k neighbors -> shape (B, G)
         else:
@@ -217,8 +229,10 @@ def main():
         dx_med = m @ U
         dx_dir = head_dir(z_ref)
         y_pred = x_clamp + dx_med + dx_dir
+        timings["model_forward"].append(time.time() - start_forward)
         
-        # --- Restored Loss Calculation ---
+        # --- Loss Calculation ---
+        start_backward = time.time()
         per_env_losses = []
         unique_envs_in_batch = torch.unique(tb["env_code"])
         for env_code in unique_envs_in_batch:
@@ -243,6 +257,7 @@ def main():
         all_params = list(prop.parameters()) + list(step0.parameters()) + list(head_med.parameters()) + list(head_dir.parameters())
         torch.nn.utils.clip_grad_norm_(all_params, 5.0)
         opt.step()
+        timings["loss_backward"].append(time.time() - start_backward)
 
         step += 1
         if step % log_every == 0:
@@ -264,6 +279,15 @@ def main():
     model_dict = {"prop": prop, "step0": step0, "head_med": head_med, "head_dir": head_dir}
     save_checkpoint(model_dict, opt, step, outdir)
     print(f"[done] total steps: {step}, final models saved to {outdir}")
+
+    avg_fetch_time = sum(timings["data_fetch"]) / len(timings["data_fetch"])
+    avg_forward_time = sum(timings["model_forward"]) / len(timings["model_forward"])
+    avg_backward_time = sum(timings["loss_backward"]) / len(timings["loss_backward"])
+
+    print(f"\nAverage time per step:")
+    print(f"  Data Fetching & Prep: {avg_fetch_time:.4f} seconds")
+    print(f"  Model Forward Pass:   {avg_forward_time:.4f} seconds")
+    print(f"  Loss & Backward Pass: {avg_backward_time:.4f} seconds")
 
 if __name__ == "__main__":
     main()

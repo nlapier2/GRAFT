@@ -15,6 +15,8 @@ import pandas as pd
 import scvi
 from scipy import sparse
 
+import time
+
 # Optional ANN backends
 _HAS_FAISS = False
 _HAS_HNSW = False
@@ -343,6 +345,7 @@ class GraftStreamingDataset:
             cs = int(self.cfg.chunk_size)
 
             for start in range(0, n_obs, cs):
+                t0 = time.time()
                 end = min(start + cs, n_obs)
                 # Materialize + align + filter this chunk
                 A_chunk = preprocess_chunk(
@@ -356,25 +359,34 @@ class GraftStreamingDataset:
                 )
                 if A_chunk.n_obs == 0:
                     continue
+                t1 = time.time()
+                print(f"[profile] Chunk Preprocessing: {t1 - t0:.4f} sec")
                 
                 # Use the single cached model to encode/decode the new data chunk
+                t2 = time.time()
                 z_chunk = qmodel.get_latent_representation(A_chunk, batch_size=self.cfg.forward_batch_size)
                 xbar_chunk = qmodel.get_normalized_expression(A_chunk, batch_size=self.cfg.forward_batch_size, n_samples=1, library_size="latent")
                 if not isinstance(xbar_chunk, np.ndarray):
                     xbar_chunk = xbar_chunk.to_numpy()
+                t3 = time.time()
+                print(f"[profile] Query Cell Decoding (z+xbar): {t3 - t2:.4f} sec")
 
                 # Map per-row targets
                 tgt_idx_chunk = self._targets_for_ids(A_chunk.obs_names.astype(str))
 
                 # Match controls for the ENTIRE CHUNK at once
+                t4 = time.time()
                 match_ds = dsid if (self.cfg.match_within == "dataset") else None
                 ctrl_idx_chunk, ctrl_ids_chunk, ctrl_dist_chunk = self.ann.query(
                     z_chunk, k=self.cfg.k_controls, match_dataset=match_ds, oversample=self.cfg.oversample
                 )
                 z_ctrl_chunk = self.ann.z_ctrl[ctrl_idx_chunk.clip(min=0)]
+                t5 = time.time()
+                print(f"[profile] ANN Query: {t5 - t4:.4f} sec")
 
                 # Fetch the normalized expression (xbar) for the matched control cells.
                 # We need to get unique indices and then map them back to the batch shape.
+                t6 = time.time()
                 unique_ctrl_indices = np.unique(ctrl_idx_chunk[ctrl_idx_chunk >= 0])
                 if len(unique_ctrl_indices) > 0:
                     # Retrieve xbar for all unique controls needed for this chunk.
@@ -397,6 +409,8 @@ class GraftStreamingDataset:
                             idx = ctrl_idx_chunk[i, j]
                             if idx in index_to_xbar_map:
                                 xbar_ctrl_chunk[i, j] = index_to_xbar_map[idx]
+                    t7 = time.time()
+                    print(f"[profile] Control Cell Decoding: {t7 - t6:.4f} sec")
                 else:
                     print(f"[warn] No valid controls found for dataset {dsid} in this chunk.")
                     xbar_ctrl_chunk = np.zeros((B, k, G), dtype=np.float32) # Fallback if no controls found
