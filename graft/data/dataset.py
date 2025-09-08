@@ -50,6 +50,7 @@ class ControlANN:
     Requires:
       - control index dir with: knn.index, ctrl_ids.parquet, knn_meta.json
       - control Z npz (same used to build the index) to fetch z_ctrl by label.
+      - control xbar npz (precomputed expression data for controls). 
       - index_parquet (global) to map control cell_id -> dataset_id (for filters).
     """
     backend: str
@@ -58,6 +59,7 @@ class ControlANN:
     index: object
     ctrl_ids: np.ndarray  # shape (N,)
     z_ctrl: np.ndarray    # shape (N, d)
+    xbar_ctrl: np.ndarray # shape (N, G)
     ctrl_ds_lookup: Dict[str, str]  # cell_id -> dataset_id
 
     @staticmethod
@@ -70,9 +72,10 @@ class ControlANN:
         cls,
         control_index_dir: str,
         control_z_npz: str,
+        control_xbar_npz: str,
         index_parquet: str,
     ) -> "ControlANN":
-        """ Load ANN index, control IDs from parquet, and control Z from scVI NPZ """
+        """ Load ANN index, control IDs from parquet, control Z, and control xbar """
         meta_path = os.path.join(control_index_dir, "knn_meta.json")
         ids_path = os.path.join(control_index_dir, "ctrl_ids.parquet")
         idx_path = os.path.join(control_index_dir, "knn.index")
@@ -117,6 +120,29 @@ class ControlANN:
             # tolerate meta dim mismatch if possible
             dim = Z.shape[1]
 
+        print(f"[info] Loading precomputed control xbar from: {control_xbar_npz}")
+        try:
+            xfile = np.load(control_xbar_npz, allow_pickle=False)
+        except Exception as e:
+            print(f"Error loading {control_xbar_npz}: {e}")
+            raise
+        
+        if "xbar" not in xfile:
+            # Fallback check for different key names if necessary, e.g. 'X' or 'data'
+            potential_keys = [k for k in xfile.keys() if 'x' in k.lower() or 'data' in k.lower()]
+            if potential_keys:
+                print(f"[warn] 'xbar' key not found in {control_xbar_npz}. Using key '{potential_keys[0]}'.")
+                xbar_key = potential_keys[0]
+            else:
+                raise ValueError(f"{control_xbar_npz} must contain precomputed expression array (key 'xbar' expected). Found keys: {list(xfile.keys())}")
+        else:
+            xbar_key = "xbar"
+
+        Xbar = np.asarray(xfile[xbar_key], dtype=np.float32, order="C")
+        if Xbar.shape[0] != ctrl_ids.shape[0]:
+            raise ValueError(f"xbar rows ({Xbar.shape[0]}) != ctrl_ids rows ({ctrl_ids.shape[0]}). "
+                             "Ensure control xbar file matches control index.")
+
         # Lookup control dataset per cell_id for post-filtering
         idx = pd.read_parquet(index_parquet)[["cell_id", "dataset_id"]].copy()
         idx["cell_id"] = idx["cell_id"].astype(str)
@@ -129,6 +155,7 @@ class ControlANN:
             index=index,
             ctrl_ids=ctrl_ids,
             z_ctrl=Z,
+            xbar_ctrl=Xbar,
             ctrl_ds_lookup=ctrl_ds_lookup,
         )
 
@@ -143,7 +170,7 @@ class ControlANN:
         """
         Given query z for perturbed cells, find k nearest control cells.
         Returns (ctrl_idx, ctrl_ids, ctrl_dist) for each query row.
-        ctrl_idx are integer labels into self.z_ctrl / self.ctrl_ids.
+        ctrl_idx are integer labels into self.z_ctrl / self.ctrl_ids / self.xbar_ctrl.
         """
         Q = z_query.astype(np.float32, copy=False)
         if self.metric == "cosine":
@@ -211,6 +238,7 @@ class GraftStreamingConfig:
     scvi_input_h5ad: str
     control_index_dir: str
     control_z_npz: str
+    control_xbar_npz: str
 
     batch_size: int = 2048
     chunk_size: int = 50_000
@@ -302,7 +330,12 @@ class GraftStreamingDataset:
                 raise KeyError("Cannot create 'tech_batch_id'; missing 'dataset_id' or 'batch_id' in reference adata.obs.")
 
         # Control ANN
-        self.ann = ControlANN.load(cfg.control_index_dir, cfg.control_z_npz, cfg.index_parquet)
+        self.ann = ControlANN.load(
+            cfg.control_index_dir, 
+            cfg.control_z_npz, 
+            cfg.control_xbar_npz, 
+            cfg.index_parquet
+        )
 
         # Env coding (dataset → int)
         self.env_codes: Dict[str, int] = {dsid: i for i, dsid in enumerate(sorted(self.by_ds.keys()))}
@@ -384,36 +417,19 @@ class GraftStreamingDataset:
                 t5 = time.time()
                 print(f"[profile] ANN Query: {t5 - t4:.4f} sec")
 
-                # Fetch the normalized expression (xbar) for the matched control cells.
-                # We need to get unique indices and then map them back to the batch shape.
                 t6 = time.time()
-                unique_ctrl_indices = np.unique(ctrl_idx_chunk[ctrl_idx_chunk >= 0])
-                if len(unique_ctrl_indices) > 0:
-                    # Retrieve xbar for all unique controls needed for this chunk.
-                    xbar_ctrl_flat = qmodel.get_normalized_expression(
-                        indices=unique_ctrl_indices,
-                        batch_size=self.cfg.forward_batch_size,
-                        n_samples=1,
-                        library_size=1e4,
-                    ).to_numpy()
-                    
-                    # Create a mapping from index to expression data
-                    index_to_xbar_map = {idx: xbar_ctrl_flat[i] for i, idx in enumerate(unique_ctrl_indices)}
-                    
-                    # Reconstruct the batch shape (B, k, G)
-                    B, k = ctrl_idx_chunk.shape
-                    G = xbar_ctrl_flat.shape[1]
-                    xbar_ctrl_chunk = np.zeros((B, k, G), dtype=np.float32)
-                    for i in range(B):
-                        for j in range(k):
-                            idx = ctrl_idx_chunk[i, j]
-                            if idx in index_to_xbar_map:
-                                xbar_ctrl_chunk[i, j] = index_to_xbar_map[idx]
-                    t7 = time.time()
-                    print(f"[profile] Control Cell Decoding: {t7 - t6:.4f} sec")
-                else:
-                    print(f"[warn] No valid controls found for dataset {dsid} in this chunk.")
-                    xbar_ctrl_chunk = np.zeros((B, k, G), dtype=np.float32) # Fallback if no controls found
+                # Clip indices to handle invalid matches (-1) by pointing them to index 0.
+                clipped_indices = ctrl_idx_chunk.clip(min=0)
+                # Fetch precomputed xbar using advanced indexing: shape (B, k, G)
+                xbar_ctrl_chunk = self.ann.xbar_ctrl[clipped_indices]
+
+                # Mask out invalid entries where ctrl_idx_chunk was < 0.
+                # Create a mask of shape (B, k) and expand dimensions to broadcast over G.
+                invalid_mask = ctrl_idx_chunk < 0 # Shape (B, k)
+                xbar_ctrl_chunk[invalid_mask] = 0.0 # Set expression vectors for invalid matches to zero.
+                
+                t7 = time.time()
+                print(f"[profile] Control Data Lookup: {t7 - t6:.4f} sec")
 
                 # Break chunk into mini-batches
                 B = int(self.cfg.batch_size)
@@ -427,7 +443,7 @@ class GraftStreamingDataset:
                     ctrl_idx = ctrl_idx_chunk[i0:i1]
                     ctrl_ids = ctrl_ids_chunk[i0:i1]
                     z_ctrl = z_ctrl_chunk[i0:i1]
-                    x_bar_ctrl = xbar_ctrl_chunk[i0:i1]
+                    x_bar_ctrl = xbar_ctrl_chunk[i0:i1] # Renamed variable for clarity
                     ctrl_dist = ctrl_dist_chunk[i0:i1]
                     
                     batch = {

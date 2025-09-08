@@ -135,6 +135,7 @@ def main():
         scvi_input_h5ad=paths["scvi_input_h5ad"],
         control_index_dir=paths["control_index_dir"],
         control_z_npz=paths["control_z_npz"],
+        control_xbar_npz=paths["control_xbar_npz"],
         batch_size=int(train_cfg.get("batch_size", 2048)),
         chunk_size=int(train_cfg.get("chunk_size", 50000)),
         k_controls=int(train_cfg.get("k_controls", 16)),
