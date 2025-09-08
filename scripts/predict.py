@@ -6,8 +6,8 @@ same robust, streaming data pipeline as train_gnn.py.
 
 Workflow:
 1.  Loads a trained model and all required artifacts.
-2.  Accepts a --dataset-id and a template H5AD file. It streams data directly
-    from the raw path specified in datasets.yaml for that dataset_id.
+2.  Accepts a --template-h5ad file containing new cells to predict on, and a
+    --controls-dataset-id to specify which set of trained controls to use for matching.
 3.  Bypasses the index parquet filtering to allow prediction on new, unseen cells.
 4.  Processes data in chunks, generating normalized predictions.
 5.  Re-noises the combined predictions into count space.
@@ -61,7 +61,8 @@ def main():
     parser.add_argument("--config", required=True, help="Path to the training config YAML (e.g., graft_smoke.yaml).")
     parser.add_argument("--checkpoint", required=True, help="Path to the trained model checkpoint (.pt file).")
     parser.add_argument("--renoise-params", required=True, help="Path to the renoise_params.npz file.")
-    parser.add_argument("--dataset-id", required=True, help="The dataset_id for the file to be predicted.")
+    parser.add_argument("--template-h5ad", required=True, help="Path to an AnnData file with new cells to predict.")
+    parser.add_argument("--controls-dataset-id", required=True, help="The dataset_id from training to use for control matching.")
     parser.add_argument("--output-h5ad", required=True, help="Path to save the final predicted AnnData object.")
     parser.add_argument("--batch-size", type=int, default=512, help="Batch size for processing predictions.")
     args = parser.parse_args()
@@ -74,13 +75,6 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     gene_list = load_gene_list(paths["gene_list_tsv"])
-    gene_to_idx = {g: i for i, g in enumerate(gene_list)}
-    
-    # FIX: Load scVI with the reference adata to avoid ValueError
-    scvi_ref_adata = ad.read_h5ad(paths['scvi_input_h5ad'], backed='r')
-    scvi_model = scvi.model.SCVI.load(paths["scvi_model_dir"], adata=scvi_ref_adata)
-    scvi_model.to_device(device)
-    scvi_model.module.eval()
     
     control_ann = ControlANN.load(paths["control_index_dir"], paths["control_z_npz"], paths["control_xbar_npz"], paths["index_parquet"])
     U = build_U(paths["factor_U"], device=device)
@@ -90,68 +84,89 @@ def main():
     final_lib_sizes = {k.replace('_', '-'): v for k, v in renoise_data['lib_sizes_by_dataset'].items()}
     renoiser = ReNoiser(L_ref=renoise_data['L_ref'], theta=renoise_data['theta'], lib_sizes_by_dataset=final_lib_sizes)
     
-    # --- 2. Instantiate and Load Model ---
-    print("Instantiating and loading trained model...")
-    z_dim = scvi_model.module.n_latent
-    G = len(gene_list)
-    ds_ids = sorted(list(scvi_ref_adata.obs['dataset_id'].astype(str).unique()))
-    n_envs = len(ds_ids)
-    env_to_code = {dsid: i for i, dsid in enumerate(ds_ids)}
-
-    prop = StatePropagator(z_dim=z_dim, n_envs=n_envs, n_genes=G, **model_cfg["propagator"]).to(device)
-    step0 = StepZeroClamp(z_dim=z_dim, n_labs=n_envs, **model_cfg["step0"]).to(device)
-    head_med = MediatedHead(z_dim=z_dim, **model_cfg["mediated"]).to(device)
-    head_dir = SparseDirectHead(z_dim=z_dim, G=G, **model_cfg["direct"]).to(device)
-
-    checkpoint = torch.load(args.checkpoint, map_location=device)
-    prop.load_state_dict(checkpoint["models"]["prop"])
-    step0.load_state_dict(checkpoint["models"]["step0"])
-    head_med.load_state_dict(checkpoint["models"]["head_med"])
-    head_dir.load_state_dict(checkpoint["models"]["head_dir"])
-    prop.eval(); step0.eval(); head_med.eval(); head_dir.eval()
-
-    # --- 3. Set up Streaming Data Loader for Prediction ---
-    print(f"Setting up streaming loader for dataset: {args.dataset_id}")
-    with open(paths['datasets_yaml'], 'r') as f:
-        raw_path = yaml.safe_load(f)['datasets'][args.dataset_id]['raw_path']
-    template_adata = ad.read_h5ad(raw_path, backed='r')
+    # --- 2. Set up Streaming Data Loader for Prediction ---
+    print(f"Setting up streaming loader for prediction using controls from: {args.controls_dataset_id}")
+    template_adata = ad.read_h5ad(args.template_h5ad, backed='r')
     original_genes = template_adata.var_names.astype(str).tolist()
     original_obs = template_adata.obs.copy()
 
-    # Create a dummy sampler that yields the target dataset_id indefinitely
-    sampler = BalancedRoundRobin(dataset_ids=[args.dataset_id], steps=None)
+    # Create a temporary yaml for the dataset loader to point to the template file
+    temp_dataset_id = "PREDICTION_TEMP"
+    temp_yaml_path = "temp_predict_datasets.yaml"
+    with open(paths['datasets_yaml'], 'r') as f:
+        datasets_yaml_data = yaml.safe_load(f)
+    datasets_yaml_data['datasets'][temp_dataset_id] = {'raw_path': args.template_h5ad}
+    with open(temp_yaml_path, 'w') as f:
+        yaml.dump(datasets_yaml_data, f)
+    
+    sampler = BalancedRoundRobin(dataset_ids=[temp_dataset_id], steps=None)
     
     ds_cfg = GraftStreamingConfig(
-        datasets_yaml=paths["datasets_yaml"], index_parquet=paths["index_parquet"],
+        datasets_yaml=temp_yaml_path, index_parquet=paths["index_parquet"],
         gene_list_tsv=paths["gene_list_tsv"], scvi_model_dir=paths["scvi_model_dir"],
         scvi_input_h5ad=paths["scvi_input_h5ad"], control_index_dir=paths["control_index_dir"],
         control_z_npz=paths["control_z_npz"], control_xbar_npz=paths["control_xbar_npz"],
         batch_size=args.batch_size, chunk_size=train_cfg.get("chunk_size", 50000),
         k_controls=train_cfg["k_controls"], oversample=train_cfg["oversample"],
-        match_within=train_cfg["match_within"], forward_batch_size=train_cfg["forward_batch_size"],
-        include_controls_in_query=True, # Process all cells
+        match_within=train_cfg.get("match_within", "dataset"), forward_batch_size=train_cfg["forward_batch_size"],
+        include_controls_in_query=True,
         filter_by_index=False # <-- IMPORTANT: Do not filter for unseen cells
     )
-    # The dataset now streams from the raw H5AD for the specified dataset_id
     dataset = GraftStreamingDataset(ds_cfg, sampler)
 
+    # --- 3. Lazy Model Instantiation & Loading ---
+    prop, step0, head_med, head_dir = None, None, None, None
+    
     # --- 4. Prediction Loop ---
     print(f"Generating predictions for {template_adata.n_obs} cells...")
-    all_preds_normalized, all_obs_indices = [], []
+    all_preds_normalized, all_cell_ids = [], []
     
-    # We iterate until we've processed at least as many cells as are in the template
-    with torch.no_grad(), tqdm(total=template_adata.n_obs) as pbar:
-        for batch in dataset:
-            if batch['dataset_id'] != args.dataset_id: continue # Should not happen with this sampler
-            
-            tb = {k: torch.as_tensor(v, device=device) for k, v in batch.items() if isinstance(v, np.ndarray)}
+    data_iterator = iter(dataset)
 
+    with torch.no_grad(), tqdm(total=template_adata.n_obs) as pbar:
+        while len(all_cell_ids) < template_adata.n_obs:
+            try:
+                batch = next(data_iterator)
+            except StopIteration:
+                break
+
+            if prop is None:
+                print("First batch received. Lazily initializing model...")
+                z_dim = batch["z_q"].shape[1]
+                G = len(gene_list)
+                scvi_ref_adata = ad.read_h5ad(paths['scvi_input_h5ad'], backed='r')
+                ds_ids = sorted(list(scvi_ref_adata.obs['dataset_id'].astype(str).unique()))
+                n_envs = len(ds_ids)
+                env_to_code = {dsid: i for i, dsid in enumerate(ds_ids)}
+
+                prop = StatePropagator(z_dim=z_dim, n_envs=n_envs, n_genes=G, **model_cfg["propagator"]).to(device)
+                step0 = StepZeroClamp(z_dim=z_dim, n_labs=n_envs, **model_cfg["step0"]).to(device)
+                head_med = MediatedHead(z_dim=z_dim, **model_cfg["mediated"]).to(device)
+                head_dir = SparseDirectHead(z_dim=z_dim, G=G, **model_cfg["direct"]).to(device)
+
+                checkpoint = torch.load(args.checkpoint, map_location=device)
+                prop.load_state_dict(checkpoint["models"]["prop"])
+                step0.load_state_dict(checkpoint["models"]["step0"])
+                head_med.load_state_dict(checkpoint["models"]["head_med"])
+                head_dir.load_state_dict(checkpoint["models"]["head_dir"])
+                prop.eval(); step0.eval(); head_med.eval(); head_dir.eval()
+
+            tb = {k: torch.as_tensor(v, device=device) for k, v in batch.items() if isinstance(v, np.ndarray)}
+            
             z_q_tensor = tb["z_q"].float()
-            xbar_ctrl = tb["xbar_ctrl"].float()
+            
+            ctrl_idx, _, _ = control_ann.query(
+                tb["z_q"].cpu().numpy(), k=train_cfg["k_controls"], 
+                match_dataset=args.controls_dataset_id, 
+                oversample=train_cfg["oversample"]
+            )
+            xbar_ctrl = torch.tensor(control_ann.xbar_ctrl[ctrl_idx.clip(min=0)], device=device).float()
+            xbar_ctrl[ctrl_idx < 0] = 0.0
             x0 = xbar_ctrl.mean(dim=1)
 
             target_idx = tb["target_idx"].long()
-            env_code = tb["env_code"].long()
+            env_code_val = env_to_code[args.controls_dataset_id]
+            env_code = torch.full_like(target_idx, env_code_val)
 
             z_ref = prop(z_q_tensor, target_idx=target_idx, env_codes=env_code)
             x_clamp, _ = step0(x0, z_ref, env_code, target_idx)
@@ -161,26 +176,23 @@ def main():
             y_pred_normalized = x_clamp + dx_med + dx_dir
 
             all_preds_normalized.append(y_pred_normalized.cpu().numpy())
-            # We need to reconstruct the final AnnData, so we save the original obs names
-            all_obs_indices.extend(batch['cell_ids'])
+            all_cell_ids.extend(batch['cell_ids'])
 
             pbar.update(len(batch['cell_ids']))
-            if len(all_obs_indices) >= template_adata.n_obs:
-                break
+
+    os.remove(temp_yaml_path)
 
     # --- 5. Assemble, Re-noise, and Unscramble ---
     print("Finalizing predictions: re-noising and unscrambling genes...")
     final_normalized_matrix = np.vstack(all_preds_normalized)
-    final_obs = original_obs.loc[[cid.split('::')[1] for cid in all_obs_indices]]
+    final_obs = original_obs.loc[[cid.split('::')[1] for cid in all_cell_ids]]
 
-    # Re-noise
     final_counts_canonical = renoiser.sample_counts(
         xbar=final_normalized_matrix,
-        dataset_ids=final_obs["dataset_id"].astype(str).tolist(),
+        dataset_ids=[args.controls_dataset_id] * len(final_obs),
         mode="empirical"
     )
 
-    # Unscramble genes
     back_projection = _build_projection(gene_list, original_genes)
     final_counts_unscrambled = final_counts_canonical @ back_projection
 
@@ -198,3 +210,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
