@@ -76,7 +76,14 @@ def main():
 
     # 3. Estimate dispersion parameters (alpha and theta)
     print("Estimating per-gene dispersion (alpha/theta)...")
-    alpha = estimate_alpha_from_counts(adata.X, full_lib_sizes, L_ref=args.l_ref)
+    
+    # Convert the sparse matrix to a dense numpy array before passing.
+    if sparse.issparse(adata.X):
+        counts_dense = adata.X.toarray()
+    else:
+        counts_dense = adata.X
+        
+    alpha = estimate_alpha_from_counts(counts_dense, full_lib_sizes, L_ref=args.l_ref)
     
     # Clip for numerical stability when inverting
     theta = 1.0 / np.clip(alpha, 1e-8, None)
@@ -104,3 +111,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
