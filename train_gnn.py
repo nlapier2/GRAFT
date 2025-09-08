@@ -197,8 +197,6 @@ def main():
     dist_fn = pick_dist_fn(loss_cfg["distribution"].get("type", "swd"))
     w_dist = float(loss_cfg["distribution"].get("weight", 1.0))
     w_rex  = float(loss_cfg["rex"].get("weight", 0.1))
-    w_irm  = float(loss_cfg["irm"].get("weight", 0.0))
-    irm_target_only = bool(loss_cfg["irm"].get("use_target_only", True))
     w_cons = float(loss_cfg["consistency"].get("weight", 0.5))
     w_l1   = float(loss_cfg["direct"].get("l1", 1e-4))
     w_orth = float(loss_cfg["direct"].get("orth_to_U", 0.0))
@@ -279,14 +277,13 @@ def main():
         
         loss_dist = w_dist * (torch.stack(per_env_losses).mean() if per_env_losses else torch.tensor(0.0, device=device))
         loss_rex  = w_rex  * (risk_extrapolation(per_env_losses) if len(per_env_losses) > 1 else torch.tensor(0.0, device=device))
-        loss_irm  = w_irm  * irmv1_penalty(y_pred, y_true, tb["env_code"], use_target_only=irm_target_only, target_idx=tb["target_idx"]) if w_irm > 0 else torch.tensor(0.0, device=device)
         loss_cons = w_cons * target_knockdown_consistency(y_pred, y_true, tb["target_idx"], mode="mse")
         loss_l1   = w_l1   * dx_dir.abs().mean()
         loss_orth = torch.tensor(0.0, device=device)
         if w_orth > 0.0:
             loss_orth = w_orth * ((dx_dir @ U) ** 2).mean()
 
-        total_loss = loss_dist + loss_rex + loss_irm + loss_cons + loss_l1 + loss_orth
+        total_loss = loss_dist + loss_rex + loss_cons + loss_l1 + loss_orth
 
         opt.zero_grad()
         total_loss.backward()
@@ -300,7 +297,7 @@ def main():
             log_data = {
                 "step": step_index, "dataset": batch["dataset_id"], "loss": float(total_loss.item()),
                 "dist": float(loss_dist.item()), "rex": float(loss_rex.item()),
-                "irm": float(loss_irm.item()), "cons": float(loss_cons.item()),
+                "cons": float(loss_cons.item()),
                 "l1": float(loss_l1.item()), "orth": float(loss_orth.item()),
             }
             print(json.dumps(log_data))
