@@ -252,13 +252,17 @@ class GraftStreamingConfig:
 class GraftStreamingDataset:
     """Streams mini-batches across datasets with on-the-fly scVI and ANN control matching.
 
-    Usage:
-      ds = GraftStreamingDataset(cfg)
-      for batch in ds.iter_batches(dataset_order):
+    Usage (new):
+      sampler = make_dataset_chooser(...)
+      ds = GraftStreamingDataset(cfg, sampler)
+      for batch in ds: # ds is now directly iterable
           train_step(batch)
     """
-    def __init__(self, cfg: GraftStreamingConfig):
+    def __init__(self, cfg: GraftStreamingConfig, sampler: Iterator[str]): # <<< CHANGE_1: Added sampler argument
         self.cfg = cfg
+        self.sampler = sampler # <<< CHANGE_2: Store sampler internally
+
+        # --- All existing __init__ code below remains the same ---
         # Genes and mapping
         self.gene_list: List[str] = load_gene_list(cfg.gene_list_tsv)
         self.gene_to_idx: Dict[str, int] = {g: i for i, g in enumerate(self.gene_list)}
@@ -272,10 +276,7 @@ class GraftStreamingDataset:
         print(f"[info] Loading reference AnnData for scVI: {self.cfg.scvi_input_h5ad}")
         self.scvi_reference_adata = ad.read_h5ad(cfg.scvi_input_h5ad)
         
-        # Get the set of datasets actually present in the scVI reference file.
         valid_scvi_datasets = set(self.scvi_reference_adata.obs['dataset_id'].astype(str).unique())
-        
-        # Filter the main index to include ONLY datasets known to scVI.
         original_count = len(idx_all['dataset_id'].unique())
         idx = idx_all[idx_all["dataset_id"].isin(valid_scvi_datasets)].copy()
         filtered_count = len(idx['dataset_id'].unique())
@@ -286,39 +287,27 @@ class GraftStreamingDataset:
         if idx.empty:
             raise ValueError("No overlapping datasets found between index_parquet and scvi_reference_adata.")
         
-        # Proceed with the filtered index from now on
         self.index = idx
-
-        # Target gene → index mapping (best-effort; absent targets → -1)
         self.target_col = "target_gene" if "target_gene" in idx.columns else ("target" if "target" in idx.columns else None)
         self._target_map_cache: Dict[str, int] = {}
 
-        # Restrict query pool per dataset
         if not cfg.include_controls_in_query and "is_control" in idx.columns:
             self.query_pool = idx[~idx["is_control"].astype(bool)].copy()
         else:
             self.query_pool = idx.copy()
 
-        # Per-dataset tables
         self.by_ds: Dict[str, pd.DataFrame] = {
             dsid: g.copy() for dsid, g in self.query_pool.groupby("dataset_id")
         }
 
-        # Read datasets.yaml (mapping)
         with open(cfg.datasets_yaml, "r") as f:
             y = json.loads(json.dumps(_yaml_safe_load(f.read())))
         ds_map = y.get("datasets", {})
         self.ds_paths: Dict[str, str] = {str(k): str(v["raw_path"]) for k, v in ds_map.items() if isinstance(v, dict) and "raw_path" in v}
         
-        # Cache for initialized scVI models, one per dataset
         self.scvi_model_cache: Dict[str, scvi.model.SCVI] = {}
+        # self.scvi_reference_adata already loaded above
 
-        # Load the reference AnnData for scvi model loading once
-        print(f"[info] Loading reference AnnData for scVI: {self.cfg.scvi_input_h5ad}")
-        self.scvi_reference_adata = ad.read_h5ad(self.cfg.scvi_input_h5ad)
-
-        # Ensure the reference adata has the tech_batch_id scVI was trained on.
-        # This makes the loader robust to older scvi_input files.
         if "tech_batch_id" not in self.scvi_reference_adata.obs.columns:
             print("[warn] 'tech_batch_id' not found in scvi_reference_adata.obs. Creating it on the fly.")
             obs = self.scvi_reference_adata.obs
@@ -329,15 +318,12 @@ class GraftStreamingDataset:
             else:
                 raise KeyError("Cannot create 'tech_batch_id'; missing 'dataset_id' or 'batch_id' in reference adata.obs.")
 
-        # Control ANN
         self.ann = ControlANN.load(
             cfg.control_index_dir, 
             cfg.control_z_npz, 
             cfg.control_xbar_npz, 
             cfg.index_parquet
         )
-
-        # Env coding (dataset → int)
         self.env_codes: Dict[str, int] = {dsid: i for i, dsid in enumerate(sorted(self.by_ds.keys()))}
 
     def get_dataset_ids(self) -> List[str]:
@@ -345,122 +331,136 @@ class GraftStreamingDataset:
 
     # ---- iteration ---- #
 
-    def iter_batches(self, dataset_sequence: Iterable[str]) -> Iterator[Dict[str, np.ndarray]]:
-        """Yield batches in the order specified by dataset_sequence (e.g., round-robin)."""
-        for dsid in dataset_sequence:
-            if dsid not in self.by_ds or dsid not in self.ds_paths:
-                continue
-            raw_path = self.ds_paths[dsid]
-            rows_meta = self.by_ds[dsid]
-            if rows_meta.empty:
-                continue
-            
-            # Check cache for an initialized scVI model.
-            # The model object is now shared across all datasets.
-            if "model" not in self.scvi_model_cache:
-                print(f"[info] Initializing shared scVI model.")
-                # Load the base scVI model, providing the reference AnnData it was trained on.
-                # This is the crucial fix for the ValueError.
-                model = scvi.model.SCVI.load(
-                    self.cfg.scvi_model_dir, 
-                    adata=self.scvi_reference_adata
-                )
-                model.module.eval()
-                # Store the initialized, ready-to-use model in the cache
-                self.scvi_model_cache["model"] = model
-            
-            # Retrieve the cached model
-            qmodel = self.scvi_model_cache["model"]
+    # <<< CHANGE_3: Refactor iter_batches into __iter__ and a helper generator a_chunk_processor >>>
 
-            # Stream the raw H5AD in chunks
+    def __iter__(self) -> Iterator[Dict[str, np.ndarray]]:
+        """Main iterator. Cycles through datasets based on the sampler policy."""
+        
+        # State: Keep track of the current chunk generator for each dataset.
+        # {dsid: generator}
+        chunk_processor_cache: Dict[str, Iterator[Dict[str, np.ndarray]]] = {}
+
+        for dsid in self.sampler:
+            if dsid not in self.by_ds: # Sampler might yield dsid not in query pool (e.g. if filtering)
+                continue
+
+            if dsid not in chunk_processor_cache:
+                # Create a new generator for this dataset's chunks
+                chunk_processor_cache[dsid] = self._process_dataset_chunks(dsid)
+
+            try:
+                # Yield one batch from the active chunk processor
+                yield next(chunk_processor_cache[dsid])
+            except StopIteration:
+                # This dataset's file reading is complete for one full pass.
+                # Remove it from cache so it restarts if sampled again in a subsequent epoch.
+                del chunk_processor_cache[dsid]
+
+    def _process_dataset_chunks(self, dsid: str) -> Iterator[Dict[str, np.ndarray]]:
+        """Generator that processes all chunks for a single dataset and yields mini-batches."""
+        # This function contains the logic previously in iter_batches, processing one dataset fully.
+        if dsid not in self.by_ds or dsid not in self.ds_paths:
+            return # Should not happen if called from __iter__ with valid dsid
+
+        raw_path = self.ds_paths[dsid]
+        rows_meta = self.by_ds[dsid]
+        if rows_meta.empty:
+            return
+
+        # Check cache for an initialized scVI model.
+        if "model" not in self.scvi_model_cache:
+            print(f"[info] Initializing shared scVI model for dataset {dsid}.")
+            model = scvi.model.SCVI.load(
+                self.cfg.scvi_model_dir, 
+                adata=self.scvi_reference_adata
+            )
+            model.module.eval()
+            self.scvi_model_cache["model"] = model
+        
+        qmodel = self.scvi_model_cache["model"]
+
+        # Stream the raw H5AD in chunks
+        try:
             A_b = ad.read_h5ad(raw_path, backed="r")
-            n_obs = A_b.n_obs
-            cs = int(self.cfg.chunk_size)
+        except Exception as e:
+            print(f"[error] Failed to read H5AD {raw_path} for dataset {dsid}: {e}")
+            return
+            
+        n_obs = A_b.n_obs
+        cs = int(self.cfg.chunk_size)
 
-            for start in range(0, n_obs, cs):
-                t0 = time.time()
-                end = min(start + cs, n_obs)
-                # Materialize + align + filter this chunk
-                A_chunk = preprocess_chunk(
-                    A_backed=A_b,
-                    row_index=slice(start, end),
-                    gene_list=self.gene_list,
-                    dataset_id=dsid,
-                    index_df=rows_meta,
-                    counts_layer=None,
-                    keep_cols=FINAL_OBS_COLS,
-                )
-                if A_chunk.n_obs == 0:
-                    continue
-                t1 = time.time()
-                print(f"[profile] Chunk Preprocessing: {t1 - t0:.4f} sec")
+        for start in range(0, n_obs, cs):
+            t0 = time.time()
+            end = min(start + cs, n_obs)
+            A_chunk = preprocess_chunk(
+                A_backed=A_b,
+                row_index=slice(start, end),
+                gene_list=self.gene_list,
+                dataset_id=dsid,
+                index_df=rows_meta,
+                counts_layer=None,
+                keep_cols=FINAL_OBS_COLS,
+            )
+            if A_chunk.n_obs == 0:
+                continue
+            t1 = time.time()
+            print(f"[profile] Chunk Preprocessing ({dsid} {start}-{end}): {t1 - t0:.4f} sec")
+            
+            t2 = time.time()
+            z_chunk = qmodel.get_latent_representation(A_chunk, batch_size=self.cfg.forward_batch_size)
+            xbar_chunk = qmodel.get_normalized_expression(A_chunk, batch_size=self.cfg.forward_batch_size, n_samples=1, library_size=1e4)
+            if not isinstance(xbar_chunk, np.ndarray):
+                xbar_chunk = xbar_chunk.to_numpy()
+            t3 = time.time()
+            print(f"[profile] Query Cell Decoding (z+xbar): {t3 - t2:.4f} sec")
+
+            tgt_idx_chunk = self._targets_for_ids(A_chunk.obs_names.astype(str))
+
+            t4 = time.time()
+            match_ds = dsid if (self.cfg.match_within == "dataset") else None
+            ctrl_idx_chunk, ctrl_ids_chunk, ctrl_dist_chunk = self.ann.query(
+                z_chunk, k=self.cfg.k_controls, match_dataset=match_ds, oversample=self.cfg.oversample
+            )
+            z_ctrl_chunk = self.ann.z_ctrl[ctrl_idx_chunk.clip(min=0)]
+            t5 = time.time()
+            print(f"[profile] ANN Query: {t5 - t4:.4f} sec")
+
+            t6 = time.time()
+            clipped_indices = ctrl_idx_chunk.clip(min=0)
+            xbar_ctrl_chunk = self.ann.xbar_ctrl[clipped_indices]
+            invalid_mask = ctrl_idx_chunk < 0 
+            xbar_ctrl_chunk[invalid_mask] = 0.0
+            t7 = time.time()
+            print(f"[profile] Control Data Lookup: {t7 - t6:.4f} sec")
+
+            # Break chunk into mini-batches
+            B = int(self.cfg.batch_size)
+            N = A_chunk.n_obs
+            for i0 in range(0, N, B):
+                i1 = min(i0 + B, N)
+                z_q = z_chunk[i0:i1]
+                xbar_q = xbar_chunk[i0:i1]
+                ids_q = np.array(A_chunk.obs_names[i0:i1], dtype=str)
+                ctrl_idx = ctrl_idx_chunk[i0:i1]
+                ctrl_ids = ctrl_ids_chunk[i0:i1]
+                z_ctrl = z_ctrl_chunk[i0:i1]
+                x_bar_ctrl = xbar_ctrl_chunk[i0:i1] 
+                ctrl_dist = ctrl_dist_chunk[i0:i1]
                 
-                # Use the single cached model to encode/decode the new data chunk
-                t2 = time.time()
-                z_chunk = qmodel.get_latent_representation(A_chunk, batch_size=self.cfg.forward_batch_size)
-                xbar_chunk = qmodel.get_normalized_expression(A_chunk, batch_size=self.cfg.forward_batch_size, n_samples=1, library_size=1e4)
-                if not isinstance(xbar_chunk, np.ndarray):
-                    xbar_chunk = xbar_chunk.to_numpy()
-                t3 = time.time()
-                print(f"[profile] Query Cell Decoding (z+xbar): {t3 - t2:.4f} sec")
-
-                # Map per-row targets
-                tgt_idx_chunk = self._targets_for_ids(A_chunk.obs_names.astype(str))
-
-                # Match controls for the ENTIRE CHUNK at once
-                t4 = time.time()
-                match_ds = dsid if (self.cfg.match_within == "dataset") else None
-                ctrl_idx_chunk, ctrl_ids_chunk, ctrl_dist_chunk = self.ann.query(
-                    z_chunk, k=self.cfg.k_controls, match_dataset=match_ds, oversample=self.cfg.oversample
-                )
-                z_ctrl_chunk = self.ann.z_ctrl[ctrl_idx_chunk.clip(min=0)]
-                t5 = time.time()
-                print(f"[profile] ANN Query: {t5 - t4:.4f} sec")
-
-                t6 = time.time()
-                # Clip indices to handle invalid matches (-1) by pointing them to index 0.
-                clipped_indices = ctrl_idx_chunk.clip(min=0)
-                # Fetch precomputed xbar using advanced indexing: shape (B, k, G)
-                xbar_ctrl_chunk = self.ann.xbar_ctrl[clipped_indices]
-
-                # Mask out invalid entries where ctrl_idx_chunk was < 0.
-                # Create a mask of shape (B, k) and expand dimensions to broadcast over G.
-                invalid_mask = ctrl_idx_chunk < 0 # Shape (B, k)
-                xbar_ctrl_chunk[invalid_mask] = 0.0 # Set expression vectors for invalid matches to zero.
-                
-                t7 = time.time()
-                print(f"[profile] Control Data Lookup: {t7 - t6:.4f} sec")
-
-                # Break chunk into mini-batches
-                B = int(self.cfg.batch_size)
-                N = A_chunk.n_obs
-                for i0 in range(0, N, B):
-                    i1 = min(i0 + B, N)
-                    # Slice the pre-computed chunk-level results for this mini-batch
-                    z_q = z_chunk[i0:i1]
-                    xbar_q = xbar_chunk[i0:i1]
-                    ids_q = np.array(A_chunk.obs_names[i0:i1], dtype=str)
-                    ctrl_idx = ctrl_idx_chunk[i0:i1]
-                    ctrl_ids = ctrl_ids_chunk[i0:i1]
-                    z_ctrl = z_ctrl_chunk[i0:i1]
-                    x_bar_ctrl = xbar_ctrl_chunk[i0:i1] # Renamed variable for clarity
-                    ctrl_dist = ctrl_dist_chunk[i0:i1]
-                    
-                    batch = {
-                        "z_q": z_q,                       # (b, d)
-                        "xbar_q": xbar_q,                 # (b, G)
-                        "cell_ids": ids_q,                # (b,)
-                        "target_idx": tgt_idx_chunk[i0:i1], # (b,)
-                        "env_code": np.full((i1 - i0,), self.env_codes[dsid], dtype=np.int64),
-                        # control matches:
-                        "ctrl_idx": ctrl_idx,             # (b, k), labels into z_ctrl/ctrl_ids
-                        "ctrl_ids": ctrl_ids,             # (b, k)
-                        "z_ctrl": z_ctrl,                 # (b, k, d)
-                        "xbar_ctrl": x_bar_ctrl,          # (b, k, G)
-                        "ctrl_dist": ctrl_dist,           # (b, k)
-                        "dataset_id": dsid,               # string for reference
-                    }
-                    yield batch
+                batch = {
+                    "z_q": z_q,
+                    "xbar_q": xbar_q,
+                    "cell_ids": ids_q,
+                    "target_idx": tgt_idx_chunk[i0:i1],
+                    "env_code": np.full((i1 - i0,), self.env_codes[dsid], dtype=np.int64),
+                    "ctrl_idx": ctrl_idx,
+                    "ctrl_ids": ctrl_ids,
+                    "z_ctrl": z_ctrl,
+                    "xbar_ctrl": x_bar_ctrl,
+                    "ctrl_dist": ctrl_dist,
+                    "dataset_id": dsid,
+                }
+                yield batch # <<< Yield mini-batch here
 
     # ---- helpers ---- #
 

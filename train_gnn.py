@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-train_gnn.py (reconciled)
+train_gnn.py (reconciled and refactored for efficient iteration)
 =========================
 
 This script combines the modern streaming data pipeline with the original,
 correct multi-component model architecture and detailed loss calculations.
 
-- Streams data via GraftStreamingDataset and samples via make_dataset_chooser.
-- Instantiates the full model: Propagator -> StepZeroClamp -> Mediated/Direct Heads.
-- Computes the complete, multi-part loss function as defined in the original script.
+Refactoring:
+- Implements efficient iteration by creating a single persistent data iterator.
+- The sampler logic is passed into the dataset class to manage stateful chunk loading.
+- Training loop calls next(iterator) instead of re-creating the iterator each step.
 """
 
 from __future__ import annotations
@@ -28,12 +29,13 @@ import torch.nn as nn
 import torch.optim as optim
 import yaml
 import time
+import anndata as ad # Added import for pre-calculation
 
-# --- Imports from the new data pipeline ---
+# --- Imports from the data pipeline ---
 from graft.data.dataset import GraftStreamingConfig, GraftStreamingDataset
 from graft.data.samplers import make_dataset_chooser, estimate_dataset_sizes
 
-# --- Imports from the original, correct model and loss definitions ---
+# --- Imports from the model and loss definitions ---
 from graft.models.gnn_core import StatePropagator
 from graft.models.step0 import StepZeroClamp
 from graft.models.heads import MediatedHead, SparseDirectHead
@@ -74,7 +76,7 @@ def to_device(batch: Dict[str, np.ndarray], device: torch.device) -> Dict[str, t
             out[k] = torch.as_tensor(v, dtype=dtype, device=device)
     return out
 
-# --- Helper functions from the old script ---
+# --- Helper functions ---
 def build_U(path: str, device: torch.device) -> torch.Tensor:
     arr = np.load(path, allow_pickle=False)
     return torch.tensor(arr, dtype=torch.float32, device=device)
@@ -120,13 +122,45 @@ def main():
     train_cfg = cfg.get("training", {})
     loss_cfg = cfg.get("loss", {})
     model_cfg = cfg.get("model", {})
-    data_cfg = cfg.get("data", {})
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     set_seed(int(train_cfg.get("seed", 1337)))
 
-    # --- New Streaming Dataset Setup ---
+    # --- Data and Sampler Setup Refactoring ---
+    # 1. Pre-calculate dataset sizes and IDs for sampler configuration.
+    # This logic mimics the filtering performed inside GraftStreamingDataset.__init__
+    # to ensure the sampler operates on the correct set of cells.
+    print("[info] Pre-calculating dataset sizes for sampler...")
+    index_all = pd.read_parquet(paths["index_parquet"])
+    
+    # Filter index by datasets present in the scVI reference AnnData
+    scvi_reference_adata = ad.read_h5ad(paths["scvi_input_h5ad"])
+    valid_scvi_datasets = set(scvi_reference_adata.obs['dataset_id'].astype(str).unique())
+    query_pool = index_all[index_all["dataset_id"].isin(valid_scvi_datasets)].copy()
+    
+    # Filter to non-controls if specified by config
+    include_controls_in_query = bool(train_cfg.get("include_controls_in_query", False))
+    if not include_controls_in_query and "is_control" in query_pool.columns:
+        query_pool = query_pool[~query_pool["is_control"].astype(bool)]
+
+    # Calculate sizes and get dataset IDs from the filtered query pool
+    sizes = query_pool.groupby("dataset_id").size().to_dict()
+    ds_ids = sorted(list(sizes.keys()))
+    if not ds_ids:
+        raise ValueError("No queryable cells found after filtering by control status and scVI reference datasets.")
+
+    # 2. Create Sampler (Chooser)
+    total_steps = int(train_cfg.get("epochs", 1)) * int(train_cfg.get("steps_per_epoch", 1000))
+    chooser = make_dataset_chooser(
+        dataset_ids=ds_ids, sizes=sizes,
+        policy=str(train_cfg.get("sampler_policy", "weighted")),
+        weight_mode=str(train_cfg.get("sampler_weight_mode", "sqrt")),
+        steps=total_steps,
+        seed=int(train_cfg.get("seed", 1337)),
+    )
+
+    # 3. Initialize Streaming Dataset with Sampler
     ds_cfg = GraftStreamingConfig(
         datasets_yaml=paths["datasets_yaml"],
         index_parquet=paths["index_parquet"],
@@ -142,18 +176,15 @@ def main():
         oversample=int(train_cfg.get("oversample", 5)),
         match_within=str(train_cfg.get("match_within", "dataset")),
         forward_batch_size=int(train_cfg.get("forward_batch_size", 4096)),
-        include_controls_in_query=bool(train_cfg.get("include_controls_in_query", False)),
+        include_controls_in_query=include_controls_in_query,
     )
-    ds = GraftStreamingDataset(ds_cfg)
-    ds_ids = ds.get_dataset_ids()
-    ds_id_to_code = {dsid: i for i, dsid in enumerate(sorted(ds_ids))}
+    # Pass the chooser to the dataset constructor as required by dataset.py refactoring
+    ds = GraftStreamingDataset(ds_cfg, chooser)
     n_envs = len(ds_ids)
 
-    # --- Restored Model Instantiation ---
+    # --- Model Instantiation ---
     G = len(ds.gene_list)
     F = int(model_cfg["mediated"]["F"])
-    # Defer z_dim until first batch
-    
     prop: nn.Module = None
     step0: nn.Module = None
     head_med: nn.Module = None
@@ -161,9 +192,8 @@ def main():
     opt: optim.Optimizer = None
     
     U = build_U(paths["factor_U"], device=device)
-    U_t = U.t().contiguous()
 
-    # --- Restored Loss Configuration ---
+    # --- Loss Configuration ---
     dist_fn = pick_dist_fn(loss_cfg["distribution"].get("type", "swd"))
     w_dist = float(loss_cfg["distribution"].get("weight", 1.0))
     w_rex  = float(loss_cfg["rex"].get("weight", 0.1))
@@ -173,30 +203,35 @@ def main():
     w_l1   = float(loss_cfg["direct"].get("l1", 1e-4))
     w_orth = float(loss_cfg["direct"].get("orth_to_U", 0.0))
 
-    # --- New Sampler Setup ---
-    sizes = estimate_dataset_sizes(ds.by_ds)
-    total_steps = int(train_cfg.get("epochs", 1)) * int(train_cfg.get("steps_per_epoch", 1000))
-    chooser = make_dataset_chooser(
-        dataset_ids=ds_ids, sizes=sizes,
-        policy=str(train_cfg.get("sampler_policy", "weighted")),
-        weight_mode=str(train_cfg.get("sampler_weight_mode", "sqrt")),
-        steps=total_steps,
-        seed=int(train_cfg.get("seed", 1337)),
-    )
-
     outdir = Path(paths.get("output_dir", "./gnn_out"))
     outdir.mkdir(parents=True, exist_ok=True)
-    step = 0
     log_every = int(train_cfg.get("log_every", 50))
     ckpt_every = int(train_cfg.get("ckpt_every", 500))
 
-    # --- Main Training Loop (New Data Loading + Old Model/Loss Logic) ---
+    # --- Main Training Loop (Refactored Iterator Usage) ---
     print("Starting training loop...")
-    for dsid in chooser:
+    # Create one persistent iterator from the dataset object
+    data_iterator = iter(ds)
+    
+    for step in range(total_steps):
         start_fetch = time.time()
-        batch = next(iter(ds.iter_batches([dsid])), None)
-        if batch is None:
-            continue
+        try:
+            batch = next(data_iterator)
+        except StopIteration:
+            print(f"Data iterator exhausted at step {step}. Re-initializing for next epoch.")
+            # Re-create sampler for the next epoch if steps > number of batches in one epoch.
+            current_epoch = (step // train_cfg.get("steps_per_epoch", 1000)) + 1
+            new_seed = int(train_cfg.get("seed", 1337)) + current_epoch
+            chooser = make_dataset_chooser(
+                dataset_ids=ds_ids, sizes=sizes,
+                policy=str(train_cfg.get("sampler_policy", "weighted")),
+                weight_mode=str(train_cfg.get("sampler_weight_mode", "sqrt")),
+                steps=total_steps - step, # Or keep total_steps if running for fixed epochs regardless
+                seed=new_seed,
+            )
+            ds.sampler = chooser # Update dataset's internal sampler
+            data_iterator = iter(ds)
+            batch = next(data_iterator)
 
         # Lazily create models and optimizer once we know z_dim from the first batch
         if prop is None:
@@ -260,35 +295,35 @@ def main():
         opt.step()
         timings["loss_backward"].append(time.time() - start_backward)
 
-        step += 1
-        if step % log_every == 0:
+        step_index = step + 1 # for 1-based indexing in logs
+        if step_index % log_every == 0:
             log_data = {
-                "step": step, "dataset": dsid, "loss": float(total_loss.item()),
+                "step": step_index, "dataset": batch["dataset_id"], "loss": float(total_loss.item()),
                 "dist": float(loss_dist.item()), "rex": float(loss_rex.item()),
                 "irm": float(loss_irm.item()), "cons": float(loss_cons.item()),
                 "l1": float(loss_l1.item()), "orth": float(loss_orth.item()),
             }
             print(json.dumps(log_data))
 
-        if step % ckpt_every == 0:
+        if step_index % ckpt_every == 0:
             model_dict = {"prop": prop, "step0": step0, "head_med": head_med, "head_dir": head_dir}
-            save_checkpoint(model_dict, opt, step, outdir)
+            save_checkpoint(model_dict, opt, step_index, outdir)
 
-        if step >= total_steps:
-            break
-
+    # Final save
+    step_index = step + 1
     model_dict = {"prop": prop, "step0": step0, "head_med": head_med, "head_dir": head_dir}
-    save_checkpoint(model_dict, opt, step, outdir)
-    print(f"[done] total steps: {step}, final models saved to {outdir}")
+    save_checkpoint(model_dict, opt, step_index, outdir)
+    print(f"[done] total steps: {step_index}, final models saved to {outdir}")
 
-    avg_fetch_time = sum(timings["data_fetch"]) / len(timings["data_fetch"])
-    avg_forward_time = sum(timings["model_forward"]) / len(timings["model_forward"])
-    avg_backward_time = sum(timings["loss_backward"]) / len(timings["loss_backward"])
+    if timings["data_fetch"]:
+        avg_fetch_time = sum(timings["data_fetch"]) / len(timings["data_fetch"])
+        avg_forward_time = sum(timings["model_forward"]) / len(timings["model_forward"])
+        avg_backward_time = sum(timings["loss_backward"]) / len(timings["loss_backward"])
 
-    print(f"\nAverage time per step:")
-    print(f"  Data Fetching & Prep: {avg_fetch_time:.4f} seconds")
-    print(f"  Model Forward Pass:   {avg_forward_time:.4f} seconds")
-    print(f"  Loss & Backward Pass: {avg_backward_time:.4f} seconds")
+        print(f"\nAverage time per step:")
+        print(f"  Data Fetching & Prep: {avg_fetch_time:.4f} seconds")
+        print(f"  Model Forward Pass:   {avg_forward_time:.4f} seconds")
+        print(f"  Loss & Backward Pass: {avg_backward_time:.4f} seconds")
 
 if __name__ == "__main__":
     main()
