@@ -365,7 +365,7 @@ class GraftStreamingDataset:
                 # Use the single cached model to encode/decode the new data chunk
                 t2 = time.time()
                 z_chunk = qmodel.get_latent_representation(A_chunk, batch_size=self.cfg.forward_batch_size)
-                xbar_chunk = qmodel.get_normalized_expression(A_chunk, batch_size=self.cfg.forward_batch_size, n_samples=1, library_size="latent")
+                xbar_chunk = qmodel.get_normalized_expression(A_chunk, batch_size=self.cfg.forward_batch_size, n_samples=1, library_size=1e4)
                 if not isinstance(xbar_chunk, np.ndarray):
                     xbar_chunk = xbar_chunk.to_numpy()
                 t3 = time.time()

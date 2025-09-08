@@ -198,7 +198,7 @@ def main():
     )
     model = scvi.model.SCVI(adata, n_latent=args.n_latent, gene_likelihood="nb", dispersion="gene")
     model.train(max_epochs=args.max_epochs, batch_size=args.batch_size,
-                early_stopping=True, early_stopping_patience=20)
+                early_stopping=True, early_stopping_patience=20, datasplitter_kwargs={"num_workers": 4})
 
     # Save model
     model.save(model_dir, overwrite=True)
