@@ -23,12 +23,11 @@ from pathlib import Path
 import anndata as ad
 import numpy as np
 import pandas as pd
-import scvi
 import torch
 import torch.nn as nn
 import yaml
-from scipy import sparse
 from tqdm import tqdm
+from typing import Dict
 
 # Ensure local modules can be imported
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -55,6 +54,22 @@ def load_renoise_params(path: str) -> dict:
     lib_sizes = {k.replace('lib_sizes_', ''): v for k, v in npz_file.items() if k.startswith('lib_sizes_')}
     params['lib_sizes_by_dataset'] = lib_sizes
     return params
+
+def to_device(batch: Dict[str, np.ndarray], device: torch.device) -> Dict[str, torch.Tensor]:
+    out = {}
+    for k, v in batch.items():
+        if isinstance(v, np.ndarray):
+            # Handle multi-dimensional arrays for control latents/expressions
+            if v.ndim > 1 and v.dtype.kind in ('f',):
+                 dtype = torch.float32
+            elif v.dtype.kind in ("f",):
+                dtype = torch.float32
+            elif v.dtype.kind in ("i", "u", "b"):
+                dtype = torch.int64
+            else:
+                continue # Skip non-numeric types like string arrays
+            out[k] = torch.as_tensor(v, dtype=dtype, device=device)
+    return out
 
 def main():
     parser = argparse.ArgumentParser(description="Generate predictions from a trained GRAFT model.")
@@ -90,16 +105,23 @@ def main():
     original_genes = template_adata.var_names.astype(str).tolist()
     original_obs = template_adata.obs.copy()
 
-    # Create a temporary yaml for the dataset loader to point to the template file
-    temp_dataset_id = "PREDICTION_TEMP"
+    # CORRECTED LOGIC: Create a temporary YAML where the user-provided dataset_id
+    # points to the template H5AD file.
     temp_yaml_path = "temp_predict_datasets.yaml"
     with open(paths['datasets_yaml'], 'r') as f:
         datasets_yaml_data = yaml.safe_load(f)
-    datasets_yaml_data['datasets'][temp_dataset_id] = {'raw_path': args.template_h5ad}
+    
+    # Ensure the target dataset exists in the config before overwriting
+    if args.controls_dataset_id not in datasets_yaml_data['datasets']:
+        raise KeyError(f"Provided --controls-dataset-id '{args.controls_dataset_id}' not found in {paths['datasets_yaml']}")
+    
+    datasets_yaml_data['datasets'][args.controls_dataset_id]['raw_path'] = args.template_h5ad
+    
     with open(temp_yaml_path, 'w') as f:
         yaml.dump(datasets_yaml_data, f)
     
-    sampler = BalancedRoundRobin(dataset_ids=[temp_dataset_id], steps=None)
+    # Sampler will now correctly yield the ID that the loader can find.
+    sampler = BalancedRoundRobin(dataset_ids=[args.controls_dataset_id], steps=None)
     
     ds_cfg = GraftStreamingConfig(
         datasets_yaml=temp_yaml_path, index_parquet=paths["index_parquet"],
@@ -116,6 +138,7 @@ def main():
 
     # --- 3. Lazy Model Instantiation & Loading ---
     prop, step0, head_med, head_dir = None, None, None, None
+    env_to_code = None
     
     # --- 4. Prediction Loop ---
     print(f"Generating predictions for {template_adata.n_obs} cells...")
@@ -150,26 +173,12 @@ def main():
                 head_med.load_state_dict(checkpoint["models"]["head_med"])
                 head_dir.load_state_dict(checkpoint["models"]["head_dir"])
                 prop.eval(); step0.eval(); head_med.eval(); head_dir.eval()
-
-            tb = {k: torch.as_tensor(v, device=device) for k, v in batch.items() if isinstance(v, np.ndarray)}
             
-            z_q_tensor = tb["z_q"].float()
-            
-            ctrl_idx, _, _ = control_ann.query(
-                tb["z_q"].cpu().numpy(), k=train_cfg["k_controls"], 
-                match_dataset=args.controls_dataset_id, 
-                oversample=train_cfg["oversample"]
-            )
-            xbar_ctrl = torch.tensor(control_ann.xbar_ctrl[ctrl_idx.clip(min=0)], device=device).float()
-            xbar_ctrl[ctrl_idx < 0] = 0.0
-            x0 = xbar_ctrl.mean(dim=1)
-
-            target_idx = tb["target_idx"].long()
-            env_code_val = env_to_code[args.controls_dataset_id]
-            env_code = torch.full_like(target_idx, env_code_val)
-
-            z_ref = prop(z_q_tensor, target_idx=target_idx, env_codes=env_code)
-            x_clamp, _ = step0(x0, z_ref, env_code, target_idx)
+            # make predictions
+            tb = to_device(batch, device)
+            x0 = tb["xbar_ctrl"].mean(dim=1)
+            z_ref = prop(tb["z_q"], target_idx=tb["target_idx"], env_codes=tb["env_code"])
+            x_clamp, _ = step0(x0, z_ref, tb["env_code"], tb["target_idx"])
             m = head_med(z_ref)
             dx_med = m @ U
             dx_dir = head_dir(z_ref)
@@ -185,7 +194,10 @@ def main():
     # --- 5. Assemble, Re-noise, and Unscramble ---
     print("Finalizing predictions: re-noising and unscrambling genes...")
     final_normalized_matrix = np.vstack(all_preds_normalized)
-    final_obs = original_obs.loc[[cid.split('::')[1] for cid in all_cell_ids]]
+    
+    # Reconstruct final obs dataframe by matching original obs with the cell IDs processed
+    processed_local_ids = [cid.split('::')[1] for cid in all_cell_ids]
+    final_obs = original_obs.loc[processed_local_ids]
 
     final_counts_canonical = renoiser.sample_counts(
         xbar=final_normalized_matrix,
