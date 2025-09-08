@@ -247,6 +247,7 @@ class GraftStreamingConfig:
     match_within: str = "dataset"  # "dataset" | "none"
     forward_batch_size: int = 4096
     include_controls_in_query: bool = False  # usually False (query = perturbed only)
+    filter_by_index: bool = True  # only process cells in index_parquet. True for training, False for prediction
 
 
 class GraftStreamingDataset:
@@ -400,6 +401,7 @@ class GraftStreamingDataset:
                 index_df=rows_meta,
                 counts_layer=None,
                 keep_cols=FINAL_OBS_COLS,
+                filter_by_index=self.cfg.filter_by_index,
             )
             if A_chunk.n_obs == 0:
                 continue

@@ -93,6 +93,7 @@ def preprocess_chunk(
     index_df: pd.DataFrame,
     counts_layer: Optional[str] = None,
     keep_cols: Optional[Iterable[str]] = None,
+    filter_by_index: bool = True,
 ) -> ad.AnnData:
     """
     Core routine:
@@ -119,16 +120,23 @@ def preprocess_chunk(
         A.obs_names = A.obs_names.copy()
         A.var_names = A.var_names.copy()
 
-    # filter by allowed global cell_ids from the provided index
-    allowed_cell_ids = set(index_df["cell_id"])
-    global_ids = pd.Index([f"{dataset_id}::{cid}" for cid in A.obs_names.astype(str)], name="cell_id")
-    mask = global_ids.isin(allowed_cell_ids)
+    if filter_by_index:
+        # filter by allowed global cell_ids from the provided index
+        allowed_cell_ids = set(index_df["cell_id"])
+        global_ids = pd.Index([f"{dataset_id}::{cid}" for cid in A.obs_names.astype(str)], name="cell_id")
+        mask = global_ids.isin(allowed_cell_ids)
     
-    if not mask.any():
-        return A[:0, :].copy()  # No allowed cells in this slice
+        if not mask.any():
+            return A[:0, :].copy()  # No allowed cells in this slice
     
-    A = A[mask, :].copy()
-    kept_global_ids = global_ids[mask]
+        A = A[mask, :].copy()
+        kept_global_ids = global_ids[mask]
+        obs = index_df.set_index("cell_id").loc[kept_global_ids].copy()
+    else:
+        # For prediction, we don't filter. We just create the obs from the AnnData itself.
+        obs = A.obs.copy()
+        obs["cell_id"] = [f"{dataset_id}::{cid}" for cid in A.obs_names.astype(str)]
+        obs["dataset_id"] = dataset_id # Ensure this column exists
 
     # Ensure the matrix is in CSR format for efficient row-slicing during training.
     if sparse.issparse(A.X):
@@ -139,7 +147,6 @@ def preprocess_chunk(
     X_aligned = A.X @ P
 
     # assemble output AnnData with authoritative obs from the index
-    obs = index_df.set_index("cell_id").loc[kept_global_ids].copy()
     obs = obs[[c for c in keep_cols if c in obs.columns]].copy()
     var = pd.DataFrame(index=pd.Index(gene_list, name="gene"))
 
