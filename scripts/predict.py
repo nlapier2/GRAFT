@@ -28,6 +28,8 @@ import torch.nn as nn
 import yaml
 from tqdm import tqdm
 from typing import Dict
+import gc
+from scipy import sparse
 
 # Ensure local modules can be imported
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -191,26 +193,45 @@ def main():
 
     os.remove(temp_yaml_path)
 
-    # --- 5. Assemble, Re-noise, and Unscramble ---
+    # --- 5. Assemble, Re-noise, and Unscramble (Rewritten for Memory Efficiency) ---
     print("Finalizing predictions: re-noising and unscrambling genes...")
     final_normalized_matrix = np.vstack(all_preds_normalized)
-    
-    # Reconstruct final obs dataframe by matching original obs with the cell IDs processed
+    del all_preds_normalized
+    gc.collect()
+
+    # Reconstruct final obs dataframe
     processed_local_ids = [cid.split('::')[1] for cid in all_cell_ids]
     final_obs = original_obs.loc[processed_local_ids]
 
+    # Re-noise to get a dense matrix of canonical counts
     final_counts_canonical = renoiser.sample_counts(
         xbar=final_normalized_matrix,
         dataset_ids=[args.controls_dataset_id] * len(final_obs),
-        mode="empirical"
+        mode="empirical",
+        chunk_size=5000
     )
+    del final_normalized_matrix # Free memory
+    gc.collect()
 
+    # ---- KEY CHANGE: Convert to sparse BEFORE unscrambling ----
+    print("Converting to sparse format before gene unscrambling...")
+    # Using int16 if counts are within range, otherwise int32
+    dtype = np.int16 if final_counts_canonical.max() < 32767 else np.int32
+    sparse_counts_canonical = sparse.csr_matrix(final_counts_canonical, dtype=dtype)
+    del final_counts_canonical # Free the dense canonical matrix
+    gc.collect()
+
+    # Build the back-projection matrix to map from canonical to original gene order
     back_projection = _build_projection(gene_list, original_genes)
-    final_counts_unscrambled = final_counts_canonical @ back_projection
+
+    # Perform the unscrambling in sparse format. The result is also sparse and memory-efficient.
+    print("Unscrambling genes in sparse format...")
+    final_counts_unscrambled_sparse = sparse_counts_canonical @ back_projection
 
     print(f"Writing final predicted AnnData to {args.output_h5ad}...")
+    # The write_anndata helper can accept the sparse matrix directly
     output_adata = write_anndata(
-        counts=final_counts_unscrambled,
+        counts=final_counts_unscrambled_sparse,
         var_names=original_genes,
         obs_df=final_obs
     )

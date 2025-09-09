@@ -187,6 +187,7 @@ class ReNoiser:
         fixed_L: Optional[float] = None,
         deterministic: bool = False,
         rng: Optional[np.random.Generator] = None,
+        chunk_size: int = 5000,
     ) -> np.ndarray:
         """
         Convert normalized predictions xbar (B, G) into integer counts (B, G).
@@ -206,14 +207,38 @@ class ReNoiser:
         """
         rng = rng or np.random.default_rng(13)
         xbar = np.asarray(xbar, dtype=np.float32)
-        libs = self.sample_library_sizes(dataset_ids, mode=mode, fixed_L=fixed_L, rng=rng).astype(np.float32)
-        scale = (libs / self.L_ref).reshape(-1, 1)  # (B,1)
-        mu = np.maximum(xbar * scale, 0.0)          # expected counts
-
+        
+        # The deterministic path is less memory-intensive, but we can chunk it too for consistency.
         if deterministic or self.theta is None:
-            return np.rint(mu).astype(np.int32)
-        else:
-            return self._nb_sample(mu, self.theta, rng=rng)
+            libs = self.sample_library_sizes(dataset_ids, mode=mode, fixed_L=fixed_L, rng=rng)
+            scale = (libs / self.L_ref).reshape(-1, 1)
+            mu = np.maximum(xbar * scale, 0.0)
+            return sparse.csr_matrix(np.rint(mu).astype(np.int32))
+
+        # ---- REFACTORED CHUNKING LOGIC ----
+        # Process everything in chunks to avoid creating any large intermediate matrices.
+        B = xbar.shape[0]
+        count_chunks = []
+        for i in range(0, B, chunk_size):
+            end = min(i + chunk_size, B)
+            
+            # 1. Slice the inputs for the current chunk
+            xbar_chunk = xbar[i:end]
+            dataset_ids_chunk = dataset_ids[i:end]
+            
+            # 2. Calculate libs, scale, and mu only for this smaller chunk
+            libs_chunk = self.sample_library_sizes(dataset_ids_chunk, mode=mode, fixed_L=fixed_L, rng=rng)
+            scale_chunk = (libs_chunk / self.L_ref).reshape(-1, 1)
+            mu_chunk = np.maximum(xbar_chunk * scale_chunk, 0.0)
+            
+            # 3. Sample counts for the chunk (dense)
+            counts_chunk_dense = self._nb_sample(mu_chunk, self.theta, rng=rng)
+            
+            # 4. Convert to sparse immediately and append
+            count_chunks.append(sparse.csr_matrix(counts_chunk_dense))
+            
+        # 5. Vertically stack the sparse chunks to create the final matrix
+        return sparse.vstack(count_chunks, format="csr")
 
     def expected_counts(
         self,
