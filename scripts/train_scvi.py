@@ -142,7 +142,7 @@ def main():
     # Denoised export options
     ap.add_argument("--save-denoised", action="store_true", help="If set, dump denoised in chunks")
     ap.add_argument("--denoised-chunk-size", type=int, default=10000)
-    ap.add_argument("--denoised-format", choices=["parquet","npz"], default="parquet",
+    ap.add_argument("--denoised-format", choices=["parquet","npz"], default="npz",
                     help="Chunk file format; npz is memory-friendlier")
     ap.add_argument("--library-size", type=float, default=1e4)
     ap.add_argument("--transform-batch", default=None,
