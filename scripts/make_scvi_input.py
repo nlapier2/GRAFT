@@ -1,245 +1,200 @@
-# scripts/make_scvi_input.py  (v1-simplified + controls-only + chunked reads)
-# Minimal: per-dataset contiguous selection (cap) + chunked H5AD scanning to extract selected cells.
-# New:
-#   --controls-only     : filter to controls only (uses 'is_control' in the built index)
-#   --chunk-size INT    : read H5AD in row chunks (default 100k) and extract desired rows from each chunk.
-#
-# Notes:
-# - We keep .to_memory() on each small chunk (safe).
-# - We only carry minimal, HDF5-safe obs columns.
-# - We assemble with scipy.sparse.vstack for speed.
+#!/usr/bin/env python3
+"""
+make_scvi_input.py
+---------------------
+Build a controls-only (or filtered) scVI input H5AD by streaming raw dataset H5ADs
+in backed mode and using a shared, minimal chunk preprocessor.
 
-import os, sys, json
+Key ideas:
+- Use the global TSV gene list (from build_gene_maps.py) to define var order.
+- Use the index parquet (from build_index.py) to define which cells to include
+  (and to build the final obs table).
+- For each dataset: open raw .h5ad (backed), iterate row-chunks, call
+  graft.utils.chunk_preprocess.preprocess_chunk to materialize + align genes +
+  filter to allowed cells. Collect blocks, then concatenate once.
+- Impose a single stable row order at the very end (sorted by cell_id).
+
+Outputs:
+- H5AD with X aligned to gene list, obs taken from the index parquet (for included cells),
+  and var = gene_list.
+"""
+
+from __future__ import annotations
+
+# temporary workaround for script visibility
+import os, sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+import argparse
+import os
+from typing import List, Optional
+
+import anndata as ad
 import numpy as np
 import pandas as pd
-import anndata as ad
 import yaml
 from scipy import sparse
 
-from utils.normalize import normalize_hgnc
+from graft.utils.chunk_preprocess import preprocess_chunk, load_gene_list
 
 
-# ------------------------------ helpers ------------------------------
-
-def read_yaml(yaml_path):
-    with open(yaml_path, "r") as f:
+def load_datasets_yaml(datasets_yaml: str) -> pd.DataFrame:
+    """
+    Read your YAML where `datasets` is a dict mapping dataset_id -> config.
+    Returns a DataFrame with columns: [dataset_id, raw_path, counts_layer].
+    """
+    with open(datasets_yaml, "r") as f:
         cfg = yaml.safe_load(f)
-    return cfg.get("datasets", cfg)
 
-def load_map(dataset_id):
-    with open(f"artifacts/gene_map/{dataset_id}.json") as f:
-        mp = json.load(f)
-    return {int(k): int(v) for k, v in mp["to_common_idx"].items()}
+    if not isinstance(cfg, dict) or "datasets" not in cfg:
+        raise ValueError("datasets.yaml must have a top-level key 'datasets' (mapping).")
 
-def subset_rows_contiguous(idx: pd.DataFrame,
-                           cell_type: str,
-                           datasets=None,
-                           max_cells_per_ds=None,
-                           seed=13,
-                           controls_only: bool = False):
+    ds_map = cfg["datasets"]
+    if not isinstance(ds_map, dict) or len(ds_map) == 0:
+        raise ValueError("'datasets' must be a non-empty mapping of dataset_id -> config dict")
+
+    rows = []
+    for dataset_id, item in ds_map.items():
+        if not isinstance(item, dict):
+            raise ValueError(f"datasets[{dataset_id!r}] must be a dict, got {type(item)}")
+        raw_path = item.get("raw_path")
+        if raw_path is None:
+            raise ValueError(f"datasets[{dataset_id!r}] is missing 'raw_path'")
+        counts_layer = item.get("counts_layer", None)  # optional; rarely present
+        rows.append({
+            "dataset_id": str(dataset_id),
+            "raw_path": str(raw_path),
+            "counts_layer": str(counts_layer) if counts_layer is not None else None,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def filter_index(index_parquet: str,
+                 dataset_ids: Optional[List[str]] = None,
+                 controls_only: bool = True,
+                 cell_type: Optional[str] = None) -> pd.DataFrame:
     """
-    Pick ONE contiguous block per dataset up to cap (max_cells_per_ds).
-    Optionally restrict to controls only using 'is_control' column in the index.
+    Load the global index parquet and return a filtered table of rows to include.
     """
-    rng = np.random.default_rng(seed)
-    sub = idx[(idx["cell_type"] == cell_type) & (idx["common_gene_set"])].copy()
-    if controls_only and "is_control" in sub.columns:
-        sub = sub[sub["is_control"].astype(bool)]
-    if datasets:
-        sub = sub[sub["dataset_id"].isin(datasets)]
+    idx = pd.read_parquet(index_parquet)
+    if dataset_ids is not None:
+        idx = idx[idx["dataset_id"].astype(str).isin(list(map(str, dataset_ids)))]
+    if controls_only and "is_control" in idx.columns:
+        idx = idx[idx["is_control"].astype(bool)]
+    if cell_type is not None and "cell_type" in idx.columns:
+        idx = idx[idx["cell_type"] == cell_type]
+    idx["cell_id"] = idx["cell_id"].astype(str)
+    idx["dataset_id"] = idx["dataset_id"].astype(str)
+    return idx
 
-    parts = []
-    for ds, g in sub.groupby("dataset_id", sort=False):
-        n = len(g)
-        if n == 0:
-            continue
-        cap = min(max_cells_per_ds or n, n)
-        if cap == n:
-            sel = g  # take all
-        else:
-            # choose a contiguous window in the observed file order
-            start = int(rng.integers(0, n - cap + 1))
-            sel = g.iloc[start:start+cap]
-        parts.append(sel)
-
-    if not parts:
-        return sub.iloc[0:0]
-    return pd.concat(parts, axis=0)
-
-def _build_keep_and_order(ds_nvars: int, gene_map: dict):
-    """Return (keep_bool, order_cols) for dataset->common gene mapping."""
-    to_common = np.full(ds_nvars, -1, dtype=int)
-    for k, v in gene_map.items():
-        if 0 <= k < ds_nvars:
-            to_common[k] = v
-    keep_bool = to_common >= 0
-    order_cols = np.argsort(to_common[keep_bool])
-    return keep_bool, order_cols
-
-def _make_obs_frame(rows_meta: pd.DataFrame, index_order: np.ndarray) -> pd.DataFrame:
-    """
-    Build a minimal, HDF5-safe obs DataFrame in the order of `index_order`
-    where `index_order` are positions into rows_meta.
-    """
-    rm = rows_meta.iloc[index_order]
-    obs = pd.DataFrame(index=rm["cell_id"].values)  # global ids as obs_names
-    # Keep only minimal scalar/categorical columns
-    obs["dataset_id"]  = rm["dataset_id"].astype("category").values
-    obs["lab_id"]      = rm["lab_id"].astype("category").values
-    obs["batch_id"]    = rm["batch_id"].astype("category").values
-    obs["cell_type"]   = rm["cell_type"].astype("category").values
-    obs["is_control"]  = rm["is_control"].astype(bool).values
-    obs["target_gene"] = rm["target_gene"].astype("category").values
-    return obs
-
-def fetch_dataset_by_chunks(raw_path: str,
-                            rows_meta: pd.DataFrame,
-                            gene_map: dict,
-                            gene_list,
-                            chunk_size: int = 100_000):
-    """
-    Scan H5AD in contiguous chunks of rows and extract only the desired cells.
-    Returns (X: csr_matrix [n_selected x G], obs: DataFrame with global cell_id index).
-    """
-    A_b = ad.read_h5ad(raw_path, backed="r")
-    G = A_b.n_vars
-
-    # Map requested cell_ids to *dataset-local* ids
-    cid_global = rows_meta["cell_id"].tolist()
-    # If global ids look like "<dataset>::<local>", strip the prefix
-    if not all(c in A_b.obs_names for c in cid_global):
-        cid_local = [c.split("::", 1)[1] for c in cid_global]
-    else:
-        cid_local = cid_global
-
-    # Desired order = rows_meta order
-    id_to_pos = {cid_local[i]: i for i in range(len(cid_local))}
-    want_set = set(id_to_pos.keys())
-
-    # Column mapping once
-    keep_bool, order_cols = _build_keep_and_order(G, gene_map)
-
-    X_blocks = []
-    obs_blocks = []
-    ord_blocks = []
-
-    n = A_b.n_obs
-    for start in range(0, n, chunk_size):
-        end = min(start + chunk_size, n)
-        # Materialize this chunk
-        A_chunk = A_b[start:end, :].to_memory()  # (C, G)
-        ids_chunk = np.asarray(A_chunk.obs_names)
-
-        # Find which rows we want from this chunk
-        mask = np.isin(ids_chunk, list(want_set))
-        if not mask.any():
-            continue
-        sel_idx = np.nonzero(mask)[0]
-
-        # Subset rows in-memory, then columns in-memory
-        A_sel = A_chunk[sel_idx, :]
-        A_sel = A_sel[:, keep_bool]
-        A_sel = A_sel[:, order_cols]
-
-        # Determine desired global order positions for these rows
-        ord_vals = np.array([id_to_pos[i] for i in ids_chunk[sel_idx]], dtype=np.int64)
-        # Reorder rows inside this block to match rows_meta order (ascending ord)
-        order = np.argsort(ord_vals)
-        A_sel = A_sel[order, :]
-        ord_vals = ord_vals[order]
-
-        # Build obs for this block (in the correct order)
-        obs_block = _make_obs_frame(rows_meta, ord_vals)
-
-        # Collect
-        X_blocks.append(A_sel.X.tocsr() if hasattr(A_sel.X, "tocsr") else sparse.csr_matrix(A_sel.X))
-        obs_blocks.append(obs_block)
-        ord_blocks.append(ord_vals)
-
-        # free chunk
-        del A_chunk, A_sel
-
-    if not X_blocks:
-        raise ValueError(f"No requested cells found in {raw_path}")
-
-    # Concatenate blocks (already in rows_meta order within each block)
-    X = sparse.vstack(X_blocks, format="csr")
-    obs = pd.concat(obs_blocks, axis=0)
-
-    # Final global reorder to ensure exact rows_meta order across blocks
-    all_ord = np.concatenate(ord_blocks, axis=0)
-    perm = np.argsort(all_ord)
-    X = X[perm, :]
-    obs = obs.iloc[perm]
-
-    # Ensure var names match the common gene list
-    var = pd.DataFrame(index=gene_list)
-    return X, obs
-
-
-# ------------------------------ main ------------------------------
 
 def main():
-    import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--yaml", default="configs/datasets.yaml", help="Datasets YAML")
-    ap.add_argument("--index", default="artifacts/cell_index.parquet", help="Cell index parquet path")
-    ap.add_argument("--gene-list", default="artifacts/gene_list.tsv", help="Common gene list (one per line)")
-    ap.add_argument("--cell-type", required=True, help="Cell type to build (e.g., K562)")
-    ap.add_argument("--datasets", nargs="*", default=None, help="Optional list of dataset_ids to include")
-    ap.add_argument("--max-cells-per-ds", type=int, default=200000, help="Cap per dataset to limit memory")
-    ap.add_argument("--controls-only", action="store_true", help="If set, include only control cells")
-    ap.add_argument("--chunk-size", type=int, default=100000, help="Row chunk size for backed reads")
-    ap.add_argument("--seed", type=int, default=13)
-    ap.add_argument("--out", default=None, help="Output h5ad path")
+    ap.add_argument("--datasets-yaml", required=True, help="YAML listing datasets (mapping dataset_id -> config with raw_path)")
+    ap.add_argument("--index-parquet", required=True, help="Global index parquet from build_index.py")
+    ap.add_argument("--gene-list-tsv", required=True, help="One-gene-per-line TSV (global gene universe/order)")
+    ap.add_argument("--out-h5ad", required=True, help="Path to write the scVI input H5AD")
+    ap.add_argument("--controls-only", action="store_true", help="Keep only control cells")
+    ap.add_argument("--cell-type", default=None, help="Optional cell_type filter (exact match)")
+    ap.add_argument("--chunk-size", type=int, default=100_000, help="Rows per chunk to materialize from each dataset")
+    ap.add_argument("--max-cells", type=int, default=None, help="Optional cap on total cells (for smoke tests)")
     args = ap.parse_args()
 
-    gene_list = [g.strip() for g in open(args.gene_list) if g.strip()]
-    datasets_cfg = read_yaml(args.yaml)
-    idx = pd.read_parquet(args.index)
+    # Define the exact columns to keep in the final obs table
+    FINAL_OBS_COLS = [
+        "dataset_id", "cell_id", "lab_id", "batch_id", "cell_type",
+        "is_control", "pert_type", "target_gene", "guide_id",
+        "target_id", "perturbation"
+    ]
 
-    rows = subset_rows_contiguous(
-        idx, args.cell_type, args.datasets, args.max_cells_per_ds,
-        seed=args.seed, controls_only=args.controls_only
+    # 1) Load datasets config (mapping datasets -> {raw_path, ...})
+    ds_tbl = load_datasets_yaml(args.datasets_yaml)
+    gene_list = load_gene_list(args.gene_list_tsv)
+
+    # 2) Read index and filter rows we want to include
+    idx = filter_index(
+        index_parquet=args.index_parquet,
+        dataset_ids=ds_tbl["dataset_id"].tolist(),
+        controls_only=args.controls_only,
+        cell_type=args.cell_type,
     )
-    if rows.empty:
-        scope = "controls" if args.controls_only else "cells"
-        raise SystemExit(f"No {scope} for cell_type={args.cell_type} with common_gene_set=True")
+    if idx.empty:
+        raise ValueError("No cells pass the index filtering conditions.")
 
-    X_list, obs_list = [], []
-    for ds, g in rows.groupby("dataset_id", sort=False):
-        raw_path = datasets_cfg[ds].get("raw_path") or datasets_cfg[ds].get("path")
-        if not raw_path or not os.path.exists(raw_path):
-            print(f"[WARN] {ds}: raw_path not found, skip")
+    # Map of dataset_id -> rows to include (for fast membership tests)
+    want_by_ds = {dsid: g.copy() for dsid, g in idx.groupby("dataset_id")}
+
+    X_blocks, obs_blocks = [], []
+    n_total = 0
+
+    # 3) For each dataset, stream its H5AD and extract the needed cells via preprocess_chunk
+    for _, row in ds_tbl.iterrows():
+        dsid = row["dataset_id"]
+        raw_path = row["raw_path"]
+        counts_layer = row.get("counts_layer", None)
+
+        if dsid not in want_by_ds:
             continue
-        gmap = load_map(ds)
-        X_ds, obs_ds = fetch_dataset_by_chunks(
-            raw_path=raw_path,
-            rows_meta=g,
-            gene_map=gmap,
-            gene_list=gene_list,
-            chunk_size=max(1, int(args.chunk_size))
-        )
-        X_list.append(X_ds)
-        obs_list.append(obs_ds)
-        print(f"[INFO] added {ds}: ({X_ds.shape[0]}, {X_ds.shape[1]}) via chunked scan")
+        print(f"[info] processing dataset {dsid} from {raw_path}")
 
-    if not X_list:
-        raise SystemExit("No datasets could be loaded.")
+        rows_meta = want_by_ds[dsid]
 
-    # Assemble final AnnData
-    X = sparse.vstack(X_list, format="csr")
-    obs = pd.concat(obs_list, axis=0)
-    var = pd.DataFrame(index=gene_list)
-    Aall = ad.AnnData(X=X, obs=obs, var=var)
+        A_b = ad.read_h5ad(raw_path, backed="r")
+        n_obs = A_b.n_obs
+        cs = int(args.chunk_size)
 
-    # Write
-    out = args.out or f"artifacts/scvi_input_{args.cell_type}{'_controls' if args.controls_only else ''}.h5ad"
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    Aall.write_h5ad(out, compression="lzf")
-    print(f"[OK] wrote {out}: {Aall.shape}")
+        for start in range(0, n_obs, cs):
+            end = min(start + cs, n_obs)
+            A_chunk = preprocess_chunk(
+                A_backed=A_b,
+                row_index=slice(start, end),
+                gene_list=gene_list,
+                dataset_id=dsid,
+                index_df=rows_meta,
+                counts_layer=counts_layer,
+                keep_cols=FINAL_OBS_COLS,
+            )
+            if A_chunk.n_obs == 0:
+                continue
+
+            X_blocks.append(A_chunk.X)
+            obs_blocks.append(A_chunk.obs)
+
+            n_total += A_chunk.n_obs
+            if args.max_cells is not None and n_total >= args.max_cells:
+                break
+
+        if args.max_cells is not None and n_total >= args.max_cells:
+            break
+
+    if not X_blocks:
+        raise ValueError("No cells materialized. Check dataset paths and index filters.")
+
+    # 4) Concatenate and impose a single stable row order
+    X = sparse.vstack(X_blocks, format="csr")
+    obs = pd.concat(obs_blocks, axis=0)
+    order = np.argsort(obs.index.values)
+    X = X[order, :]
+    obs = obs.iloc[order, :]
+
+    # 5) Build final obs table and ensure types are safe for writing
+    if "tech_batch_id" not in obs.columns and {"dataset_id", "batch_id"}.issubset(obs.columns):
+        obs["tech_batch_id"] = (obs["dataset_id"].astype(str) + "_" + obs["batch_id"].astype(str)).astype("category")
+    
+    for col in obs.select_dtypes(include=['object', 'category']).columns:
+        obs[col] = obs[col].astype(str).astype('category')
+
+    # 6) Assemble AnnData and write
+    var = pd.DataFrame(index=pd.Index(gene_list, name="gene"))
+    A_out = ad.AnnData(X=X, obs=obs, var=var)
+
+    os.makedirs(os.path.dirname(args.out_h5ad), exist_ok=True)
+    A_out.write_h5ad(args.out_h5ad)
+    print(f"[ok] wrote {args.out_h5ad} with shape {A_out.n_obs} x {A_out.n_vars}")
+    print(f"[note] controls_only={args.controls_only} cell_type={args.cell_type} chunk_size={args.chunk_size} max_cells={args.max_cells}")
+    print("[done]")
+
 
 if __name__ == "__main__":
     main()
