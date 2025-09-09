@@ -2,13 +2,13 @@ paths:
   datasets_yaml: configs/datasets_adamson_test.yaml  # <- specifies datasets to use
   index_parquet: /data/GRAFT/artifacts_adamson/cell_index.parquet  # <- full index with controls+perturbed
   gene_list_tsv: /data/GRAFT/artifacts_adamson/gene_list.tsv  # <- from build_gene_maps.py
-  scvi_model_dir: /data/GRAFT/artifacts_adamson/scvi_k562_max200k_control_only_v2/scvi_K562/  # <- trained control-only scVI
-  scvi_input_h5ad: /data/GRAFT/artifacts_adamson/scvi_input_all-celltypes.h5ad  # <- input to scVI (with controls)
+  scvi_model_dir: /data/GRAFT/artifacts_adamson/scvi_K562_epoch100_latent32/  # <- trained control-only scVI
+  scvi_input_h5ad: /data/GRAFT/artifacts_adamson/scvi_input_K562.h5ad  # <- input to scVI (with controls)
   control_index_dir: /data/GRAFT/artifacts_adamson/knn_control_index/  # <- contains knn.index, ctrl_ids.parquet, knn_meta.json
-  control_z_npz: /data/GRAFT/artifacts_adamson/scvi_k562_max200k_control_only_v2/scvi_z_K562.npz  # <- from train_scvi output
-  control_xbar_npz: /data/GRAFT/artifacts_adamson/scvi_k562_max200k_control_only_with_xbar/scvi_denoised_K562_parts/part_000000000_000101932.npz  # <- from train_scvi output
-  factor_U: /data/GRAFT/artifacts_adamson/learned_factor_encoders/factor_W_K562.npy
-  output_dir: /data/GRAFT/artifacts_adamson/gnn_runs/
+  control_z_npz: /data/GRAFT/artifacts_adamson/scvi_K562_epoch100_latent32/scvi_z_K562.npz  # <- from train_scvi output
+  control_xbar_npz: /data/GRAFT/artifacts_adamson/scvi_K562_epoch100_latent32/scvi_denoised_K562_parts/part_000000000_000101932.parquet  # <- from train_scvi output
+  factor_U: /data/GRAFT/artifacts_adamson/learned_factor_encoders/factor_W.npy
+  output_dir: /data/GRAFT/artifacts_adamson/gnn_runs/K562/
 
 
 training:
