@@ -257,38 +257,33 @@ class ReNoiser:
 
 
 def write_anndata(
-    counts: np.ndarray,
+    counts: np.ndarray | sparse.spmatrix,
     var_names: Sequence[str],
     obs_df: Optional[pd.DataFrame] = None,
-    X_fmt: str = "csr",
 ) -> ad.AnnData:
     """
     Build an AnnData from a counts matrix and metadata.
 
     Parameters
     ----------
-    counts : (N, G) int array
+    counts : (N, G) int array or sparse matrix
     var_names : list/array of gene names length G
     obs_df : optional dataframe with N rows; index becomes obs_names
-    X_fmt : "csr" or "csc"
 
     Returns
     -------
     AnnData with integer sparse counts in .X
     """
-    counts = np.asarray(counts, dtype=np.int32)
-    if X_fmt == "csr":
-        X = sparse.csr_matrix(counts, copy=False)
-    else:
-        X = sparse.csc_matrix(counts, copy=False)
-
+    if not sparse.issparse(counts):
+        counts = sparse.csr_matrix(np.asarray(counts, dtype=np.int32))
+    
     if obs_df is None:
         obs = pd.DataFrame(index=[f"cell_{i}" for i in range(counts.shape[0])])
     else:
         obs = obs_df.copy()
-        if "cell_id" in obs.columns:
-            obs = obs.set_index("cell_id", drop=True)
+        if "cell_id" in obs.columns and obs.index.name != "cell_id":
+             obs = obs.set_index("cell_id", drop=True)
 
     var = pd.DataFrame(index=np.asarray(var_names, dtype=str))
-    adata = ad.AnnData(X=X, obs=obs, var=var)
+    adata = ad.AnnData(X=counts, obs=obs, var=var)
     return adata
