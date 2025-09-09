@@ -68,9 +68,8 @@ def _load_z_any(z_path: str, obs_index: pd.Index) -> np.ndarray:
 def main():
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cell-type", required=True)
-    ap.add_argument("--model-dir", default=None, help="scVI model dir (default: artifacts/scvi_<CELLTYPE>/)")
-    ap.add_argument("--scvi-input", default=None, help="scVI input h5ad (default: artifacts/scvi_input_<CELLTYPE>.h5ad)")
+    ap.add_argument("--model-dir", required=True, help="scVI model dir (default: artifacts/scvi_<CELLTYPE>/)")
+    ap.add_argument("--scvi-input", required=True, help="scVI input h5ad (default: artifacts/scvi_input_<CELLTYPE>.h5ad)")
     ap.add_argument("--z-path", required=False,
                     help="Path to scVI latent Z; **preferred** format is .npz (with keys 'z' and optional 'cell_ids').")
     ap.add_argument("--z-parquet", required=False,
@@ -87,9 +86,8 @@ def main():
     ap.add_argument("--output-dir", default="artifacts", help="Output dir for learned W (default: artifacts/)")
     args = ap.parse_args()
 
-    cell = args.cell_type
-    model_dir  = args.model_dir  or f"artifacts/scvi_{cell}"
-    scvi_input = args.scvi_input or f"artifacts/scvi_input_{cell}.h5ad"
+    model_dir  = args.model_dir
+    scvi_input = args.scvi_input
 
     # scVI streaming helper
     scvi_stream = ScviOnTheFly(model_dir=model_dir, scvi_input_h5ad=scvi_input, library_size=1e4)
@@ -182,8 +180,8 @@ def main():
     # Save learned W and a small report
     os.makedirs(args.output_dir, exist_ok=True)
     W_final = model.forward(torch.from_numpy(z[:1]).to(args.device))["W"].detach().cpu().numpy()
-    np.save(f"{args.output_dir}/factor_W_{cell}.npy", W_final)
-    print(f"[OK] saved W to {args.output_dir}/factor_W_{cell}.npy")
+    np.save(f"{args.output_dir}/factor_W.npy", W_final)
+    print(f"[OK] saved W to {args.output_dir}/factor_W.npy")
 
 if __name__ == "__main__":
     main()
