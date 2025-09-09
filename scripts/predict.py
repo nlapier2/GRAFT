@@ -179,14 +179,29 @@ def main():
             # make predictions
             tb = to_device(batch, device)
             x0 = tb["xbar_ctrl"].mean(dim=1)
-            z_ref = prop(tb["z_q"], target_idx=tb["target_idx"], env_codes=tb["env_code"])
-            x_clamp, _ = step0(x0, z_ref, tb["env_code"], tb["target_idx"])
+
+            # --- 1. Calculate clamp effectiveness based on PRE-perturbation state z_q
+            x_clamped_authoritative, eff = step0(x0, tb["z_q"], tb["env_code"], tb["target_idx"])
+
+            # --- 2. Propagate state, now conditioned on the effectiveness of the initial hit
+            z_ref = prop(tb["z_q"], eff=eff, target_idx=tb["target_idx"], env_codes=tb["env_code"])
+
+            # --- 3. Predict downstream changes from the new state z_ref
             m = head_med(z_ref)
             dx_med = m @ U
             dx_dir = head_dir(z_ref)
-            y_pred_normalized = x_clamp + dx_med + dx_dir
+            y_pred_downstream = x0 + dx_med + dx_dir
 
-            all_preds_normalized.append(y_pred_normalized.cpu().numpy())
+            # --- 4. Surgically intervene to enforce the Step-0 clamp on the final prediction
+            y_pred = y_pred_downstream.clone()
+            mask = tb["target_idx"] >= 0
+            if torch.any(mask):
+                rows_to_update = torch.nonzero(mask, as_tuple=False).view(-1)
+                cols_to_update = tb["target_idx"][mask]
+                clamped_values = x_clamped_authoritative[rows_to_update, cols_to_update]
+                y_pred[rows_to_update, cols_to_update] = clamped_values
+
+            all_preds_normalized.append(y_pred.cpu().numpy())
             all_cell_ids.extend(batch['cell_ids'])
 
             pbar.update(len(batch['cell_ids']))

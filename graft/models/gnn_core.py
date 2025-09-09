@@ -156,7 +156,7 @@ class StatePropagator(nn.Module):
             if n_genes is None:
                 raise ValueError("n_genes is required when use_target_cond=True")
             self.tok = TargetEmbed(n_genes=n_genes, dim=target_embed_dim)
-            self.fuse = nn.Linear(z_dim + target_embed_dim, z_dim)
+            self.fuse = nn.Linear(z_dim + target_embed_dim + 1, z_dim)
             _xavier_small_(self.fuse.weight, gain=0.2); nn.init.zeros_(self.fuse.bias)
         else:
             self.tok = None
@@ -169,6 +169,7 @@ class StatePropagator(nn.Module):
         self,
         z: torch.Tensor,
         target_idx: Optional[torch.Tensor] = None,
+        eff: Optional[torch.Tensor] = None,
         env_codes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
@@ -183,7 +184,9 @@ class StatePropagator(nn.Module):
                 t = self.tok(None).to(x.device).expand(x.shape[0], -1)
             else:
                 t = self.tok(target_idx)
-            x = torch.cat([x, t], dim=1)
+            if eff is None:
+                eff = torch.zeros_like(x[:, :1]) # Fallback if eff not provided
+            x = torch.cat([x, t, eff.view(-1, 1)], dim=1)
             x = self.fuse(x)
 
         # Multi-step propagation (weight sharing across steps)
