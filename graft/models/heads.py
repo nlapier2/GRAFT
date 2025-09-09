@@ -166,3 +166,103 @@ class SparseDirectHead(nn.Module):
         if self.bound is not None:
             dx = torch.clamp(dx, min=-self.bound, max=self.bound)
         return dx
+
+
+class TrueSparseDirectHead(nn.Module):
+    """
+    Predicts direct gene deltas Δx_dir by conditioning on the intervention
+    and the pre-perturbation state. This is a more causally faithful model
+    of a "direct" effect than decoding from the post-perturbation state z_ref.
+
+    Mechanism:
+        - Embeds the target gene's identity.
+        - Concatenates the pre-state z_q, target embedding, and clamp effectiveness eff.
+        - An MLP maps this combined representation directly to a sparse gene-space delta.
+    
+    Args
+    ----
+    z_dim : int
+        Dimension of the pre-perturbation state embedding (z_q).
+    G : int
+        Number of genes.
+    n_genes : int
+        Total number of genes in the vocabulary for the embedding layer.
+    hidden : int
+        Hidden size for the MLP.
+    target_embed_dim : int
+        Dimension of the target gene embedding.
+    dropout : float
+        Dropout inside the MLP.
+    bound : Optional[float]
+        If provided, clamp outputs to [-bound, bound].
+    """
+    def __init__(
+        self,
+        z_dim: int,
+        n_genes: int,
+        hidden: int = 256,
+        target_embed_dim: int = 32,
+        dropout: float = 0.0,
+        bound: Optional[float] = None,
+    ):
+        super().__init__()
+        self.bound = bound
+        self.n_genes = n_genes
+
+        # Embedding for the target gene's identity (+1 for a no-target token)
+        self.target_embed = nn.Embedding(n_genes + 1, target_embed_dim)
+        nn.init.normal_(self.target_embed.weight, mean=0.0, std=0.02)
+        
+        # Normalization layer for the input state
+        self.norm = nn.LayerNorm(z_dim)
+
+        # The MLP maps from the combined context to the gene-space delta
+        mlp_in_dim = z_dim + target_embed_dim + 1  # +1 for the scalar `eff`
+        self.mlp = nn.Sequential(
+            nn.Linear(mlp_in_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, n_genes),
+        )
+        
+        # Initialize MLP weights conservatively
+        for m in self.mlp:
+            if isinstance(m, nn.Linear):
+                xavier_small_(m.weight)
+                nn.init.zeros_(m.bias)
+
+        # Small output scaling to start with modest direct effects
+        self.out_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(
+        self,
+        z_q: torch.Tensor,
+        target_idx: torch.Tensor,
+        eff: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Produce the direct-effect delta, Δx_dir.
+        
+        Note: The output is zero for control cells (where target_idx < 0).
+        """
+        # Map target indices to embeddings. Controls (idx=-1) map to the last token.
+        idx = torch.where(target_idx >= 0, target_idx, torch.full_like(target_idx, self.n_genes))
+        t_embed = self.target_embed(idx)
+        
+        # Normalize the pre-perturbation state
+        z_norm = self.norm(z_q)
+        
+        # Combine all context information
+        x = torch.cat([z_norm, t_embed, eff.view(-1, 1)], dim=1)
+        
+        # Predict the change in gene expression
+        dx = self.mlp(x) * self.out_scale
+        
+        # Ensure the direct effect is zero for control cells
+        control_mask = (target_idx < 0).float().view(-1, 1)
+        dx = dx * (1.0 - control_mask)
+
+        if self.bound is not None:
+            dx = torch.clamp(dx, min=-self.bound, max=self.bound)
+            
+        return dx

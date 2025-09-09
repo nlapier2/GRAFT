@@ -38,7 +38,7 @@ from graft.data.samplers import make_dataset_chooser, estimate_dataset_sizes
 # --- Imports from the model and loss definitions ---
 from graft.models.gnn_core import StatePropagator
 from graft.models.step0 import StepZeroClamp
-from graft.models.heads import MediatedHead, SparseDirectHead
+from graft.models.heads import MediatedHead, SparseDirectHead, TrueSparseDirectHead
 from graft.losses.distribution import sliced_wasserstein, mmd_rbf, energy_distance
 from graft.losses.consistency import target_knockdown_consistency
 from graft.losses.invariance import risk_extrapolation, irmv1_penalty
@@ -239,7 +239,8 @@ def main():
             prop = StatePropagator(z_dim=z_dim, n_envs=n_envs, n_genes=G, **model_cfg["propagator"]).to(device)
             step0 = StepZeroClamp(z_dim=z_dim, n_labs=n_envs, **model_cfg["step0"]).to(device)
             head_med = MediatedHead(z_dim=z_dim, **model_cfg["mediated"]).to(device)
-            head_dir = SparseDirectHead(z_dim=z_dim, G=G, **model_cfg["direct"]).to(device)
+            head_dir = TrueSparseDirectHead(z_dim=z_dim, n_genes=G, **model_cfg["direct"]).to(device)
+            # head_dir = SparseDirectHead(z_dim=z_dim, G=G, **model_cfg["direct"]).to(device)
 
             all_params = list(prop.parameters()) + list(step0.parameters()) + list(head_med.parameters()) + list(head_dir.parameters())
             opt = make_optimizer(all_params, cfg.get("optim", {}))
@@ -256,19 +257,21 @@ def main():
         else:
             x0 = y_true # Fallback if no controls were found for this batch
 
-        # --- 1. Calculate clamp effectiveness based on PRE-perturbation state z_q
+        # Calculate clamp effectiveness based on PRE-perturbation state z_q
         x_clamped_authoritative, eff = step0(x0, tb["z_q"], tb["env_code"], tb["target_idx"])
 
-        # --- 2. Propagate state, now conditioned on the effectiveness of the initial hit
+        # Predict direct effects on other genes
+        dx_dir = head_dir(tb["z_q"], target_idx=tb["target_idx"], eff=eff)
+
+        # Propagate state, now conditioned on the effectiveness of the initial hit
         z_ref = prop(tb["z_q"], eff=eff, target_idx=tb["target_idx"], env_codes=tb["env_code"])
 
-        # --- 3. Predict downstream changes from the new state z_ref
+        # Predict downstream changes from the new state z_ref
         m = head_med(z_ref)
         dx_med = m @ U
-        dx_dir = head_dir(z_ref)
         y_pred_downstream = x0 + dx_med + dx_dir
 
-        # --- 4. Surgically intervene to enforce the Step-0 clamp on the final prediction
+        # Surgically intervene to enforce the Step-0 clamp on the final prediction
         y_pred = y_pred_downstream.clone()
         mask = tb["target_idx"] >= 0
         if torch.any(mask):

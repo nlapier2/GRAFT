@@ -39,7 +39,7 @@ from graft.data.dataset import GraftStreamingConfig, GraftStreamingDataset, Cont
 from graft.data.samplers import BalancedRoundRobin
 from graft.models.gnn_core import StatePropagator
 from graft.models.step0 import StepZeroClamp
-from graft.models.heads import MediatedHead, SparseDirectHead
+from graft.models.heads import MediatedHead, SparseDirectHead, TrueSparseDirectHead
 from graft.utils.re_noise import ReNoiser, write_anndata
 from graft.utils.chunk_preprocess import load_gene_list, _build_projection
 
@@ -167,7 +167,8 @@ def main():
                 prop = StatePropagator(z_dim=z_dim, n_envs=n_envs, n_genes=G, **model_cfg["propagator"]).to(device)
                 step0 = StepZeroClamp(z_dim=z_dim, n_labs=n_envs, **model_cfg["step0"]).to(device)
                 head_med = MediatedHead(z_dim=z_dim, **model_cfg["mediated"]).to(device)
-                head_dir = SparseDirectHead(z_dim=z_dim, G=G, **model_cfg["direct"]).to(device)
+                head_dir = TrueSparseDirectHead(z_dim=z_dim, n_genes=G, **model_cfg["direct"]).to(device)
+                # head_dir = SparseDirectHead(z_dim=z_dim, G=G, **model_cfg["direct"]).to(device)
 
                 checkpoint = torch.load(args.checkpoint, map_location=device)
                 prop.load_state_dict(checkpoint["models"]["prop"])
@@ -180,19 +181,21 @@ def main():
             tb = to_device(batch, device)
             x0 = tb["xbar_ctrl"].mean(dim=1)
 
-            # --- 1. Calculate clamp effectiveness based on PRE-perturbation state z_q
+            # Calculate clamp effectiveness based on PRE-perturbation state z_q
             x_clamped_authoritative, eff = step0(x0, tb["z_q"], tb["env_code"], tb["target_idx"])
 
-            # --- 2. Propagate state, now conditioned on the effectiveness of the initial hit
+            # Predict direct effects on other genes
+            dx_dir = head_dir(tb["z_q"], target_idx=tb["target_idx"], eff=eff)
+
+            # Propagate state, now conditioned on the effectiveness of the initial hit
             z_ref = prop(tb["z_q"], eff=eff, target_idx=tb["target_idx"], env_codes=tb["env_code"])
 
-            # --- 3. Predict downstream changes from the new state z_ref
+            # Predict downstream changes from the new state z_ref
             m = head_med(z_ref)
             dx_med = m @ U
-            dx_dir = head_dir(z_ref)
             y_pred_downstream = x0 + dx_med + dx_dir
 
-            # --- 4. Surgically intervene to enforce the Step-0 clamp on the final prediction
+            # Surgically intervene to enforce the Step-0 clamp on the final prediction
             y_pred = y_pred_downstream.clone()
             mask = tb["target_idx"] >= 0
             if torch.any(mask):
