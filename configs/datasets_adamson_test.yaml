@@ -119,18 +119,18 @@ datasets:
       pert_type: "crispri"
 
   ReplogleWeissman2022_K562_gwps:
-    raw_path: "/data/scperturb/preprocessed/ReplogleWeissman2022_K562_gwps.h5ad"
+    raw_path: "/data/scperturb/ReplogleWeissman2022_K562_gwps.h5ad"
     lab_id: "Weissman"
     obs_map:
       batch_id: "batch"
       cell_type: "cell_line"
       pert_type: null
-      target_gene: "target_id"
+      target_gene: "gene"
       guide_id: "guide_id"
-      is_control_from: "target_id"
-      target_id: "target_id"
-      perturbation: "target_id"
-    fixed:
+      is_control_from: "gene"
+      target_id: "gene"
+      perturbation: "perturbation"
+    fixed: 
       pert_type: "crispri"
 
   VCC:
