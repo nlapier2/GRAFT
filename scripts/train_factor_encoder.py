@@ -68,12 +68,10 @@ def _load_z_any(z_path: str, obs_index: pd.Index) -> np.ndarray:
 def main():
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model-dir", required=True, help="scVI model dir (default: artifacts/scvi_<CELLTYPE>/)")
-    ap.add_argument("--scvi-input", required=True, help="scVI input h5ad (default: artifacts/scvi_input_<CELLTYPE>.h5ad)")
-    ap.add_argument("--z-path", required=False,
+    ap.add_argument("--model-dir", required=True, help="scVI model dir")
+    ap.add_argument("--scvi-input", required=True, help="scVI input h5ad")
+    ap.add_argument("--z-path", required=True,
                     help="Path to scVI latent Z; **preferred** format is .npz (with keys 'z' and optional 'cell_ids').")
-    ap.add_argument("--z-parquet", required=False,
-                    help="(Deprecated) Parquet path for Z; kept for backward compatibility.")
     ap.add_argument("--membership-npy", required=True, help="Path to membership matrix M.npy (F_anchor x G)")
     ap.add_argument("--epochs-warm", type=int, default=5)
     ap.add_argument("--epochs-joint", type=int, default=50)
