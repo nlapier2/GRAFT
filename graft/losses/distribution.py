@@ -55,40 +55,45 @@ import torch
 import torch.nn.functional as F
 
 
-def _unit_random_projections(G: int, K: int, device=None, dtype=None) -> torch.Tensor:
-    """
-    Sample K random unit vectors in R^G.
-    """
-    v = torch.randn(G, K, device=device, dtype=dtype)
-    v = v / (v.norm(dim=0, keepdim=True) + 1e-12)
-    return v  # (G, K)
-
-
 def _match_sizes(X: torch.Tensor, Y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Subsample the larger of (X, Y) along batch dim to match the smaller size.
+    Used by all losses here to handle unequal batch sizes.
     """
     Bx, _ = X.shape
     By, _ = Y.shape
     if Bx == By:
         return X, Y
     B = min(Bx, By)
-    # Choose a deterministic subset for reproducibility (first B). You can switch to random if desired.
+    # Randomly subsample without replacement
     if Bx > B:
-        X = X[:B]
+        indices = torch.randperm(Bx, device=X.device)[:B]
+        X = X[indices]
     if By > B:
-        Y = Y[:B]
+        indices = torch.randperm(By, device=Y.device)[:B]
+        Y = Y[indices]
     return X, Y
+
+
+def _unit_random_projections(G: int, K: int, device=None, dtype=None) -> torch.Tensor:
+    """
+    Sample K random unit vectors in R^G. Used by sliced_wasserstein.
+    """
+    v = torch.randn(G, K, device=device, dtype=dtype)
+    v = v / (v.norm(dim=0, keepdim=True) + 1e-12)
+    return v  # (G, K)
 
 
 def sliced_wasserstein(
     X: torch.Tensor,
     Y: torch.Tensor,
-    n_proj: int = 32,
+    n_proj: int = 128,
     p: int = 2,
 ) -> torch.Tensor:
     """
     Sliced Wasserstein-p distance between two batches X, Y of shape (B, G).
+    Computes an approximation to the Wasserstein-p distance by projecting
+    onto `n_proj` random 1D directions and averaging the 1D Wasserstein distances.
 
     Steps:
       1) Sample K = n_proj random unit directions v_k in R^G.
@@ -134,9 +139,9 @@ def _pairwise_sqdist(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     Compute pairwise squared distances between rows of A (N,d) and B (M,d).
     Returns (N, M).
     """
-    a2 = (A * A).sum(dim=1, keepdim=True)         # (N,1)
-    b2 = (B * B).sum(dim=1, keepdim=True).T       # (1,M)
-    return torch.clamp(a2 + b2 - 2.0 * (A @ B.T), min=0.0)
+    a2 = (A * A).sum(dim=1, keepdim=True)         # (N,1), l2 norms of rows of A
+    b2 = (B * B).sum(dim=1, keepdim=True).T       # (1,M), l2 norms of rows of B
+    return torch.clamp(a2 + b2 - 2.0 * (A @ B.T), min=0.0)  # l2 squared distance for each row pair from A and B
 
 
 def mmd_rbf(
@@ -165,8 +170,9 @@ def mmd_rbf(
 
     # Bandwidths
     if sigma is None:
+        # Use median distance heuristic to set a base bandwidth if sigma not provided
         with torch.no_grad():
-            D = _pairwise_sqdist(Z[:min(1024, Z.size(0))], Z[:min(1024, Z.size(0))]).detach()
+            D = _pairwise_sqdist(Z[:min(1024, Z.size(0))], Z[:min(1024, Z.size(0))]).detach()  # use a subset for efficiency
             med = torch.median(D[D > 0])
             base = torch.sqrt(med + 1e-8)  # sqrt since D is squared distance
             base = float(base.item()) if torch.isfinite(base) else 1.0
@@ -211,9 +217,9 @@ def energy_distance(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
     X, Y = _match_sizes(X, Y)
     B = X.size(0)
 
-    d_xy = _pairwise_euclidean(X, Y)         # (B, B)
-    d_xx = _pairwise_euclidean(X, X)         # (B, B)
-    d_yy = _pairwise_euclidean(Y, Y)         # (B, B)
+    d_xy = _pairwise_euclidean(X, Y)         # (B, B) pairwise distances between cells from the two different batches
+    d_xx = _pairwise_euclidean(X, X)         # (B, B) pairwise distances between cells from batch X
+    d_yy = _pairwise_euclidean(Y, Y)         # (B, B) pairwise distances between cells from batch Y
 
     term1 = 2.0 * d_xy.mean()
     term2 = d_xx.mean()
