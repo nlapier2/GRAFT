@@ -1,5 +1,5 @@
 """
-basic_simulation.py
+sim_smoke.py
 
 A self-contained script to test the core GRAFT model components in a
 controlled simulation, bypassing the complexities of scVI and factor encoding.
@@ -87,14 +87,17 @@ class SimulatedGraftWorld:
         # 2. Pick targets and get ground truth effects
         target_idx = torch.randint(0, self.n_pert_genes, (batch_size,))
         delta_z = self.delta_z_true[target_idx]
-        delta_x_dir = self.A_true[:, target_idx].T
+        delta_x_dir_base = self.A_true[:, target_idx].T
 
-        # 3. Apply knobs
-        z_pert = z_ctrl + alpha_med * delta_z
+        # 3. Apply knobs to get true effects
+        true_delta_z = alpha_med * delta_z
+        true_delta_x_dir = alpha_dir * delta_x_dir_base
+
+        z_pert = z_ctrl + true_delta_z
         m_pert = self.MLP_z_to_m(z_pert)
         delta_x_med = (m_pert - m_ctrl) @ self.U_true
         
-        x_bar_downstream = x_bar_ctrl + delta_x_med + alpha_dir * delta_x_dir
+        x_bar_downstream = x_bar_ctrl + delta_x_med + true_delta_x_dir
 
         # 4. Apply Step-0 Clamp
         x_bar_pert = x_bar_downstream.clone()
@@ -104,14 +107,15 @@ class SimulatedGraftWorld:
         
         return {
             "z_q": z_pert.numpy(),
-            "xbar_q": x_bar_pert.numpy(),
-            "xbar_ctrl": x_bar_ctrl.numpy()[:, None, :], # Add k=1 dimension
+            "xbar_q": x_bar_pert.detach().numpy(),
+            "xbar_ctrl": x_bar_ctrl.detach().numpy()[:, None, :], # Add k=1 dimension
             "target_idx": target_idx.numpy(),
             "env_code": np.zeros(batch_size, dtype=int),
             "dataset_id": "sim_dataset",
             # Ground truth for evaluation
-            "delta_z_true": (alpha_med * delta_z).numpy(),
-            "delta_x_dir_true": (alpha_dir * delta_x_dir).numpy(),
+            "delta_z_true": true_delta_z.detach().numpy(),
+            "delta_x_dir_true": true_delta_x_dir.detach().numpy(),
+            "eff_true": np.full(batch_size, alpha_step0, dtype=np.float32)
         }
 
 # --- 2. The Spoofed Data Pipeline ---
@@ -123,19 +127,12 @@ class SpoofedDataPipeline:
 
     def setup(self):
         print(f"Creating spoofed data pipeline in: {self.temp_dir}")
-        # Gene list
         with open(self.temp_dir / "gene_list.tsv", "w") as f:
-            for i in range(self.sim_world.n_genes):
-                f.write(f"GENE_{i}\n")
-        # Factor U matrix
+            for i in range(self.sim_world.n_genes): f.write(f"GENE_{i}\n")
         np.save(self.temp_dir / "factor_U.npy", self.sim_world.U_true.numpy())
-        # Index Parquet
         pd.DataFrame({"cell_id": []}).to_parquet(self.temp_dir / "cell_index.parquet")
-        # Datasets YAML
         with open(self.temp_dir / "datasets.yaml", "w") as f:
             yaml.dump({"datasets": {"sim_dataset": {"raw_path": "dummy.h5ad"}}}, f)
-
-        # Main config YAML
         config = {
             "paths": {
                 "datasets_yaml": str(self.temp_dir / "datasets.yaml"),
@@ -143,13 +140,12 @@ class SpoofedDataPipeline:
                 "gene_list_tsv": str(self.temp_dir / "gene_list.tsv"),
                 "factor_U": str(self.temp_dir / "factor_U.npy"),
                 "output_dir": str(self.temp_dir / "output"),
-                # Dummy paths for things we monkeypatch
                 "scvi_model_dir": "dummy", "scvi_input_h5ad": "dummy",
                 "control_index_dir": "dummy", "control_z_npz": "dummy", "control_xbar_npz": "dummy",
             },
             "training": { "batch_size": 128, "k_controls": 1, "seed": 42 },
             "loss": {
-                "distribution": {"weight": 1.0}, "consistency": {"weight": 1.0},
+                "distribution": {"weight": 1.0}, "consistency": {"weight": 0.5},
                 "rex": {"weight": 0.0}, "direct": {"l1": 0.01}
             },
             "model": {
@@ -162,7 +158,6 @@ class SpoofedDataPipeline:
         }
         with open(self.temp_dir / "config.yaml", "w") as f:
             yaml.dump(config, f)
-        
         return self.temp_dir / "config.yaml"
 
     def cleanup(self):
@@ -191,11 +186,9 @@ def run_test_case(config_path, sim_world, test_case_knobs, n_steps=101):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     U = torch.tensor(np.load(paths["factor_U"]), device=device)
     
-    # Setup mock dataset
     mock_dataset = MockGraftDataset(sim_world, train_cfg["batch_size"], test_case_knobs)
     data_iterator = iter(mock_dataset)
     
-    # Lazy model init
     first_batch = next(data_iterator)
     z_dim = first_batch["z_q"].shape[1]
     G = sim_world.n_genes
@@ -214,24 +207,41 @@ def run_test_case(config_path, sim_world, test_case_knobs, n_steps=101):
     w_cons = loss_cfg["consistency"]["weight"]
     w_l1 = loss_cfg["direct"]["l1"]
 
+    # Store final batch results for evaluation
+    final_results = {}
+
     for step in range(n_steps):
         batch = next(data_iterator)
         tb = to_device(batch, device)
         y_true = tb["xbar_q"]
         x0 = tb["xbar_ctrl"].mean(dim=1)
         
-        # --- Model Forward Pass ---
-        z_ref = prop(tb["z_q"], target_idx=tb["target_idx"])
-        x_clamp, eff = step0(x0, z_ref, tb["env_code"], tb["target_idx"])
+        # --- CORRECTED Model Forward Pass (matches train_gnn.py) ---
+        _, eff = step0(x0, tb["z_q"], tb["env_code"], tb["target_idx"])
+        dx_dir = head_dir(tb["z_q"]) # In your logic, direct head uses pre-state z_q
+        z_ref = prop(tb["z_q"], target_idx=tb["target_idx"], env_codes=tb["env_code"]) # Propagator also uses pre-state z_q
         m = head_med(z_ref)
         dx_med = m @ U
-        dx_dir = head_dir(z_ref)
-        y_pred = x_clamp + dx_med + dx_dir
+        y_pred_downstream = x0 + dx_med + dx_dir
 
-        # --- Loss Calculation ---
+        # Surgically intervene with authoritative clamp
+        y_pred = y_pred_downstream.clone()
+        mask = tb["target_idx"] >= 0
+        if torch.any(mask):
+            # 1. Get the indices of rows that have a valid target
+            rows_to_update = mask.nonzero(as_tuple=False).view(-1)
+            
+            # 2. Get the corresponding target gene indices (the columns) for those rows
+            cols_to_update = tb["target_idx"][mask]
+            
+            # 3. Calculate the clamped values using the predicted effectiveness for the affected rows
+            clamped_vals = x0[rows_to_update, cols_to_update] * (1.0 - eff[rows_to_update])
+            
+            # 4. Apply the surgical intervention
+            y_pred[rows_to_update, cols_to_update] = clamped_vals
+        
         loss_dist = w_dist * dist_fn(y_pred, y_true)
-        loss_cons = w_cons * F.l1_loss(y_pred[torch.arange(len(y_pred)), tb["target_idx"]], 
-                                       y_true[torch.arange(len(y_true)), tb["target_idx"]])
+        loss_cons = w_cons * F.l1_loss(y_pred[mask], y_true[mask])
         loss_l1 = w_l1 * dx_dir.abs().mean()
         total_loss = loss_dist + loss_cons + loss_l1
         
@@ -240,34 +250,52 @@ def run_test_case(config_path, sim_world, test_case_knobs, n_steps=101):
         opt.step()
 
         if step % 50 == 0:
-            # --- Evaluation ---
-            pred_state_shift = z_ref - tb["z_q"]
-            true_state_shift = tb["delta_z_true"]
-            state_sim = F.cosine_similarity(pred_state_shift, true_state_shift).mean().item()
-            
-            true_direct_effect = tb["delta_x_dir_true"]
-            dir_sim = F.cosine_similarity(dx_dir, true_direct_effect).mean().item()
+            print(f"  Step {step:03d} | Loss: {total_loss.item():.4f}")
 
-            print(f"  Step {step:03d} | Loss: {total_loss.item():.4f} | "
-                  f"Consist Loss: {loss_cons.item():.4f} | "
-                  f"State Shift Sim: {state_sim:.3f} | "
-                  f"Direct Effect Sim: {dir_sim:.3f}")
+        if step == n_steps - 1:
+            final_results = {
+                'eff_pred': eff.detach().cpu().numpy(),
+                'eff_true': batch['eff_true'],
+                'dx_dir_pred': dx_dir.detach().cpu().numpy(),
+                'dx_dir_true': batch['delta_x_dir_true']
+            }
+
+    # --- Final Evaluation Statistics ---
+    avg_eff = np.mean(final_results['eff_pred'])
+    print(f"\n  [Evaluation]")
+    print(f"  > Average Predicted Target Effectiveness (eff): {avg_eff:.3f} (True: {np.mean(final_results['eff_true']):.3f})")
+
+    # Direct effects stats
+    pred_dir = final_results['dx_dir_pred']
+    true_dir = final_results['dx_dir_true']
+    
+    # Avg number of predicted effects (using a small threshold)
+    pred_sparsity_mask = np.abs(pred_dir) > 0.1
+    avg_pred_effects = pred_sparsity_mask.sum(axis=1).mean()
+    print(f"  > Avg Predicted # of Direct Effects (>0.1): {avg_pred_effects:.2f}")
+
+    # Percentage of correct direct effects
+    true_sparsity_mask = np.abs(true_dir) > 0.0
+    correct_predictions = (pred_sparsity_mask & true_sparsity_mask).sum()
+    total_true_effects = true_sparsity_mask.sum()
+    if total_true_effects > 0:
+        percent_correct = 100 * (correct_predictions / total_true_effects)
+        print(f"  > Recall of True Direct Effects: {percent_correct:.2f}%")
+    else:
+        print("  > No true direct effects to measure recall against.")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run simulation smoke tests for GRAFT.")
-    parser.add_argument(
-        "--test_case",
-        choices=['a', 'b', 'c', 'all'],
-        default='all',
-        help="Which test case to run: (a) Step0 only, (b) Direct only, (c) Mediated only."
-    )
+    parser.add_argument("--test_case", choices=['a', 'b', 'c', 'all'], default='all', help="Test case")
+    parser.add_argument("--n-steps", type=int, default=101, help="Number of training steps.")
     args = parser.parse_args()
 
-    # Define test case knobs
+    # Define test case knobs with small baseline step0 effect
     test_cases = {
-        'a': ("Step0 Clamp", {"alpha_step0": 0.9, "alpha_dir": 0.0, "alpha_med": 0.0}),
-        'b': ("Sparse Direct Head", {"alpha_step0": 0.0, "alpha_dir": 1.0, "alpha_med": 0.0}),
-        'c': ("State Propagator & Mediated Head", {"alpha_step0": 0.0, "alpha_dir": 0.0, "alpha_med": 1.0}),
+        'a': ("Step0 Clamp", {"alpha_step0": 0.5, "alpha_dir": 0.0, "alpha_med": 0.0}),
+        'b': ("Sparse Direct Head", {"alpha_step0": 0.1, "alpha_dir": 1.0, "alpha_med": 0.0}),
+        'c': ("State Propagator & Mediated Head", {"alpha_step0": 0.1, "alpha_dir": 0.0, "alpha_med": 1.0}),
     }
     
     sim_world = SimulatedGraftWorld()
@@ -275,14 +303,13 @@ if __name__ == "__main__":
     
     try:
         config_path = pipeline.setup()
-        
         cases_to_run = test_cases.keys() if args.test_case == 'all' else [args.test_case]
         
         for case in cases_to_run:
             name, knobs = test_cases[case]
             print(f"\n--- Running Test Case ({case}): {name} ---")
             print(f"Simulation Knobs: {knobs}")
-            run_test_case(config_path, sim_world, knobs)
+            run_test_case(config_path, sim_world, knobs, n_steps=args.n_steps)
 
     finally:
         pipeline.cleanup()
