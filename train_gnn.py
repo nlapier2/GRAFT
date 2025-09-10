@@ -194,6 +194,19 @@ def main():
     if not include_controls_in_query and "is_control" in query_pool.columns:
         query_pool = query_pool[~query_pool["is_control"].astype(bool)]
 
+    with open(paths["datasets_yaml"], "r") as f:
+        _yaml = yaml.safe_load(f)
+    _ds_map = _yaml.get("datasets", {})
+    allowed_for_gnn = {str(k) for k, v in _ds_map.items()
+                    if isinstance(v, dict) and bool(v.get("train_graft", True))}
+    if len(allowed_for_gnn) == 0:
+        raise ValueError("No datasets have train_graft: true in datasets.yaml")
+    before = query_pool["dataset_id"].nunique()
+    query_pool = query_pool[query_pool["dataset_id"].isin(allowed_for_gnn)].copy()
+    after = query_pool["dataset_id"].nunique()
+    if after == 0:
+        raise ValueError("After applying train_graft filter, no queryable cells remain.")
+
     # Calculate sizes and get dataset IDs from the filtered query pool
     sizes = query_pool.groupby("dataset_id").size().to_dict()
     ds_ids = sorted(list(sizes.keys()))
@@ -230,6 +243,7 @@ def main():
     )
     # Pass the chooser to the dataset constructor as required by dataset.py refactoring
     ds = GraftStreamingDataset(ds_cfg, chooser)
+    ds.env_codes = {dsid: i for i, dsid in enumerate(sorted(ds_ids))}
     n_envs = len(ds_ids)
 
     # --- Model Instantiation ---

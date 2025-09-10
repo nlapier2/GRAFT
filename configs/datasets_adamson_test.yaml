@@ -29,6 +29,7 @@ datasets:
   AdamsonWeissman2016_GSM2406681_10X010:
     raw_path: "/data/scperturb/random_split/AdamsonWeissman2016_GSM2406681_10X010/adata_train_preproc_no_qc.h5ad"
     lab_id: "Weissman"
+    train_graft : true
     obs_map:
       batch_id: "batch"
       cell_type: "cell_line"
@@ -45,6 +46,7 @@ datasets:
   DixitRegev2016:
     raw_path: "/data/scperturb/preprocessed/DixitRegev2016.h5ad"
     lab_id: "Regev"
+    train_graft : true
     obs_map:
       batch_id: "batch"
       cell_type: "cell_line"   # present
@@ -60,6 +62,7 @@ datasets:
   NormanWeissman2019_filtered:
     raw_path: "/data/scperturb/preprocessed/NormanWeissman2019_filtered.h5ad"
     lab_id: "Weissman"
+    train_graft : false
     obs_map:
       batch_id: "batch"
       cell_type: "cell_line"
@@ -76,6 +79,7 @@ datasets:
   ShifrutMarson2018:
     raw_path: "/data/scperturb/preprocessed/ShifrutMarson2018.h5ad"
     lab_id: "Marson"
+    train_graft : true
     obs_map:
       batch_id: "batch"
       cell_type: "cell_line"
@@ -91,6 +95,7 @@ datasets:
   ReplogleWeissman2022_rpe1:
     raw_path: "/data/scperturb/preprocessed/ReplogleWeissman2022_rpe1.h5ad"
     lab_id: "Weissman"
+    train_graft : true
     obs_map:
       batch_id: "batch"
       cell_type: "cell_line"
@@ -106,6 +111,7 @@ datasets:
   ReplogleWeissman2022_K562_essential:
     raw_path: "/data/scperturb/preprocessed/ReplogleWeissman2022_K562_essential.h5ad"
     lab_id: "Weissman"
+    train_graft : true
     obs_map:
       batch_id: "batch"
       cell_type: "cell_line"
@@ -121,6 +127,7 @@ datasets:
   ReplogleWeissman2022_K562_gwps:
     raw_path: "/data/scperturb/ReplogleWeissman2022_K562_gwps.h5ad"
     lab_id: "Weissman"
+    train_graft : true
     obs_map:
       batch_id: "batch"
       cell_type: "cell_line"
@@ -136,6 +143,7 @@ datasets:
   VCC:
     raw_path: "/data/scperturb/preprocessed/vcc_training.h5ad"
     lab_id: "Arc"
+    train_graft : true
     obs_map:
       batch_id: "batch"
       cell_type: "cell_line"
