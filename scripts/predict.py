@@ -40,10 +40,11 @@ from graft.data.dataset import GraftStreamingConfig, GraftStreamingDataset, Cont
 from graft.data.samplers import BalancedRoundRobin
 from graft.models.gnn_core import StatePropagator
 from graft.models.step0 import StepZeroClamp
-from graft.models.heads import MediatedHead, SparseDirectHead, TrueSparseDirectHead
+from graft.models.heads import MediatedHead, TrueSparseDirectHead
 from graft.utils.re_noise import ReNoiser, write_anndata
 from graft.utils.chunk_preprocess import load_gene_list, _build_projection
 from scripts.build_index import main as build_index_main
+from train_gnn import make_prediction
 
 
 def build_U(path: str, device: torch.device) -> torch.Tensor:
@@ -197,30 +198,7 @@ def main():
             
             # make predictions
             tb = to_device(batch, device)
-            x0 = tb["xbar_ctrl"].mean(dim=1)
-
-            # Calculate clamp effectiveness based on PRE-perturbation state z_q
-            x_clamped_authoritative, eff = step0(x0, tb["z_q"], tb["env_code"], tb["target_idx"])
-
-            # Predict direct effects on other genes
-            dx_dir = head_dir(tb["z_q"], target_idx=tb["target_idx"], eff=eff)
-
-            # Propagate state, now conditioned on the effectiveness of the initial hit
-            z_ref = prop(tb["z_q"], eff=eff, target_idx=tb["target_idx"], env_codes=tb["env_code"])
-
-            # Predict downstream changes from the new state z_ref
-            m = head_med(z_ref)
-            dx_med = m @ U
-            y_pred_downstream = x0 + dx_med + dx_dir
-
-            # Surgically intervene to enforce the Step-0 clamp on the final prediction
-            y_pred = y_pred_downstream.clone()
-            mask = tb["target_idx"] >= 0
-            if torch.any(mask):
-                rows_to_update = torch.nonzero(mask, as_tuple=False).view(-1)
-                cols_to_update = tb["target_idx"][mask]
-                clamped_values = x_clamped_authoritative[rows_to_update, cols_to_update]
-                y_pred[rows_to_update, cols_to_update] = clamped_values
+            y_pred, x_clamped_authoritative, dx_dir, dx_med, z_ref, eff = make_prediction(tb, step0, head_med, head_dir, prop, U)
 
             all_preds_normalized.append(y_pred.cpu().numpy())
             all_cell_ids.extend(batch['cell_ids'])

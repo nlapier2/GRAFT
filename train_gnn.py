@@ -38,7 +38,7 @@ from graft.data.samplers import make_dataset_chooser, estimate_dataset_sizes
 # --- Imports from the model and loss definitions ---
 from graft.models.gnn_core import StatePropagator
 from graft.models.step0 import StepZeroClamp
-from graft.models.heads import MediatedHead, SparseDirectHead, TrueSparseDirectHead
+from graft.models.heads import MediatedHead, TrueSparseDirectHead
 from graft.losses.distribution import sliced_wasserstein, mmd_rbf, energy_distance
 from graft.losses.consistency import target_knockdown_consistency
 from graft.losses.invariance import risk_extrapolation, irmv1_penalty
@@ -108,6 +108,56 @@ def save_checkpoint(model_dict: Dict[str, nn.Module], opt: optim.Optimizer, step
         "step": step,
     }
     torch.save(ckpt, outdir / f"ckpt_{step:07d}.pt")
+
+
+def make_prediction(tb, step0, head_med, head_dir, prop, U):    # Placeholder for prediction logic
+    x0 = tb["xbar_ctrl"].mean(dim=1)  # Average across k neighbors -> shape (B, G)
+    # define pre-perturbation state as mean embedding across k most similar controls
+    z0 = tb["z_ctrl"].mean(dim=1) if tb["z_ctrl"].dim() == 3 else tb["z_ctrl"]  # (B, d)
+
+    # Calculate clamp effectiveness based on PRE-perturbation state z_ctrl
+    x_clamped_authoritative, eff = step0(x0, z0, tb["env_code"], tb["target_idx"])
+
+    # Predict direct effects on other genes
+    dx_dir = head_dir(z0, target_idx=tb["target_idx"], eff=eff)
+
+    # Propagate state, now conditioned on the effectiveness of the initial hit
+    z_ref = prop(z0, eff=eff, target_idx=tb["target_idx"], env_codes=tb["env_code"])
+
+    # Predict downstream changes from the new state z_ref
+    m = head_med(z_ref)
+    dx_med = m @ U
+    y_pred_downstream = x0 + dx_med + dx_dir
+
+    # Surgically intervene to enforce the Step-0 clamp on the final prediction
+    y_pred = y_pred_downstream.clone()
+    mask = tb["target_idx"] >= 0
+    if torch.any(mask):
+        rows_to_update = torch.nonzero(mask, as_tuple=False).view(-1)
+        cols_to_update = tb["target_idx"][mask]
+        clamped_values = x_clamped_authoritative[rows_to_update, cols_to_update]
+        y_pred[rows_to_update, cols_to_update] = clamped_values
+    return y_pred, x_clamped_authoritative, dx_dir, dx_med, z_ref, eff
+
+
+def compute_losses(dist_fn, y_pred, y_true, dx_dir, U_t, tb, w_dist, w_rex, w_cons, w_l1, w_orth, device):
+    per_env_losses = []
+    unique_envs_in_batch = torch.unique(tb["env_code"])
+    for env_code in unique_envs_in_batch:
+        mask = (tb["env_code"] == env_code)
+        if mask.sum() > 0:
+            loss = dist_fn(y_pred[mask], y_true[mask])
+            per_env_losses.append(loss)
+            
+    loss_dist = w_dist * (torch.stack(per_env_losses).mean() if per_env_losses else torch.tensor(0.0, device=device))
+    loss_rex  = w_rex  * (risk_extrapolation(per_env_losses) if len(per_env_losses) > 1 else torch.tensor(0.0, device=device))
+    loss_cons = w_cons * target_knockdown_consistency(y_pred, y_true, tb["target_idx"], mode="mse")
+    loss_l1   = w_l1   * dx_dir.abs().mean()
+    loss_orth = torch.tensor(0.0, device=device)
+    if w_orth > 0.0:
+        loss_orth = w_orth * ((dx_dir @ U_t) ** 2).mean()
+    total_loss = loss_dist + loss_rex + loss_cons + loss_l1 + loss_orth
+    return total_loss, loss_dist, loss_rex, loss_cons, loss_l1, loss_orth
 
 
 def main():
@@ -253,54 +303,15 @@ def main():
 
         # Calculate x0 as the mean expression of the matched controls (k neighbors)
         start_forward = time.time()
-        if "xbar_ctrl" in tb and tb["xbar_ctrl"].shape[1] > 0:
-            x0 = tb["xbar_ctrl"].mean(dim=1)  # Average across k neighbors -> shape (B, G)
-        else:
-            x0 = y_true # Fallback if no controls were found for this batch
-
-        # Calculate clamp effectiveness based on PRE-perturbation state z_q
-        x_clamped_authoritative, eff = step0(x0, tb["z_q"], tb["env_code"], tb["target_idx"])
-
-        # Predict direct effects on other genes
-        dx_dir = head_dir(tb["z_q"], target_idx=tb["target_idx"], eff=eff)
-
-        # Propagate state, now conditioned on the effectiveness of the initial hit
-        z_ref = prop(tb["z_q"], eff=eff, target_idx=tb["target_idx"], env_codes=tb["env_code"])
-
-        # Predict downstream changes from the new state z_ref
-        m = head_med(z_ref)
-        dx_med = m @ U
-        y_pred_downstream = x0 + dx_med + dx_dir
-
-        # Surgically intervene to enforce the Step-0 clamp on the final prediction
-        y_pred = y_pred_downstream.clone()
-        mask = tb["target_idx"] >= 0
-        if torch.any(mask):
-            rows_to_update = torch.nonzero(mask, as_tuple=False).view(-1)
-            cols_to_update = tb["target_idx"][mask]
-            clamped_values = x_clamped_authoritative[rows_to_update, cols_to_update]
-            y_pred[rows_to_update, cols_to_update] = clamped_values
+        y_pred, x_clamped_authoritative, dx_dir, dx_med, z_ref, eff = make_prediction(tb, step0, head_med, head_dir, prop, U)
         timings["model_forward"].append(time.time() - start_forward)
         
         # --- Loss Calculation ---
         start_backward = time.time()
-        per_env_losses = []
-        unique_envs_in_batch = torch.unique(tb["env_code"])
-        for env_code in unique_envs_in_batch:
-            mask = (tb["env_code"] == env_code)
-            if mask.sum() > 0:
-                loss = dist_fn(y_pred[mask], y_true[mask])
-                per_env_losses.append(loss)
-        
-        loss_dist = w_dist * (torch.stack(per_env_losses).mean() if per_env_losses else torch.tensor(0.0, device=device))
-        loss_rex  = w_rex  * (risk_extrapolation(per_env_losses) if len(per_env_losses) > 1 else torch.tensor(0.0, device=device))
-        loss_cons = w_cons * target_knockdown_consistency(y_pred, y_true, tb["target_idx"], mode="mse")
-        loss_l1   = w_l1   * dx_dir.abs().mean()
-        loss_orth = torch.tensor(0.0, device=device)
-        if w_orth > 0.0:
-            loss_orth = w_orth * ((dx_dir @ U_t) ** 2).mean()
 
-        total_loss = loss_dist + loss_rex + loss_cons + loss_l1 + loss_orth
+        total_loss, loss_dist, loss_rex, loss_cons, loss_l1, loss_orth = compute_losses(
+            dist_fn, y_pred, y_true, dx_dir, U_t, tb, w_dist, w_rex, w_cons, w_l1, w_orth, device
+        )
 
         opt.zero_grad()
         total_loss.backward()

@@ -116,58 +116,6 @@ class MediatedHead(nn.Module):
         return m
 
 
-class SparseDirectHead(nn.Module):
-    """
-    z -> Δx_dir in gene space (R^{G}).
-
-    Args
-    ----
-    z_dim : int
-        Dimension of state embedding.
-    G : int
-        Number of genes.
-    hidden : int
-        Hidden size for the MLP.
-    dropout : float
-        Dropout inside the MLP.
-    bound : Optional[float]
-        If provided, clamp outputs to [-bound, bound] to avoid extreme jumps.
-    """
-    def __init__(
-        self,
-        z_dim: int,
-        G: int,
-        hidden: int = 256,
-        dropout: float = 0.0,
-        bound: Optional[float] = None,
-    ):
-        super().__init__()
-        self.bound = bound
-        self.norm = nn.LayerNorm(z_dim)
-        # Keep the head compact; a single hidden layer often suffices
-        self.mlp = nn.Sequential(
-            nn.Linear(z_dim, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, G),
-        )
-        # Conservative init
-        for m in self.mlp:
-            if isinstance(m, nn.Linear):
-                xavier_small_(m.weight)
-                nn.init.zeros_(m.bias)
-
-        # Small output scaling to start with very small direct effects
-        self.out_scale = nn.Parameter(torch.tensor(0.1))
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        x = self.norm(z)
-        dx = self.mlp(x) * self.out_scale
-        if self.bound is not None:
-            dx = torch.clamp(dx, min=-self.bound, max=self.bound)
-        return dx
-
-
 class TrueSparseDirectHead(nn.Module):
     """
     Predicts direct gene deltas Δx_dir by conditioning on the intervention
@@ -176,13 +124,13 @@ class TrueSparseDirectHead(nn.Module):
 
     Mechanism:
         - Embeds the target gene's identity.
-        - Concatenates the pre-state z_q, target embedding, and clamp effectiveness eff.
+        - Concatenates the pre-state z_ctrl, target embedding, and clamp effectiveness eff.
         - An MLP maps this combined representation directly to a sparse gene-space delta.
     
     Args
     ----
     z_dim : int
-        Dimension of the pre-perturbation state embedding (z_q).
+        Dimension of the pre-perturbation state embedding (z_ctrl).
     G : int
         Number of genes.
     n_genes : int
@@ -236,7 +184,7 @@ class TrueSparseDirectHead(nn.Module):
 
     def forward(
         self,
-        z_q: torch.Tensor,
+        z_ctrl: torch.Tensor,
         target_idx: torch.Tensor,
         eff: torch.Tensor,
     ) -> torch.Tensor:
@@ -250,7 +198,7 @@ class TrueSparseDirectHead(nn.Module):
         t_embed = self.target_embed(idx)
         
         # Normalize the pre-perturbation state
-        z_norm = self.norm(z_q)
+        z_norm = self.norm(z_ctrl)
         
         # Combine all context information
         x = torch.cat([z_norm, t_embed, eff.view(-1, 1)], dim=1)
