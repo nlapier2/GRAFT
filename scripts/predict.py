@@ -31,6 +31,7 @@ from typing import Dict
 import gc
 from scipy import sparse
 import tempfile
+import yaml
 
 # Ensure local modules can be imported
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -103,7 +104,27 @@ def main():
     # Sanitize renoise keys
     final_lib_sizes = {k.replace('_', '-'): v for k, v in renoise_data['lib_sizes_by_dataset'].items()}
     renoiser = ReNoiser(L_ref=renoise_data['L_ref'], theta=renoise_data['theta'], lib_sizes_by_dataset=final_lib_sizes)
-    
+
+    with open(paths["datasets_yaml"], "r") as _f:
+        _y = yaml.safe_load(_f)
+    _ds_map = _y.get("datasets", {})
+    train_graft_true = {str(k) for k, v in _ds_map.items()
+                        if isinstance(v, dict) and bool(v.get("train_graft", True))}
+    # get dataset_ids that actually made it into the scVI input (after your CT filter)
+    _scvi_ref = ad.read_h5ad(paths["scvi_input_h5ad"], backed="r")
+    scvi_ds_ids = set(_scvi_ref.obs["dataset_id"].astype(str).unique())
+    # intersection in sorted order to reproduce training-time mapping
+    train_env_ds_ids = sorted(train_graft_true & scvi_ds_ids)
+    if not train_env_ds_ids:
+        raise ValueError("No datasets remain after (train_graft:true ∩ scVI-input) intersection.")
+    if args.controls_dataset_id not in train_env_ds_ids:
+        raise ValueError(
+            f"controls-dataset-id '{args.controls_dataset_id}' is not in the training env set "
+            "(likely filtered out by scVI-input cell-type filter). Choose one of: "
+            + ", ".join(train_env_ds_ids)
+        )
+    n_envs_train = len(train_env_ds_ids)
+
     # --- 2. Set up Streaming Data Loader for Prediction ---
     print(f"Setting up streaming loader for prediction using controls from: {args.controls_dataset_id}")
     template_adata = ad.read_h5ad(args.template_h5ad, backed='r')
@@ -178,13 +199,9 @@ def main():
                 print("First batch received. Lazily initializing model...")
                 z_dim = batch["z_q"].shape[1]
                 G = len(gene_list)
-                scvi_ref_adata = ad.read_h5ad(paths['scvi_input_h5ad'], backed='r')
-                ds_ids = sorted(list(scvi_ref_adata.obs['dataset_id'].astype(str).unique()))
-                n_envs = len(ds_ids)
-                env_to_code = {dsid: i for i, dsid in enumerate(ds_ids)}
 
-                prop = StatePropagator(z_dim=z_dim, n_envs=n_envs, n_genes=G, **model_cfg["propagator"]).to(device)
-                step0 = StepZeroClamp(z_dim=z_dim, n_labs=n_envs, **model_cfg["step0"]).to(device)
+                prop = StatePropagator(z_dim=z_dim, n_envs=n_envs_train, n_genes=G, **model_cfg["propagator"]).to(device)
+                step0 = StepZeroClamp(z_dim=z_dim, n_labs=n_envs_train, **model_cfg["step0"]).to(device)
                 head_med = MediatedHead(z_dim=z_dim, **model_cfg["mediated"]).to(device)
                 head_dir = TrueSparseDirectHead(z_dim=z_dim, n_genes=G, **model_cfg["direct"]).to(device)
                 # head_dir = SparseDirectHead(z_dim=z_dim, G=G, **model_cfg["direct"]).to(device)

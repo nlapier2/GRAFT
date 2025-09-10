@@ -185,7 +185,7 @@ def main():
     index_all = pd.read_parquet(paths["index_parquet"])
     
     # Filter index by datasets present in the scVI reference AnnData
-    scvi_reference_adata = ad.read_h5ad(paths["scvi_input_h5ad"])
+    scvi_reference_adata = ad.read_h5ad(paths["scvi_input_h5ad"], backed="r")
     valid_scvi_datasets = set(scvi_reference_adata.obs['dataset_id'].astype(str).unique())
     query_pool = index_all[index_all["dataset_id"].isin(valid_scvi_datasets)].copy()
     
