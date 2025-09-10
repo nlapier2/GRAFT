@@ -108,6 +108,7 @@ class SimulatedGraftWorld:
         
         return {
             "z_q": z_pert.numpy(),
+            "z_ctrl": z_ctrl.numpy(),
             "xbar_q": x_bar_pert.detach().numpy(),
             "xbar_ctrl": x_bar_ctrl.detach().numpy()[:, None, :], # Add k=1 dimension
             "target_idx": target_idx.numpy(),
