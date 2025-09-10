@@ -30,6 +30,7 @@ from tqdm import tqdm
 from typing import Dict
 import gc
 from scipy import sparse
+import tempfile
 
 # Ensure local modules can be imported
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -42,6 +43,7 @@ from graft.models.step0 import StepZeroClamp
 from graft.models.heads import MediatedHead, SparseDirectHead, TrueSparseDirectHead
 from graft.utils.re_noise import ReNoiser, write_anndata
 from graft.utils.chunk_preprocess import load_gene_list, _build_projection
+from scripts.build_index import main as build_index_main
 
 
 def build_U(path: str, device: torch.device) -> torch.Tensor:
@@ -109,24 +111,40 @@ def main():
 
     # CORRECTED LOGIC: Create a temporary YAML where the user-provided dataset_id
     # points to the template H5AD file.
-    temp_yaml_path = "temp_predict_datasets.yaml"
+    temp_index_file = None
+    temp_yaml_file = None
     with open(paths['datasets_yaml'], 'r') as f:
         datasets_yaml_data = yaml.safe_load(f)
     
-    # Ensure the target dataset exists in the config before overwriting
-    if args.controls_dataset_id not in datasets_yaml_data['datasets']:
-        raise KeyError(f"Provided --controls-dataset-id '{args.controls_dataset_id}' not found in {paths['datasets_yaml']}")
+    # Isolate the config for the target dataset and point it to the template file
+    target_ds_config = datasets_yaml_data['datasets'][args.controls_dataset_id]
+    temp_config = {
+        'defaults': datasets_yaml_data['defaults'],
+        'datasets': {args.controls_dataset_id: target_ds_config.copy()}
+    }
+    temp_config['datasets'][args.controls_dataset_id]['raw_path'] = args.template_h5ad
+
+    with tempfile.NamedTemporaryFile(mode='w', suffix=".yaml", delete=False) as tmp_yaml:
+        yaml.dump(temp_config, tmp_yaml)
+        temp_yaml_file = tmp_yaml.name
+
+    # Create a temporary file path for the index parquet
+    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp_idx:
+        temp_index_file = tmp_idx.name
     
-    datasets_yaml_data['datasets'][args.controls_dataset_id]['raw_path'] = args.template_h5ad
-    
-    with open(temp_yaml_path, 'w') as f:
-        yaml.dump(datasets_yaml_data, f)
+    print(f"Running build_index on template file...")
+    # Call the main function from build_index.py
+    build_index_main(
+        yaml_path=temp_yaml_file,
+        out_index=temp_index_file,
+        gene_list_path=paths["gene_list_tsv"]
+    )
     
     # Sampler will now correctly yield the ID that the loader can find.
     sampler = BalancedRoundRobin(dataset_ids=[args.controls_dataset_id], steps=None)
     
     ds_cfg = GraftStreamingConfig(
-        datasets_yaml=temp_yaml_path, index_parquet=paths["index_parquet"],
+        datasets_yaml=temp_yaml_file, index_parquet=temp_index_file, #paths["index_parquet"],
         gene_list_tsv=paths["gene_list_tsv"], scvi_model_dir=paths["scvi_model_dir"],
         scvi_input_h5ad=paths["scvi_input_h5ad"], control_index_dir=paths["control_index_dir"],
         control_z_npz=paths["control_z_npz"], control_xbar_npz=paths["control_xbar_npz"],
@@ -209,7 +227,10 @@ def main():
 
             pbar.update(len(batch['cell_ids']))
 
-    os.remove(temp_yaml_path)
+    if temp_index_file and os.path.exists(temp_index_file):
+        os.remove(temp_index_file)
+    if temp_yaml_file and os.path.exists(temp_yaml_file):
+        os.remove(temp_yaml_file)
 
     # --- 5. Assemble, Re-noise, and Unscramble (Rewritten for Memory Efficiency) ---
     print("Finalizing predictions: re-noising and unscrambling genes...")
