@@ -1,5 +1,5 @@
 """
-sim_smoke.py
+basic_simulation.py
 
 A self-contained script to test the core GRAFT model components in a
 controlled simulation, bypassing the complexities of scVI and factor encoding.
@@ -37,8 +37,9 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 # --- Imports from the GRAFT pipeline ---
 from graft.models.gnn_core import StatePropagator
 from graft.models.step0 import StepZeroClamp
-from graft.models.heads import MediatedHead, SparseDirectHead
+from graft.models.heads import MediatedHead, TrueSparseDirectHead
 from train_gnn import to_device, make_optimizer, pick_dist_fn, save_checkpoint
+from graft.losses.consistency import target_knockdown_consistency
 
 
 # --- 1. The Ground-Truth Simulation World ---
@@ -146,7 +147,7 @@ class SpoofedDataPipeline:
             "training": { "batch_size": 128, "k_controls": 1, "seed": 42 },
             "loss": {
                 "distribution": {"weight": 1.0}, "consistency": {"weight": 0.5},
-                "rex": {"weight": 0.0}, "direct": {"l1": 0.01}
+                "rex": {"weight": 0.0}, "direct": {"l1": 0.1}, "orthogonality": {"weight": 0.1}
             },
             "model": {
                 "propagator": {"hidden": 64, "layers": 2, "steps": 2, "dropout": 0.0, "use_env_film": False, "use_target_cond": True, "target_embed_dim": 16},
@@ -178,6 +179,7 @@ class MockGraftDataset:
 
 # --- 4. Main Execution ---
 def run_test_case(config_path, sim_world, test_case_knobs, n_steps=101):
+    print_every = max(50, n_steps // 20)
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
     paths, train_cfg, loss_cfg, model_cfg, optim_cfg = \
@@ -185,6 +187,7 @@ def run_test_case(config_path, sim_world, test_case_knobs, n_steps=101):
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     U = torch.tensor(np.load(paths["factor_U"]), device=device)
+    U_t = U.transpose(0, 1)  # (G, F)
     
     mock_dataset = MockGraftDataset(sim_world, train_cfg["batch_size"], test_case_knobs)
     data_iterator = iter(mock_dataset)
@@ -196,7 +199,7 @@ def run_test_case(config_path, sim_world, test_case_knobs, n_steps=101):
     prop = StatePropagator(z_dim, n_envs=1, n_genes=G, **model_cfg["propagator"]).to(device)
     step0 = StepZeroClamp(z_dim, n_labs=1, **model_cfg["step0"]).to(device)
     head_med = MediatedHead(z_dim, **model_cfg["mediated"]).to(device)
-    head_dir = SparseDirectHead(z_dim, G, **model_cfg["direct"]).to(device)
+    head_dir = TrueSparseDirectHead(z_dim, G, **model_cfg["direct"]).to(device)
     
     all_params = list(prop.parameters()) + list(step0.parameters()) + \
                  list(head_med.parameters()) + list(head_dir.parameters())
@@ -206,8 +209,10 @@ def run_test_case(config_path, sim_world, test_case_knobs, n_steps=101):
     w_dist = loss_cfg["distribution"]["weight"]
     w_cons = loss_cfg["consistency"]["weight"]
     w_l1 = loss_cfg["direct"]["l1"]
+    w_orth = loss_cfg["orthogonality"]["weight"]
 
-    # Store final batch results for evaluation
+    # --- NEW: Trackers for loss components ---
+    loss_history = {'total': [], 'dist': [], 'cons': [], 'l1': [], 'orth': []}
     final_results = {}
 
     for step in range(n_steps):
@@ -216,40 +221,59 @@ def run_test_case(config_path, sim_world, test_case_knobs, n_steps=101):
         y_true = tb["xbar_q"]
         x0 = tb["xbar_ctrl"].mean(dim=1)
         
-        # --- CORRECTED Model Forward Pass (matches train_gnn.py) ---
-        _, eff = step0(x0, tb["z_q"], tb["env_code"], tb["target_idx"])
-        dx_dir = head_dir(tb["z_q"]) # In your logic, direct head uses pre-state z_q
-        z_ref = prop(tb["z_q"], target_idx=tb["target_idx"], env_codes=tb["env_code"]) # Propagator also uses pre-state z_q
+        # Calculate clamp effectiveness based on PRE-perturbation state z_q
+        x_clamped_authoritative, eff = step0(x0, tb["z_q"], tb["env_code"], tb["target_idx"])
+
+        # Predict direct effects on other genes
+        dx_dir = head_dir(tb["z_q"], target_idx=tb["target_idx"], eff=eff)
+
+        # Propagate state, now conditioned on the effectiveness of the initial hit
+        z_ref = prop(tb["z_q"], eff=eff, target_idx=tb["target_idx"], env_codes=tb["env_code"])
+
+        # Predict downstream changes from the new state z_ref
         m = head_med(z_ref)
         dx_med = m @ U
         y_pred_downstream = x0 + dx_med + dx_dir
 
-        # Surgically intervene with authoritative clamp
+        # Surgically intervene to enforce the Step-0 clamp on the final prediction
         y_pred = y_pred_downstream.clone()
         mask = tb["target_idx"] >= 0
         if torch.any(mask):
-            # 1. Get the indices of rows that have a valid target
-            rows_to_update = mask.nonzero(as_tuple=False).view(-1)
-            
-            # 2. Get the corresponding target gene indices (the columns) for those rows
+            rows_to_update = torch.nonzero(mask, as_tuple=False).view(-1)
             cols_to_update = tb["target_idx"][mask]
-            
-            # 3. Calculate the clamped values using the predicted effectiveness for the affected rows
-            clamped_vals = x0[rows_to_update, cols_to_update] * (1.0 - eff[rows_to_update])
-            
-            # 4. Apply the surgical intervention
-            y_pred[rows_to_update, cols_to_update] = clamped_vals
+            clamped_values = x_clamped_authoritative[rows_to_update, cols_to_update]
+            y_pred[rows_to_update, cols_to_update] = clamped_values
         
-        loss_dist = w_dist * dist_fn(y_pred, y_true)
-        loss_cons = w_cons * F.l1_loss(y_pred[mask], y_true[mask])
-        loss_l1 = w_l1 * dx_dir.abs().mean()
-        total_loss = loss_dist + loss_cons + loss_l1
+        # --- Loss Calculation ---
+        per_env_losses = []
+        unique_envs_in_batch = torch.unique(tb["env_code"])
+        for env_code in unique_envs_in_batch:
+            mask = (tb["env_code"] == env_code)
+            if mask.sum() > 0:
+                loss = dist_fn(y_pred[mask], y_true[mask])
+                per_env_losses.append(loss)
+        
+        loss_dist = w_dist * (torch.stack(per_env_losses).mean() if per_env_losses else torch.tensor(0.0, device=device))
+        loss_cons = w_cons * target_knockdown_consistency(y_pred, y_true, tb["target_idx"], mode="mse")
+        loss_l1   = w_l1   * dx_dir.abs().mean()
+        loss_orth = torch.tensor(0.0, device=device)
+        if w_orth > 0.0:
+            loss_orth = w_orth * ((dx_dir @ U_t) ** 2).mean()
+
+        total_loss = loss_dist + loss_cons + loss_l1 + loss_orth
         
         opt.zero_grad()
         total_loss.backward()
         opt.step()
 
-        if step % 50 == 0:
+        # --- NEW: Store loss values ---
+        loss_history['total'].append(total_loss.item())
+        loss_history['dist'].append(loss_dist.item())
+        loss_history['cons'].append(loss_cons.item())
+        loss_history['l1'].append(loss_l1.item())
+        loss_history['orth'].append(loss_orth.item())
+
+        if step % print_every == 0:
             print(f"  Step {step:03d} | Loss: {total_loss.item():.4f}")
 
         if step == n_steps - 1:
@@ -263,18 +287,23 @@ def run_test_case(config_path, sim_world, test_case_knobs, n_steps=101):
     # --- Final Evaluation Statistics ---
     avg_eff = np.mean(final_results['eff_pred'])
     print(f"\n  [Evaluation]")
+    # --- NEW: Print average loss components ---
+    print(f"  > Average Total Loss: {np.mean(loss_history['total']):.4f}")
+    print(f"    - Avg Distribution Loss: {np.mean(loss_history['dist']):.4f}")
+    print(f"    - Avg Consistency Loss:  {np.mean(loss_history['cons']):.4f}")
+    print(f"    - Avg L1 Loss:           {np.mean(loss_history['l1']):.4f}")
+    print(f"    - Avg Orthogonality Loss:{np.mean(loss_history['orth']):.4f}")
+    
     print(f"  > Average Predicted Target Effectiveness (eff): {avg_eff:.3f} (True: {np.mean(final_results['eff_true']):.3f})")
 
     # Direct effects stats
     pred_dir = final_results['dx_dir_pred']
     true_dir = final_results['dx_dir_true']
     
-    # Avg number of predicted effects (using a small threshold)
     pred_sparsity_mask = np.abs(pred_dir) > 0.1
     avg_pred_effects = pred_sparsity_mask.sum(axis=1).mean()
     print(f"  > Avg Predicted # of Direct Effects (>0.1): {avg_pred_effects:.2f}")
 
-    # Percentage of correct direct effects
     true_sparsity_mask = np.abs(true_dir) > 0.0
     correct_predictions = (pred_sparsity_mask & true_sparsity_mask).sum()
     total_true_effects = true_sparsity_mask.sum()

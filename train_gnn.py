@@ -192,6 +192,7 @@ def main():
     opt: optim.Optimizer = None
     
     U = build_U(paths["factor_U"], device=device)
+    U_t = U.transpose(0, 1)  # (G, F)
 
     # --- Loss Configuration ---
     dist_fn = pick_dist_fn(loss_cfg["distribution"].get("type", "swd"))
@@ -297,7 +298,7 @@ def main():
         loss_l1   = w_l1   * dx_dir.abs().mean()
         loss_orth = torch.tensor(0.0, device=device)
         if w_orth > 0.0:
-            loss_orth = w_orth * ((dx_dir @ U) ** 2).mean()
+            loss_orth = w_orth * ((dx_dir @ U_t) ** 2).mean()
 
         total_loss = loss_dist + loss_rex + loss_cons + loss_l1 + loss_orth
 
