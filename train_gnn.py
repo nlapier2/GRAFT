@@ -343,11 +343,19 @@ def main():
                 "l1": float(loss_l1.item()), "orth": float(loss_orth.item()),
             }
             print(json.dumps(log_data))
+            del log_data
 
         if step_index % ckpt_every == 0:
             model_dict = {"prop": prop, "step0": step0, "head_med": head_med, "head_dir": head_dir}
             save_checkpoint(model_dict, opt, step_index, outdir)
-
+            del model_dict
+        
+        # Cleanup
+        del batch, tb, y_true, y_pred, dx_dir, dx_med, z_ref, eff
+        del total_loss, loss_dist, loss_rex, loss_cons, loss_l1, loss_orth
+        if step % 50 == 0:
+            torch.cuda.empty_cache()
+    
     # Final save
     step_index = step + 1
     model_dict = {"prop": prop, "step0": step0, "head_med": head_med, "head_dir": head_dir}

@@ -111,8 +111,8 @@ class ControlANN:
         ctrl_ids = ctrl_ids_df["cell_id"].astype(str).values
 
         # Load z_ctrl from the NPZ produced by train_scvi.py
-        zfile = np.load(control_z_npz, allow_pickle=False)
-        Z = np.asarray(zfile["z"], dtype=np.float32, order="C")
+        with np.load(control_z_npz, allow_pickle=False) as zfile:
+            Z = np.asarray(zfile["z"], dtype=np.float32, order="C")
         if Z.shape[0] != ctrl_ids.shape[0]:
             raise ValueError(f"z rows ({Z.shape[0]}) != ctrl_ids rows ({ctrl_ids.shape[0]}). "
                              "Ensure NPZ is the same used to build the index.")
@@ -121,24 +121,11 @@ class ControlANN:
             dim = Z.shape[1]
 
         print(f"[info] Loading precomputed control xbar from: {control_xbar_npz}")
-        try:
-            xfile = np.load(control_xbar_npz, allow_pickle=False)
-        except Exception as e:
-            print(f"Error loading {control_xbar_npz}: {e}")
-            raise
-        
-        if "xbar" not in xfile:
-            # Fallback check for different key names if necessary, e.g. 'X' or 'data'
-            potential_keys = [k for k in xfile.keys() if 'x' in k.lower() or 'data' in k.lower()]
-            if potential_keys:
-                print(f"[warn] 'xbar' key not found in {control_xbar_npz}. Using key '{potential_keys[0]}'.")
-                xbar_key = potential_keys[0]
-            else:
-                raise ValueError(f"{control_xbar_npz} must contain precomputed expression array (key 'xbar' expected). Found keys: {list(xfile.keys())}")
-        else:
-            xbar_key = "xbar"
-
-        Xbar = np.asarray(xfile[xbar_key], dtype=np.float32, order="C")
+        with np.load(control_xbar_npz, allow_pickle=False) as xfile:
+            key = "xbar" if "xbar" in xfile.files else "X"
+            if key == "X":
+                print("[warn] control_xbar_npz does not contain 'xbar' key, using 'X' instead.")
+            Xbar = np.asarray(xfile[key], dtype=np.float32, order="C")
         if Xbar.shape[0] != ctrl_ids.shape[0]:
             raise ValueError(f"xbar rows ({Xbar.shape[0]}) != ctrl_ids rows ({ctrl_ids.shape[0]}). "
                              "Ensure control xbar file matches control index.")
@@ -390,79 +377,93 @@ class GraftStreamingDataset:
         n_obs = A_b.n_obs
         cs = int(self.cfg.chunk_size)
 
-        for start in range(0, n_obs, cs):
-            t0 = time.time()
-            end = min(start + cs, n_obs)
-            A_chunk = preprocess_chunk(
-                A_backed=A_b,
-                row_index=slice(start, end),
-                gene_list=self.gene_list,
-                dataset_id=dsid,
-                index_df=rows_meta,
-                counts_layer=None,
-                keep_cols=FINAL_OBS_COLS,
-                filter_by_index=self.cfg.filter_by_index,
-            )
-            if A_chunk.n_obs == 0:
-                continue
-            t1 = time.time()
-            print(f"[profile] Chunk Preprocessing ({dsid} {start}-{end}): {t1 - t0:.4f} sec")
-            
-            t2 = time.time()
-            z_chunk = qmodel.get_latent_representation(A_chunk, batch_size=self.cfg.forward_batch_size)
-            xbar_chunk = qmodel.get_normalized_expression(A_chunk, batch_size=self.cfg.forward_batch_size, n_samples=1, library_size=1e4)
-            if not isinstance(xbar_chunk, np.ndarray):
-                xbar_chunk = xbar_chunk.to_numpy()
-            t3 = time.time()
-            print(f"[profile] Query Cell Decoding (z+xbar): {t3 - t2:.4f} sec")
-
-            tgt_idx_chunk = self._targets_for_ids(A_chunk.obs_names.astype(str))
-
-            t4 = time.time()
-            match_ds = dsid if (self.cfg.match_within == "dataset") else None
-            ctrl_idx_chunk, ctrl_ids_chunk, ctrl_dist_chunk = self.ann.query(
-                z_chunk, k=self.cfg.k_controls, match_dataset=match_ds, oversample=self.cfg.oversample
-            )
-            z_ctrl_chunk = self.ann.z_ctrl[ctrl_idx_chunk.clip(min=0)]
-            t5 = time.time()
-            print(f"[profile] ANN Query: {t5 - t4:.4f} sec")
-
-            t6 = time.time()
-            clipped_indices = ctrl_idx_chunk.clip(min=0)
-            xbar_ctrl_chunk = self.ann.xbar_ctrl[clipped_indices]
-            invalid_mask = ctrl_idx_chunk < 0 
-            xbar_ctrl_chunk[invalid_mask] = 0.0
-            t7 = time.time()
-            print(f"[profile] Control Data Lookup: {t7 - t6:.4f} sec")
-
-            # Break chunk into mini-batches
-            B = int(self.cfg.batch_size)
-            N = A_chunk.n_obs
-            for i0 in range(0, N, B):
-                i1 = min(i0 + B, N)
-                z_q = z_chunk[i0:i1]
-                xbar_q = xbar_chunk[i0:i1]
-                ids_q = np.array(A_chunk.obs_names[i0:i1], dtype=str)
-                ctrl_idx = ctrl_idx_chunk[i0:i1]
-                ctrl_ids = ctrl_ids_chunk[i0:i1]
-                z_ctrl = z_ctrl_chunk[i0:i1]
-                x_bar_ctrl = xbar_ctrl_chunk[i0:i1] 
-                ctrl_dist = ctrl_dist_chunk[i0:i1]
+        try:
+            for start in range(0, n_obs, cs):
+                t0 = time.time()
+                end = min(start + cs, n_obs)
+                A_chunk = preprocess_chunk(
+                    A_backed=A_b,
+                    row_index=slice(start, end),
+                    gene_list=self.gene_list,
+                    dataset_id=dsid,
+                    index_df=rows_meta,
+                    counts_layer=None,
+                    keep_cols=FINAL_OBS_COLS,
+                    filter_by_index=self.cfg.filter_by_index,
+                )
+                if A_chunk.n_obs == 0:
+                    continue
+                t1 = time.time()
+                print(f"[profile] Chunk Preprocessing ({dsid} {start}-{end}): {t1 - t0:.4f} sec")
                 
-                batch = {
-                    "z_q": z_q,
-                    "xbar_q": xbar_q,
-                    "cell_ids": ids_q,
-                    "target_idx": tgt_idx_chunk[i0:i1],
-                    "env_code": np.full((i1 - i0,), self.env_codes[dsid], dtype=np.int64),
-                    "ctrl_idx": ctrl_idx,
-                    "ctrl_ids": ctrl_ids,
-                    "z_ctrl": z_ctrl,
-                    "xbar_ctrl": x_bar_ctrl,
-                    "ctrl_dist": ctrl_dist,
-                    "dataset_id": dsid,
-                }
-                yield batch # <<< Yield mini-batch here
+                t2 = time.time()
+                z_chunk = qmodel.get_latent_representation(A_chunk, batch_size=self.cfg.forward_batch_size)
+                xbar_chunk = qmodel.get_normalized_expression(A_chunk, batch_size=self.cfg.forward_batch_size, n_samples=1, library_size=1e4)
+                if not isinstance(xbar_chunk, np.ndarray):
+                    xbar_chunk = xbar_chunk.to_numpy()
+                t3 = time.time()
+                print(f"[profile] Query Cell Decoding (z+xbar): {t3 - t2:.4f} sec")
+
+                tgt_idx_chunk = self._targets_for_ids(A_chunk.obs_names.astype(str))
+
+                t4 = time.time()
+                match_ds = dsid if (self.cfg.match_within == "dataset") else None
+                ctrl_idx_chunk, ctrl_ids_chunk, ctrl_dist_chunk = self.ann.query(
+                    z_chunk, k=self.cfg.k_controls, match_dataset=match_ds, oversample=self.cfg.oversample
+                )
+                z_ctrl_chunk = self.ann.z_ctrl[ctrl_idx_chunk.clip(min=0)]
+                t5 = time.time()
+                print(f"[profile] ANN Query: {t5 - t4:.4f} sec")
+
+                t6 = time.time()
+                clipped_indices = ctrl_idx_chunk.clip(min=0)
+                xbar_ctrl_chunk = self.ann.xbar_ctrl[clipped_indices]
+                invalid_mask = ctrl_idx_chunk < 0 
+                xbar_ctrl_chunk[invalid_mask] = 0.0
+                t7 = time.time()
+                print(f"[profile] Control Data Lookup: {t7 - t6:.4f} sec")
+
+                # Break chunk into mini-batches
+                B = int(self.cfg.batch_size)
+                N = A_chunk.n_obs
+                for i0 in range(0, N, B):
+                    i1 = min(i0 + B, N)
+                    z_q = z_chunk[i0:i1]
+                    xbar_q = xbar_chunk[i0:i1]
+                    ids_q = np.array(A_chunk.obs_names[i0:i1], dtype=str)
+                    ctrl_idx = ctrl_idx_chunk[i0:i1]
+                    ctrl_ids = ctrl_ids_chunk[i0:i1]
+                    z_ctrl = z_ctrl_chunk[i0:i1]
+                    x_bar_ctrl = xbar_ctrl_chunk[i0:i1] 
+                    ctrl_dist = ctrl_dist_chunk[i0:i1]
+                    
+                    batch = {
+                        "z_q": z_q,
+                        "xbar_q": xbar_q,
+                        "cell_ids": ids_q,
+                        "target_idx": tgt_idx_chunk[i0:i1],
+                        "env_code": np.full((i1 - i0,), self.env_codes[dsid], dtype=np.int64),
+                        "ctrl_idx": ctrl_idx,
+                        "ctrl_ids": ctrl_ids,
+                        "z_ctrl": z_ctrl,
+                        "xbar_ctrl": x_bar_ctrl,
+                        "ctrl_dist": ctrl_dist,
+                        "dataset_id": dsid,
+                    }
+                    yield batch # <<< Yield mini-batch here
+                    # clean up mini-batch-level variables
+                    del z_q, xbar_q, ids_q, ctrl_idx, ctrl_ids, z_ctrl, x_bar_ctrl, ctrl_dist, batch
+                # clean up chunk-level variables
+                del A_chunk, z_chunk, xbar_chunk, tgt_idx_chunk, xbar_ctrl_chunk, ctrl_idx_chunk, ctrl_ids_chunk, ctrl_dist_chunk, z_ctrl_chunk
+        finally:
+            try:
+                A_b.file.close()
+            except Exception:
+                try:
+                    A_b._backed.close()
+                except Exception:
+                    pass
+
 
     # ---- helpers ---- #
 
