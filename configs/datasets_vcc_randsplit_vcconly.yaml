@@ -1,0 +1,43 @@
+# Adapter config for building the unified obs index and split specs (no matrix copies).
+# Canonical obs fields we aim for:
+#   cell_id, dataset_id, lab_id, batch_id, cell_type, is_control,
+#   pert_type, target_gene, guide_id, dose, time_h
+# Notes:
+# - lab_id defaults to dataset_id unless you override.
+# - is_control is resolved via simple rules (e.g., target_id/perturbation equals one of control_tokens).
+# - target normalization should be HGNC upper-case where possible.
+
+defaults:
+  # Values & logic reused unless overridden per dataset
+  control_tokens: ["control", "ntc", "non-targeting", "neg_control", "dmso", "ctrl", "untreated", "neg", "", "nan", "none", "null"]
+  target_normalize: "hgnc"   # normalize gene symbols to HGNC upper-case
+  env_key: "batch"        # use batch as environment (IRM/REx)
+  pert_type_guess: "crispri" # most of these are CRISPRi; override where needed
+  # map canonical fields to dataset columns (overridden per dataset)
+  obs_map_template:
+    batch_id: "batch"
+    cell_type: "cell_line"
+    pert_type: null          # often constant per dataset → set in "fixed"
+    target_gene: "target_id"        # e.g., "gene" or "target"
+    guide_id: "guide_id"
+    is_control_from: "target_id"  # or "perturbation"
+    target_id: "target_id"        # keep around; useful as a unique perturbation key
+
+datasets:
+
+  VCC:
+    raw_path: "/data/vcc_data/randsplit0_train_adata.h5ad"
+    lab_id: "Arc"
+    train_graft : true
+    obs_map:
+      batch_id: "batch"
+      cell_type: null
+      pert_type: null
+      target_gene: "target_gene"
+      guide_id: "guide_id"
+      is_control_from: "target_gene"
+      target_id: "target_gene"
+      perturbation: "target_gene"
+    fixed:
+      pert_type: "crispri"
+      cell_type: "h1_hESC"

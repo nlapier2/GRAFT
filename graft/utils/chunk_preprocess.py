@@ -94,6 +94,7 @@ def preprocess_chunk(
     counts_layer: Optional[str] = None,
     keep_cols: Optional[Iterable[str]] = None,
     filter_by_index: bool = True,
+    _proj_cache: Optional[dict] = None,
 ) -> ad.AnnData:
     """
     Core routine:
@@ -102,6 +103,7 @@ def preprocess_chunk(
       3) (optional) filter rows by allowed_cell_ids (global)
       4) align columns to gene_list order (by name) via sparse projection
       5) reindex obs_names to global "dataset_id::local_id" if dataset_id provided
+      6) add var['present'] boolean indicating which master genes are present in the source dataset
 
     Returns an in-memory AnnData with X aligned to gene_list order.
     """
@@ -109,6 +111,7 @@ def preprocess_chunk(
         keep_cols = ["dataset_id","cell_id","lab_id","batch_id","cell_type",
                      "is_control","pert_type","target_gene","guide_id",
                      "target_id","perturbation"]
+
     A = _materialize_rows(A_backed, row_index)
     if A.n_obs == 0:
         return A
@@ -134,19 +137,38 @@ def preprocess_chunk(
     kept_global_ids = global_ids[mask]
     obs = index_df.set_index("cell_id").loc[kept_global_ids].copy()
 
-    # Ensure the matrix is in CSR format for efficient row-slicing during training.
+    # Ensure CSR for efficient row slicing
     if sparse.issparse(A.X):
         A.X = A.X.tocsr()
 
-    # gene alignment by name using sparse projection
-    P = _build_projection(A.var_names.astype(str), gene_list)
+    # Build or reuse the projection
+    src_vars = np.array(A.var_names.astype(str))
+    dst_genes = np.array(gene_list, dtype=str)
+
+    if (_proj_cache is not None
+        and _proj_cache.get("src_vars") is not None
+        and np.array_equal(src_vars, _proj_cache["src_vars"])):
+        P = _proj_cache["P"]
+    else:
+        P = _build_projection(src_vars, dst_genes)
+        if _proj_cache is not None:
+            _proj_cache["src_vars"] = src_vars
+            _proj_cache["P"] = P
+
+    # Align expression (stays sparse if input is sparse)
     X_aligned = A.X @ P
 
-    # assemble output AnnData with authoritative obs from the index
+    # var['present']: which master genes are present in this dataset
+    # (computed against the master order)
+    present = np.isin(dst_genes, src_vars)
+
+    # Assemble output AnnData with authoritative obs from the index
     obs = obs[[c for c in keep_cols if c in obs.columns]].copy()
     var = pd.DataFrame(index=pd.Index(gene_list, name="gene"))
+    var["present"] = present  # NEW
 
     if "tech_batch_id" not in obs.columns and dataset_id is not None and {"batch_id"}.issubset(obs.columns):
         obs["tech_batch_id"] = (obs["dataset_id"].astype(str) + "_" + obs["batch_id"].astype(str)).astype("category")
+
     out = ad.AnnData(X=X_aligned, obs=obs, var=var)
     return out

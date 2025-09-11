@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 import scvi
 from scipy import sparse
+import torch
 
 import time
 
@@ -319,8 +320,6 @@ class GraftStreamingDataset:
 
     # ---- iteration ---- #
 
-    # <<< CHANGE_3: Refactor iter_batches into __iter__ and a helper generator a_chunk_processor >>>
-
     def __iter__(self) -> Iterator[Dict[str, np.ndarray]]:
         """Main iterator. Cycles through datasets based on the sampler policy."""
         
@@ -367,6 +366,8 @@ class GraftStreamingDataset:
         
         qmodel = self.scvi_model_cache["model"]
 
+        proj_cache: Dict[str, object] = {}  # <<< NEW
+
         # Stream the raw H5AD in chunks
         try:
             A_b = ad.read_h5ad(raw_path, backed="r")
@@ -390,6 +391,7 @@ class GraftStreamingDataset:
                     counts_layer=None,
                     keep_cols=FINAL_OBS_COLS,
                     filter_by_index=self.cfg.filter_by_index,
+                    _proj_cache=proj_cache,  # <<< NEW
                 )
                 if A_chunk.n_obs == 0:
                     continue
@@ -397,8 +399,11 @@ class GraftStreamingDataset:
                 print(f"[profile] Chunk Preprocessing ({dsid} {start}-{end}): {t1 - t0:.4f} sec")
                 
                 t2 = time.time()
-                z_chunk = qmodel.get_latent_representation(A_chunk, batch_size=self.cfg.forward_batch_size)
-                xbar_chunk = qmodel.get_normalized_expression(A_chunk, batch_size=self.cfg.forward_batch_size, n_samples=1, library_size=1e4)
+                with torch.inference_mode():
+                    z_chunk = qmodel.get_latent_representation(A_chunk, batch_size=self.cfg.forward_batch_size)
+                    xbar_chunk = qmodel.get_normalized_expression(
+                        A_chunk, batch_size=self.cfg.forward_batch_size, n_samples=1, library_size=1e4
+                    )
                 if not isinstance(xbar_chunk, np.ndarray):
                     xbar_chunk = xbar_chunk.to_numpy()
                 t3 = time.time()
@@ -426,6 +431,7 @@ class GraftStreamingDataset:
                 # Break chunk into mini-batches
                 B = int(self.cfg.batch_size)
                 N = A_chunk.n_obs
+                present = A_chunk.var["present"].to_numpy().astype(bool)  # <<< CHANGED: NumPy bool mask
                 for i0 in range(0, N, B):
                     i1 = min(i0 + B, N)
                     z_q = z_chunk[i0:i1]
@@ -449,6 +455,7 @@ class GraftStreamingDataset:
                         "xbar_ctrl": x_bar_ctrl,
                         "ctrl_dist": ctrl_dist,
                         "dataset_id": dsid,
+                        "gene_mask": present,  # (G,) boolean mask
                     }
                     yield batch # <<< Yield mini-batch here
                     # clean up mini-batch-level variables
