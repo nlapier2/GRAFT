@@ -48,8 +48,9 @@ def create_validation_adata(train_path: str, val_template_path: str, output_path
     control_cells = adata_train[control_mask].to_memory()
     
     print(f"Found {control_cells.n_obs} control cells in training data")
+    print(f"Control cells X shape: {control_cells.X.shape}")
     
-    # Analyze validation template requirements
+    # Analyze validation template requirements (excluding controls)
     print("Analyzing validation template requirements...")
     val_counts = val_template.obs['target_gene'].value_counts()
     print(f"Validation template cell counts per target:")
@@ -60,30 +61,12 @@ def create_validation_adata(train_path: str, val_template_path: str, output_path
     all_obs_data = []
     all_X_data = []
     
-    # Add control cells (copy from training data)
-    if 'non-targeting' in val_counts:
-        n_controls_needed = val_counts['non-targeting']
-        print(f"\nAdding {n_controls_needed} control cells...")
-        
-        # Sample control cells (with replacement if needed)
-        if n_controls_needed <= control_cells.n_obs:
-            control_indices = np.random.choice(control_cells.n_obs, n_controls_needed, replace=False)
-        else:
-            control_indices = np.random.choice(control_cells.n_obs, n_controls_needed, replace=True)
-            print(f"  Warning: Needed {n_controls_needed} controls but only {control_cells.n_obs} available. Sampling with replacement.")
-        
-        selected_controls = control_cells[control_indices]
-        
-        # Add to collections
-        all_X_data.append(selected_controls.X)
-        
-        # Create obs data for controls
-        control_obs = pd.DataFrame({
-            'target_gene': ['non-targeting'] * n_controls_needed,
-            'batch': val_template.obs[val_template.obs['target_gene'] == 'non-targeting']['batch_var'].iloc[:n_controls_needed].values,
-            'guide_id': generate_random_guide_ids(n_controls_needed)
-        })
-        all_obs_data.append(control_obs)
+    # Add ALL control cells from training data (unchanged)
+    print(f"\nAdding all {control_cells.n_obs} control cells from training data...")
+    # Convert sparse matrix to dense if needed
+    control_X = control_cells.X.toarray() if hasattr(control_cells.X, 'toarray') else control_cells.X
+    all_X_data.append(control_X)
+    all_obs_data.append(control_cells.obs.copy())
     
     # Add perturbed cells for each non-control target
     perturbed_targets = [target for target in val_counts.index if target != 'non-targeting']
@@ -92,36 +75,36 @@ def create_validation_adata(train_path: str, val_template_path: str, output_path
         print(f"\nCreating perturbed cells for {len(perturbed_targets)} targets...")
         
         # Use a representative control cell as template for perturbed cells
-        template_control = control_cells[0]
+        template_control_X = control_X[0:1]  # Keep as 2D array (1, n_genes)
         
         for target in perturbed_targets:
             n_cells = val_counts[target]
             print(f"  Creating {n_cells} cells for {target}")
             
             # Create expression data (copy from template control)
-            # In practice, you might want to modify this to simulate perturbation effects
-            target_X = np.tile(template_control.X.toarray() if hasattr(template_control.X, 'toarray') else template_control.X, 
-                              (n_cells, 1))
+            target_X = np.tile(template_control_X, (n_cells, 1))
             all_X_data.append(target_X)
             
             # Get batch values for this target from validation template
             target_batches = val_template.obs[val_template.obs['target_gene'] == target]['batch_var'].values[:n_cells]
             
-            # Create obs data for this target
+            # Create obs data for this target with unique obs names
             target_obs = pd.DataFrame({
                 'target_gene': [target] * n_cells,
                 'batch': target_batches,
                 'guide_id': generate_random_guide_ids(n_cells)
             })
+            # Generate unique observation names for perturbed cells only
+            target_obs.index = generate_unique_obs_names(n_cells, prefix=f"vcc_val_{target}")
             all_obs_data.append(target_obs)
     
     # Combine all data
     print("\nCombining all data...")
     final_X = np.vstack(all_X_data)
-    final_obs = pd.concat(all_obs_data, ignore_index=True)
+    final_obs = pd.concat(all_obs_data, ignore_index=False)  # Keep original indices for controls
     
-    # Generate unique observation names
-    final_obs.index = generate_unique_obs_names(len(final_obs))
+    print(f"Final X shape: {final_X.shape}")
+    print(f"Final obs shape: {final_obs.shape}")
     
     # Create the new AnnData object
     print("Creating new AnnData object...")
