@@ -1,0 +1,67 @@
+paths:
+  datasets_yaml: configs/datasets_vcc_randsplit.yaml  # <- specifies datasets to use
+  index_parquet: /data/GRAFT/artifacts_vcc_randsplit0/cell_index.parquet  # <- full index with controls+perturbed
+  gene_list_tsv: /data/GRAFT/artifacts_vcc_randsplit0/gene_list.tsv  # <- from build_gene_maps.py
+  scvi_model_dir: /data/GRAFT/artifacts_vcc_randsplit0/scvi_K562_epoch100_latent32/scvi_K562/  # <- trained control-only scVI
+  scvi_input_h5ad: /data/GRAFT/artifacts_vcc_randsplit0/scvi_input_K562.h5ad  # <- input to scVI (with controls)
+  control_index_dir: /data/GRAFT/artifacts_vcc_randsplit0/knn_control_index/  # <- contains knn.index, ctrl_ids.parquet, knn_meta.json
+  control_z_npz: /data/GRAFT/artifacts_vcc_randsplit0/scvi_K562_epoch100_latent32/scvi_z_K562.npz  # <- from train_scvi output
+  control_xbar_npz: /data/GRAFT/artifacts_vcc_randsplit0/scvi_K562_epoch100_latent32/scvi_denoised_K562_parts/part_000000000_000101932.npz  # <- from train_scvi output
+  factor_U: /data/GRAFT/artifacts_vcc_randsplit0/learned_factor_encoders/factor_W.npy
+  output_dir: /data/GRAFT/artifacts_vcc_randsplit0/gnn_runs/v1/
+
+
+training:
+  epochs: 1
+  steps_per_epoch: 100          
+  batch_size: 4096
+  chunk_size: 10000             # per-dataset backed chunk
+  forward_batch_size: 4096      # scVI internal forward size (per chunk)
+  lr: 1.0e-3
+  weight_decay: 0.0
+  sampler_policy: "weighted"    # "balanced" | "weighted"
+  sampler_weight_mode: "sqrt"   # damp huge datasets
+  match_within: "dataset"       # restrict ANN to same dataset for now
+  include_controls_in_query: false
+  k_controls: 8
+  oversample: 4
+  seed: 1337
+  log_every: 5
+  ckpt_every: 5
+
+loss:
+  distribution:
+    type: swd     # swd | mmd | energy
+    weight: 1.0
+  rex:
+    weight: 0.1
+  consistency:
+    weight: 0.5
+  direct:
+    l1: 1.0e-4
+    orth_to_U: 0.0
+
+model:
+  # z_dim is inferred from data, no need to set it here
+  propagator:
+    hidden: 256
+    layers: 2
+    steps: 2
+    dropout: 0.0
+    use_env_film: true
+    use_target_cond: true
+    target_embed_dim: 32
+  step0:
+    hidden: 64
+    init_eff: 0.9
+    mode: "down"
+  mediated:
+    F: 321  # NOTE: This must match the number of factors in your factor_U.npy
+    hidden: 256
+    use_factor_feats: false
+    a_dim: 0
+    nonneg: true
+    dropout: 0.0
+  direct:
+    hidden: 256
+    dropout: 0.0
