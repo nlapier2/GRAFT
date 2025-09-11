@@ -11,8 +11,7 @@ import scvi
 
 # --------------------- robust z I/O helpers ---------------------
 
-def _save_z(z: np.ndarray, cell_ids, outdir: str, cell_type: str,
-            z_format: str = "both", parquet_name: str = None, npz_name: str = None):
+def _save_z(z: np.ndarray, cell_ids, outdir: str, z_format: str = "both", parquet_name: str = None, npz_name: str = None):
     """
     Save z in the requested format(s).
     - Parquet: write as a table with 'cell_id' column (not index), float32, pyarrow engine.
@@ -20,9 +19,9 @@ def _save_z(z: np.ndarray, cell_ids, outdir: str, cell_type: str,
     """
     os.makedirs(outdir, exist_ok=True)
     if parquet_name is None:
-        parquet_name = f"scvi_z_{cell_type}.parquet"
+        parquet_name = f"scvi_z.parquet"
     if npz_name is None:
-        npz_name = f"scvi_z_{cell_type}.npz"
+        npz_name = f"scvi_z.npz"
 
     # coerce dtypes
     z = np.asarray(z, dtype=np.float32)
@@ -80,14 +79,14 @@ def _load_z_any(path: str) -> tuple[np.ndarray, np.ndarray]:
 
 # ---------------- denoised chunk writer (unchanged) ----------------
 
-def _write_denoised_chunks(model, adata, outdir, cell_type, chunk_size=10000, library_size=1e4,
+def _write_denoised_chunks(model, adata, outdir, chunk_size=10000, library_size=1e4,
                            transform_batch=None, use_parquet=True):
     """
     Stream get_normalized_expression() in row chunks and write to disk.
-    By default writes many parquet parts in: {outdir}/scvi_denoised_{cell_type}_parts/
+    By default writes many parquet parts in: {outdir}/scvi_denoised_parts/
     """
     os.makedirs(outdir, exist_ok=True)
-    parts_dir = os.path.join(outdir, f"scvi_denoised_{cell_type}_parts")
+    parts_dir = os.path.join(outdir, f"scvi_denoised_parts")
     os.makedirs(parts_dir, exist_ok=True)
 
     n = adata.n_obs
@@ -134,8 +133,8 @@ def main():
     ap.add_argument("--outdir", default="artifacts", help="Where to save model and outputs")
 
     # z output options
-    ap.add_argument("--z-format", choices=["parquet","npz","both"], default="both",
-                    help="Format to save z embeddings (default: both)")
+    ap.add_argument("--z-format", choices=["parquet","npz","both"], default="npz",
+                    help="Format to save z embeddings (default: npz)")
     ap.add_argument("--parquet-name", default=None, help="Optional custom parquet filename for z")
     ap.add_argument("--npz-name", default=None, help="Optional custom npz filename for z")
 
@@ -177,8 +176,7 @@ def main():
         print("[WARN] Non-control cells detected in scVI input; filtering to controls.")
         adata = adata[adata.obs["is_control"].astype(bool)].copy()
 
-    cell_type = str(adata.obs["cell_type"].unique().tolist()[0]) if "cell_type" in adata.obs else "UNKNOWN"
-    model_dir = os.path.join(args.outdir, f"scvi_{cell_type}")
+    model_dir = os.path.join(args.outdir, f"scvi_model")
     os.makedirs(model_dir, exist_ok=True)
 
     if "dataset_id" in adata.obs and "batch_id" in adata.obs:
@@ -206,8 +204,7 @@ def main():
     # Latent
     z_mat = model.get_latent_representation().astype(np.float32, copy=False)
     cell_ids = adata.obs_names.astype("U")
-    _save_z(z_mat, cell_ids, args.outdir, cell_type,
-            z_format=args.z_format, parquet_name=args.parquet_name, npz_name=args.npz_name)
+    _save_z(z_mat, cell_ids, args.outdir, z_format=args.z_format, parquet_name=args.parquet_name, npz_name=args.npz_name)
 
     # Denoised (optional; chunked)
     if args.save_denoised if hasattr(args, "save_denoised") else args.save_denoised:
@@ -221,7 +218,6 @@ def main():
             model=model,
             adata=adata,
             outdir=args.outdir,
-            cell_type=cell_type,
             chunk_size=args.denoised_chunk_size,
             library_size=args.library_size,
             transform_batch=args.transform_batch,
