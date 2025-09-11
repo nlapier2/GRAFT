@@ -6,14 +6,14 @@ paths:
   scvi_input_h5ad: /data/GRAFT/artifacts_vcc_randsplit0/scvi_input_v1.h5ad  # <- input to scVI (with controls)
   control_index_dir: /data/GRAFT/artifacts_vcc_randsplit0/knn_control_index/  # <- contains knn.index, ctrl_ids.parquet, knn_meta.json
   control_z_npz: /data/GRAFT/artifacts_vcc_randsplit0/scvi_v1_epoch100_latent32/scvi_z.npz  # <- from train_scvi output
-  control_xbar_npz: /data/GRAFT/artifacts_vcc_randsplit0/scvi_v1_epoch100_latent32/scvi_denoised_parts/part_000000000_000101932.npz  # <- from train_scvi output
-  factor_U: /data/GRAFT/artifacts_vcc_randsplit0/learned_factor_encoders/factor_W.npy
+  control_xbar_npz: /data/GRAFT/artifacts_vcc_randsplit0/scvi_v1_epoch100_latent32/scvi_denoised_parts/part_000000000_000178735.npz  # <- from train_scvi output
+  factor_U: /data/GRAFT/artifacts_vcc_randsplit0/learned_factor_encoders_v1/factor_W.npy
   output_dir: /data/GRAFT/artifacts_vcc_randsplit0/gnn_runs/v1/
 
 
 training:
   epochs: 1
-  steps_per_epoch: 100          
+  steps_per_epoch: 500          
   batch_size: 4096
   chunk_size: 10000             # per-dataset backed chunk
   forward_batch_size: 4096      # scVI internal forward size (per chunk)
@@ -27,7 +27,7 @@ training:
   oversample: 4
   seed: 1337
   log_every: 5
-  ckpt_every: 5
+  ckpt_every: 25
 
 loss:
   distribution:
