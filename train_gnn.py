@@ -221,6 +221,7 @@ def main():
         weight_mode=str(train_cfg.get("sampler_weight_mode", "sqrt")),
         steps=total_steps,
         seed=int(train_cfg.get("seed", 1337)),
+        priority=train_cfg.get("priority"),
     )
 
     # 3. Initialize Streaming Dataset with Sampler
@@ -291,6 +292,7 @@ def main():
                 weight_mode=str(train_cfg.get("sampler_weight_mode", "sqrt")),
                 steps=total_steps - step, # Or keep total_steps if running for fixed epochs regardless
                 seed=new_seed,
+                priority=train_cfg.get("priority"),
             )
             ds.sampler = chooser # Update dataset's internal sampler
             data_iterator = iter(ds)

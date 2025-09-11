@@ -21,6 +21,9 @@ training:
   weight_decay: 0.0
   sampler_policy: "weighted"    # "balanced" | "weighted"
   sampler_weight_mode: "sqrt"   # damp huge datasets
+  priority:
+    dataset_id: VCC
+    frac: 0.5                # ~50% of steps from this dataset
   match_within: "dataset"       # restrict ANN to same dataset for now
   include_controls_in_query: false
   k_controls: 8

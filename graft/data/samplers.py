@@ -130,41 +130,94 @@ class InterleavedGlobalSampler:
                 yield "__GLOBAL__"
 
 
+@dataclass
+class PriorityMixtureChooser:
+    """
+    Emit the priority dataset with probability p; otherwise emit from 'others'.
+    This guarantees ~p fraction of steps from the priority dataset.
+    """
+    priority_id: str
+    p: float
+    others: Iterable[str]           # an iterator over the non-priority datasets
+    steps: Optional[int] = None
+    seed: int = 123
+
+    def __iter__(self) -> Iterator[str]:
+        if self.steps is not None and self.steps <= 0:
+            return
+        rng = random.Random(self.seed)
+        produced = 0
+        other_iter = iter(self.others)
+        while self.steps is None or produced < self.steps:
+            if rng.random() < self.p:
+                yield self.priority_id
+                produced += 1
+            else:
+                try:
+                    v = next(other_iter)
+                except StopIteration:
+                    other_iter = iter(self.others)  # recycle
+                    v = next(other_iter)
+                yield v
+                produced += 1
+
+
 # ------------------------------- factory helpers ----------------------------- #
 
 def make_dataset_chooser(
     dataset_ids: Sequence[str],
     sizes: Optional[Dict[str, int]] = None,
-    policy: str = "balanced",            # "balanced" | "weighted"
-    weight_mode: str = "sqrt",           # for weighted: "uniform" | "count" | "sqrt"
+    policy: str = "balanced",
+    weight_mode: str = "sqrt",
     steps: Optional[int] = None,
     shuffle_each_epoch: bool = False,
     seed: int = 123,
+    priority: Optional[Dict[str, object]] = None,
 ):
     """
     Build a chooser iterator over dataset_ids.
 
-    Typical usage in train loop:
-        chooser = make_dataset_chooser(ds.get_dataset_ids(), sizes=ds_sizes, policy="weighted", weight_mode="sqrt", steps=total_steps)
-        for key in chooser:
-            if key == "__GLOBAL__":
-                # run any global step
-                continue
-            for batch in ds.iter_batches([key]):
-                train_step(batch)   # your trainer consumes one mini-batch
-                break               # consume exactly one batch per dataset step
+    priority (optional): dict with keys:
+      - dataset_id: str
+      - frac: float in (0,1) (default 0.5)
+      - others_policy: "balanced" | "weighted" (default = policy)
+      - others_weight_mode: "uniform" | "count" | "sqrt" (default = weight_mode)
     """
-    if policy == "balanced":
-        return BalancedRoundRobin(dataset_ids=dataset_ids, steps=steps, shuffle_each_epoch=shuffle_each_epoch, seed=seed)
-    elif policy == "weighted":
-        if sizes is None:
-            weights = {dsid: 1.0 for dsid in dataset_ids}
+    # ---- fast path: base chooser (no priority) ----
+    def _base(ids, sz, pol, wm, st, shuffle, sd):
+        if pol == "balanced":
+            return BalancedRoundRobin(dataset_ids=ids, steps=st, shuffle_each_epoch=shuffle, seed=sd)
+        elif pol == "weighted":
+            if sz is None:
+                weights = {dsid: 1.0 for dsid in ids}
+            else:
+                weights = derive_weights_from_sizes(sz, mode=wm)
+            weights = normalize_weights(weights)
+            return WeightedDatasetSampler(dataset_ids=ids, weights=weights, steps=st, seed=sd)
         else:
-            weights = derive_weights_from_sizes(sizes, mode=weight_mode)
-        weights = normalize_weights(weights)
-        return WeightedDatasetSampler(dataset_ids=dataset_ids, weights=weights, steps=steps, seed=seed)
-    else:
-        raise ValueError(f"Unknown policy: {policy}")
+            raise ValueError(f"Unknown policy: {pol}")
+
+    if not priority:
+        return _base(dataset_ids, sizes, policy, weight_mode, steps, shuffle_each_epoch, seed)
+
+    # ---- priority mixture path ----
+    pid = str(priority["dataset_id"])
+    if pid not in dataset_ids:
+        raise ValueError(f"priority dataset_id '{pid}' not in dataset_ids")
+
+    frac = float(priority.get("frac", 0.5))
+    if not (0.0 < frac < 1.0):
+        raise ValueError("priority.frac must be in (0,1)")
+
+    other_ids = [d for d in dataset_ids if d != pid]
+    if not other_ids:
+        # degenerate case: only priority id exists
+        return BalancedRoundRobin(dataset_ids=[pid], steps=steps, shuffle_each_epoch=False, seed=seed)
+
+    other_sizes = {d: (sizes[d] if sizes is not None and d in sizes else 1) for d in other_ids}
+    others_chooser = _base(other_ids, other_sizes, policy, weight_mode, steps, shuffle_each_epoch, seed + 1)
+
+    return PriorityMixtureChooser(priority_id=pid, p=frac, others=others_chooser, steps=steps, seed=seed + 2)
 
 
 def estimate_dataset_sizes(by_ds: Dict[str, "pd.DataFrame"]) -> Dict[str, int]:
