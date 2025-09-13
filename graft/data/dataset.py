@@ -13,7 +13,6 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 import scvi
-from scvi.data._manager import AnnDataManager
 from scipy import sparse
 import gc
 
@@ -316,6 +315,40 @@ class GraftStreamingDataset:
         )
         self.env_codes: Dict[str, int] = {dsid: i for i, dsid in enumerate(sorted(self.by_ds.keys()))}
 
+        # Reusable per-dataset AnnData shells and batch-code maps
+        self._templates = {}        # dsid -> AnnData (fixed n_obs = chunk_size)
+        self._batch_code_map = {}   # dsid -> dict(tech_batch_id -> int code)
+
+    def _get_template_for(self, dsid: str):
+        """Return (A_template, code_map) for dsid, creating once if needed."""
+        tmpl = self._templates.get(dsid)
+        if tmpl is None:
+            from scipy import sparse as _sp
+            import anndata as ad, numpy as _np, pandas as _pd
+            tmpl_rows = int(self.cfg.chunk_size)
+            tmpl = ad.AnnData(
+                X=_sp.csr_matrix((tmpl_rows, len(self.gene_list)), dtype=_np.float32),
+                var=_pd.DataFrame(index=self.gene_list),
+            )
+            # scVI registry columns that the manager expects to exist
+            tmpl.obs = _pd.DataFrame(
+                {
+                    "_scvi_batch": _np.zeros(tmpl_rows, dtype=_np.int64),
+                    "_scvi_labels": _np.zeros(tmpl_rows, dtype=_np.int64),
+                },
+                index=_np.arange(tmpl_rows).astype(str),  # avoid AnnData warning
+            )
+            self._templates[dsid] = tmpl
+
+        code_map = self._batch_code_map.get(dsid)
+        if code_map is None:
+            # Build once from training categories (same for all dsids in your setup)
+            ref_cats = self.scvi_reference_adata.obs["tech_batch_id"].astype("category").cat.categories
+            code_map = {cat: i for i, cat in enumerate(ref_cats)}
+            self._batch_code_map[dsid] = code_map
+
+        return tmpl, code_map
+
     def get_dataset_ids(self) -> List[str]:
         return list(self.by_ds.keys())
 
@@ -351,6 +384,8 @@ class GraftStreamingDataset:
         # This function contains the logic previously in iter_batches, processing one dataset fully.
         if dsid not in self.by_ds or dsid not in self.ds_paths:
             return # Should not happen if called from __iter__ with valid dsid
+        # get reusable template and batch code map for use with scVI; avoid memory leaks
+        A_template, code_map = self._get_template_for(dsid)
 
         raw_path = self.ds_paths[dsid]
         rows_meta = self.by_ds[dsid]
@@ -378,19 +413,6 @@ class GraftStreamingDataset:
             
         n_obs = A_b.n_obs
         cs = int(self.cfg.chunk_size)
-        tmpl_rows = cs
-
-        # Create template anndata object to avoid re-creating scVI managers
-        A_template = ad.AnnData(
-            X=sparse.csr_matrix((tmpl_rows, len(self.gene_list)), dtype=np.float32),
-            var=pd.DataFrame(index=self.gene_list),
-        )
-        A_template.obs = pd.DataFrame(
-            {"_scvi_batch": np.zeros(tmpl_rows, dtype=np.int64), "_scvi_labels": np.zeros(tmpl_rows, dtype=np.int64)},
-            index=np.arange(tmpl_rows),
-        )
-        ref_cats = self.scvi_reference_adata.obs["tech_batch_id"].astype("category").cat.categories
-        _batch_code_map = {cat: i for i, cat in enumerate(ref_cats)}
 
         try:
             for start in range(0, n_obs, cs):
@@ -452,7 +474,7 @@ class GraftStreamingDataset:
 
                 # Update just the required scVI registry column for the first n rows
                 tbi = (
-                    A_chunk.obs["tech_batch_id"].astype(str).map(_batch_code_map)
+                    A_chunk.obs["tech_batch_id"].astype(str).map(code_map)
                     .fillna(0).astype(np.int64).to_numpy()
                 )
                 if "_scvi_batch" not in A_template.obs.columns:
@@ -468,11 +490,6 @@ class GraftStreamingDataset:
                     xbar_chunk = xbar_chunk.to_numpy()
                 t3 = time.time()
                 print(f"[profile] Query Cell Decoding (z+xbar): {t3 - t2:.4f} sec")
-
-                n_mgr = sum(1 for o in gc.get_objects() if isinstance(o, AnnDataManager))
-                n_adata = sum(1 for o in gc.get_objects() if isinstance(o, ad.AnnData))
-                print('NUMBER OF MANAGERS: ', n_mgr)
-                print('NUMBER OF ANNDATAS: ', n_adata)
 
                 tgt_idx_chunk = self._targets_for_ids(A_chunk.obs_names.astype(str))
 
