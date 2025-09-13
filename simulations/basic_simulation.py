@@ -4,172 +4,234 @@ basic_simulation.py
 A self-contained script to test the core GRAFT model components in a
 controlled simulation, bypassing the complexities of scVI and factor encoding.
 
-This script does the following:
-1.  Defines a `SimulatedGraftWorld` with a ground-truth generative process for
-    cellular perturbations, including step-0, direct, and mediated effects.
-2.  Creates a `SpoofedDataPipeline` to generate all the necessary temporary
-    artifact files (configs, index files, etc.) that the training script expects.
-3.  Implements a `MockGraftDataset` that "monkeypatches" the real data loader.
-    Instead of loading real data, it generates perfect ground-truth batches
-    from the simulation on the fly.
-4.  Runs a simplified training loop for three distinct test cases to verify
-    that each core model component (`StepZeroClamp`, `SparseDirectHead`,
-    `StatePropagator`, `MediatedHead`) can learn the signal it was designed for.
+What it does:
+1) Defines a *causal-by-construction* SimulatedGraftWorld:
+   - step-0 on target -> propagate via stable SEM (I-B)^{-1}
+   - decompose Δx_total into mediated (span(U)) and sparse direct residual
+   - retains z (state), with baseline x0 = U m(z) and optional dz ~ d_tgt
+2) Creates a SpoofedDataPipeline that writes the artifacts your training expects
+3) Implements a MockGraftDataset that yields perfect ground-truth batches
+4) Runs a training loop using your real forward utils & losses
 """
-import argparse
-import json
-import os
-import shutil
-import sys
-import tempfile
+
+from __future__ import annotations
+import argparse, tempfile, shutil, json, yaml, os, sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import yaml
 
-# Add project root to path to allow importing graft modules
+# Allow importing graft modules (assumes this file lives in repo_root/simulations/)
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-# --- Imports from the GRAFT pipeline ---
+# --- Imports from your pipeline ---
 from graft.models.gnn_core import StatePropagator
 from graft.models.step0 import StepZeroClamp
 from graft.models.heads import MediatedHead, TrueSparseDirectHead
-from train_gnn import to_device, make_optimizer, pick_dist_fn, make_prediction, compute_losses
-from graft.losses.consistency import target_knockdown_consistency
+from train_gnn import make_optimizer, pick_dist_fn, make_prediction, compute_losses, to_device
 
 
-# --- 1. The Ground-Truth Simulation World ---
+# === 1) Causal simulation world =================================================
 class SimulatedGraftWorld:
-    """Creates a toy universe with known causal rules for perturbations."""
+    """
+    Causal CRISPRi simulator.
 
-    def __init__(self, n_genes=500, z_dim=32, F_dim=50, n_pert_genes=100):
-        self.n_genes = n_genes
-        self.z_dim = z_dim
-        self.F_dim = F_dim
-        self.n_pert_genes = n_pert_genes  # Number of genes we will simulate perturbations for
+    Mechanism
+    ---------
+    - Stable sparse gene->gene matrix B (spectral radius < 1)
+    - On-target clamp: x_tgt' = x_tgt + d_tgt  (CRISPRi: d_tgt < 0)
+    - Propagation: Δx_total = (I - B)^{-1} (d_tgt * e_tgt)
+    - Decomposition: Δx_med = P_U Δx_total ; Δx_dir = Δx_total - Δx_med (sparsified)
+    - Latent z matters: x0 = U m(z) with small RELU MLP; optional dz ∝ d_tgt
+    """
 
-        # Ground Truth Decoder: U_true (Factors -> Genes)
-        self.U_true = torch.zeros(F_dim, n_genes)
-        for i in range(F_dim):
-            # Each factor affects ~30 random genes
-            affected_genes = np.random.choice(n_genes, 30, replace=False)
-            self.U_true[i, affected_genes] = torch.rand(30) * 2
-        self.U_true = F.normalize(self.U_true, p=1, dim=1)
+    def __init__(self, n_genes=2000, z_dim=32, F_dim=64, n_pert_genes=400, seed=123):
+        self.n_genes = int(n_genes)
+        self.z_dim = int(z_dim)
+        self.F_dim = int(F_dim)
+        self.n_pert_genes = int(n_pert_genes)
 
-        # Ground Truth Direct Effects: A_true (Gene -> Gene)
-        self.A_true = torch.zeros(n_genes, n_genes)
-        for i in range(n_pert_genes):
-            # Each perturbed gene directly affects 5 other genes
-            affected_genes = np.random.choice(n_genes, 5, replace=False)
-            self.A_true[affected_genes, i] = (torch.rand(5) - 0.5) * 4 # Positive and negative effects
+        g = torch.Generator().manual_seed(seed)
 
-        # Ground Truth State Shift Vectors (Perturbation -> z shift)
-        self.delta_z_true = torch.randn(n_pert_genes, z_dim) * 0.5
+        # Stable sparse B
+        density = max(1, int(0.002 * self.n_genes * self.n_genes))
+        rows = torch.randint(self.n_genes, (density,), generator=g)
+        cols = torch.randint(self.n_genes, (density,), generator=g)
+        vals = torch.randn(density, generator=g) * 0.05
+        B = torch.zeros(self.n_genes, self.n_genes)
+        B[rows, cols] = vals
+        B.fill_diagonal_(0.0)
+        with torch.no_grad():
+            v = torch.randn(self.n_genes, generator=g); v /= v.norm() + 1e-8
+            for _ in range(100):
+                v = B @ v; v /= v.norm() + 1e-8
+            spec = (B @ v).norm()
+        scale = (0.9 / (spec + 1e-6)).clamp(max=1.0)
+        self.B = B * scale
+        self.I = torch.eye(self.n_genes)
+        self.R = torch.linalg.inv(self.I - self.B) if self.n_genes <= 4000 else None
 
-        # Ground Truth State-to-Program Map (z -> m)
-        self.MLP_z_to_m = nn.Sequential(
-            nn.Linear(z_dim, 64),
-            nn.LeakyReLU(),
-            nn.Linear(64, F_dim),
-            nn.Softplus() # Non-negative factor activations
-        )
+        # Program dictionary U (orthonormal columns) and projector P
+        U = torch.randn(self.n_genes, self.F_dim, generator=g)
+        U, _ = torch.linalg.qr(U)
+        self.U = U
+        self.U_true = U  # alias for pipeline export
+        self.P = self.U @ self.U.T
 
-    def generate_batch(self, batch_size, alpha_step0, alpha_dir, alpha_med):
-        """Generates a batch of ground-truth data based on the simulation knobs."""
-        # 1. Generate control cells
-        z_ctrl = torch.randn(batch_size, self.z_dim)
-        m_ctrl = self.MLP_z_to_m(z_ctrl)
-        x_bar_ctrl = m_ctrl @ self.U_true
+        # Latent -> programs -> genes
+        self.Wm = torch.randn(self.F_dim, self.z_dim, generator=g) * 0.3
+        self.bm = torch.randn(self.F_dim, generator=g) * 0.1
 
-        # 2. Pick targets and get ground truth effects
-        target_idx = torch.randint(0, self.n_pert_genes, (batch_size,))
-        delta_z = self.delta_z_true[target_idx]
-        delta_x_dir_base = self.A_true[:, target_idx].T
+        # Optional state shift from on-target shock
+        self.gz = torch.randn(self.z_dim, generator=g) * 0.2
 
-        # 3. Apply knobs to get true effects
-        true_delta_z = alpha_med * delta_z
-        true_delta_x_dir = alpha_dir * delta_x_dir_base
+        # Targetable gene set
+        self.perturbable = torch.arange(self.n_pert_genes)
 
-        z_pert = z_ctrl + true_delta_z
-        m_pert = self.MLP_z_to_m(z_pert)
-        delta_x_med = (m_pert - m_ctrl) @ self.U_true
-        
-        x_bar_downstream = x_bar_ctrl + delta_x_med + true_delta_x_dir
+    def _baseline_from_z(self, z):
+        m = torch.nn.functional.relu((self.Wm @ z.T).T + self.bm)  # (N,F)
+        x0 = (self.U @ m.T).T                                      # (N,G)
+        return x0 + 0.1  # avoid exact zeros
 
-        # 4. Apply Step-0 Clamp
-        x_bar_pert = x_bar_downstream.clone()
-        rows = torch.arange(batch_size)
-        clamped_values = x_bar_ctrl[rows, target_idx] * (1.0 - alpha_step0)
-        x_bar_pert[rows, target_idx] = clamped_values
-        
+    def generate_batch(self, batch_size=512, mode="down", k_direct=50):
+        N, G, Z = batch_size, self.n_genes, self.z_dim
+
+        # Latent state + baseline control
+        z_ctrl = torch.randn(N, Z)
+        x0 = self._baseline_from_z(z_ctrl)
+
+        # Targets and heterogeneous effectiveness
+        target_idx = self.perturbable[torch.randint(len(self.perturbable), (N,))]
+        eff = torch.rand(N) * 0.6 + 0.2
+        if mode == "down":
+            d_tgt = -eff * x0[torch.arange(N), target_idx]
+        else:
+            d_tgt = +eff * (0.5 + x0[torch.arange(N), target_idx])
+
+        # Authoritative step-0 clamp
+        x_step0 = x0.clone()
+        x_step0[torch.arange(N), target_idx] = x0[torch.arange(N), target_idx] + d_tgt
+
+        # Propagate via SEM
+        e_tgt = torch.nn.functional.one_hot(target_idx, num_classes=G).float()
+        rhs = d_tgt[:, None] * e_tgt
+        if self.R is not None:
+            dx_total = rhs @ self.R.T
+        else:
+            dx_total = torch.linalg.solve(self.I - self.B, rhs.T).T
+
+        # Decompose into mediated vs direct (then sparsify direct)
+        dx_med = dx_total @ self.P
+        dx_dir = dx_total - dx_med
+        if k_direct is not None and 0 < k_direct < G:
+            _, idxs = torch.topk(dx_dir.abs(), k=k_direct, dim=1)
+            mask = torch.zeros_like(dx_dir).scatter_(1, idxs, 1.0)
+            dx_dir = dx_dir * mask
+
+        # Optional state shift tied to same shock
+        dz = d_tgt[:, None] * self.gz[None, :]
+        z_ref = z_ctrl + dz  # for diagnostics; model consumes z_ctrl
+
+        # Final perturbed (overwrite target with clamp to keep semantics tight)
+        x1 = x0 + dx_med + dx_dir
+        x1[torch.arange(N), target_idx] = x_step0[torch.arange(N), target_idx]
+
+        # Single environment for now (0)
+        env_code = np.zeros(N, dtype=np.int64)
+
         return {
-            "z_q": z_pert.numpy(),
-            "z_ctrl": z_ctrl.numpy(),
-            "xbar_q": x_bar_pert.detach().numpy(),
-            "xbar_ctrl": x_bar_ctrl.detach().numpy()[:, None, :], # Add k=1 dimension
-            "target_idx": target_idx.numpy(),
-            "env_code": np.zeros(batch_size, dtype=int),
-            "dataset_id": "sim_dataset",
-            # Ground truth for evaluation
-            "delta_z_true": true_delta_z.detach().numpy(),
-            "delta_x_dir_true": true_delta_x_dir.detach().numpy(),
-            "eff_true": np.full(batch_size, alpha_step0, dtype=np.float32)
+            "xbar_ctrl": x0[:, None, :].detach().numpy(),  # (N,1,G)
+            "z_ctrl": z_ctrl.detach().numpy(),             # (N,Z)
+            "xbar_q": x1.detach().numpy(),                 # (N,G)
+            "target_idx": target_idx.detach().numpy(),     # (N,)
+            "env_code": env_code,                          # (N,)
+            "eff_true": eff.detach().numpy(),              # (N,)
+
+            # diagnostics
+            "U_true": self.U.detach().numpy(),             # (G,F)
+            "dx_med_true": dx_med.detach().numpy(),        # (N,G)
+            "dx_dir_true": dx_dir.detach().numpy(),        # (N,G)
+            "x_clamped_authoritative": x_step0.detach().numpy(),  # (N,G)
+            "mode": mode
         }
 
-# --- 2. The Spoofed Data Pipeline ---
+
+# === 2) Spoofed data pipeline ===================================================
 class SpoofedDataPipeline:
-    """Creates a temporary directory with all the fake files the model expects."""
     def __init__(self, sim_world: SimulatedGraftWorld):
         self.sim_world = sim_world
         self.temp_dir = Path(tempfile.mkdtemp())
 
-    def setup(self):
+    def setup(self) -> str:
         print(f"Creating spoofed data pipeline in: {self.temp_dir}")
+        # genes
         with open(self.temp_dir / "gene_list.tsv", "w") as f:
-            for i in range(self.sim_world.n_genes): f.write(f"GENE_{i}\n")
-        np.save(self.temp_dir / "factor_U.npy", self.sim_world.U_true.numpy())
+            for i in range(self.sim_world.n_genes):
+                f.write(f"GENE_{i}\n")
+        # factors
+        np.save(
+            self.temp_dir / "factor_U.npy",
+            self.sim_world.U_true.detach().cpu().numpy().T
+        )
+        # empty index (satisfy loader)
         pd.DataFrame({"cell_id": []}).to_parquet(self.temp_dir / "cell_index.parquet")
+        # datasets yaml
         with open(self.temp_dir / "datasets.yaml", "w") as f:
             yaml.dump({"datasets": {"sim_dataset": {"raw_path": "dummy.h5ad"}}}, f)
+
+        # config aligned with actual module signatures
         config = {
             "paths": {
-                "datasets_yaml": str(self.temp_dir / "datasets.yaml"),
-                "index_parquet": str(self.temp_dir / "cell_index.parquet"),
-                "gene_list_tsv": str(self.temp_dir / "gene_list.tsv"),
+                "gene_list": str(self.temp_dir / "gene_list.tsv"),
                 "factor_U": str(self.temp_dir / "factor_U.npy"),
                 "output_dir": str(self.temp_dir / "output"),
-                "scvi_model_dir": "dummy", "scvi_input_h5ad": "dummy",
-                "control_index_dir": "dummy", "control_z_npz": "dummy", "control_xbar_npz": "dummy",
+                "datasets_yaml": str(self.temp_dir / "datasets.yaml"),
+                "index_parquet": str(self.temp_dir / "cell_index.parquet"),
+                "scvi_model_dir": "dummy",
+                "scvi_input_h5ad": "dummy",
+                "control_index_dir": "dummy",
+                "control_z_npz": "dummy",
+                "control_xbar_npz": "dummy",
             },
-            "training": { "batch_size": 128, "k_controls": 1, "seed": 42 },
+            "training": {"batch_size": 128, "k_controls": 1, "seed": 42},
             "loss": {
-                "distribution": {"weight": 1.0}, "consistency": {"weight": 0.5},
-                "rex": {"weight": 0.0}, "direct": {"l1": 0.1}, "orthogonality": {"weight": 0.1}
+                "distribution": {"weight": 1.0},
+                "consistency": {"weight": 0.5},
+                "rex": {"weight": 0.0},
+                "direct": {"l1": 0.1},
+                "orthogonality": {"weight": 0.1},
             },
             "model": {
-                "propagator": {"hidden": 64, "layers": 2, "steps": 2, "dropout": 0.0, "use_env_film": False, "use_target_cond": True, "target_embed_dim": 16},
+                "propagator": {
+                    "hidden": 64,
+                    "layers": 2,
+                    "steps": 2,
+                    "dropout": 0.0,
+                    "use_env_film": False,
+                    "use_target_cond": True,
+                    "target_embed_dim": 16,
+                },
                 "step0": {"hidden": 32, "init_eff": 0.9, "mode": "down"},
                 "mediated": {"F": self.sim_world.F_dim, "hidden": 64},
-                "direct": {"hidden": 64},
+                "direct": {"hidden": 64, "target_embed_dim": 32},
             },
-             "optim": {"lr": 1e-3, "weight_decay": 1e-5}
+            "optim": {"lr": 2e-4, "weight_decay": 1e-2},
         }
+        (self.temp_dir / "output").mkdir(parents=True, exist_ok=True)
         with open(self.temp_dir / "config.yaml", "w") as f:
             yaml.dump(config, f)
-        return self.temp_dir / "config.yaml"
+        return str(self.temp_dir / "config.yaml")
 
-    def cleanup(self):
+    def teardown(self):
         print(f"Cleaning up spoofed data pipeline from: {self.temp_dir}")
-        shutil.rmtree(self.temp_dir)
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-# --- 3. The Monkeypatch ---
+
+# === 3) Mock dataset ============================================================
 class MockGraftDataset:
-    """A mock dataset that generates simulated batches instead of loading data."""
-    def __init__(self, sim_world, batch_size, test_case_knobs):
+    def __init__(self, sim_world: SimulatedGraftWorld, batch_size: int, test_case_knobs: dict):
         self.sim_world = sim_world
         self.batch_size = batch_size
         self.knobs = test_case_knobs
@@ -178,131 +240,164 @@ class MockGraftDataset:
         while True:
             yield self.sim_world.generate_batch(self.batch_size, **self.knobs)
 
-# --- 4. Main Execution ---
+
+# === 4) Training loop ===========================================================
 def run_test_case(config_path, sim_world, test_case_knobs, n_steps=101):
     print_every = max(50, n_steps // 20)
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
-    paths, train_cfg, loss_cfg, model_cfg, optim_cfg = \
+    paths, train_cfg, loss_cfg, model_cfg, optim_cfg = (
         cfg["paths"], cfg["training"], cfg["loss"], cfg["model"], cfg["optim"]
-    
+    )
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    U = torch.tensor(np.load(paths["factor_U"]), device=device)
-    U_t = U.transpose(0, 1)  # (G, F)
-    
-    mock_dataset = MockGraftDataset(sim_world, train_cfg["batch_size"], test_case_knobs)
-    data_iterator = iter(mock_dataset)
-    
-    first_batch = next(data_iterator)
-    z_dim = first_batch["z_q"].shape[1]
+    U_np = np.load(paths["factor_U"])
+    U_t = torch.tensor(U_np, dtype=torch.float32, device=device)  # (G,F)
+
+    # Build components with correct signatures
     G = sim_world.n_genes
-    
-    prop = StatePropagator(z_dim, n_envs=1, n_genes=G, **model_cfg["propagator"]).to(device)
-    step0 = StepZeroClamp(z_dim, n_labs=1, **model_cfg["step0"]).to(device)
-    head_med = MediatedHead(z_dim, **model_cfg["mediated"]).to(device)
-    head_dir = TrueSparseDirectHead(z_dim, G, **model_cfg["direct"]).to(device)
-    
-    all_params = list(prop.parameters()) + list(step0.parameters()) + \
-                 list(head_med.parameters()) + list(head_dir.parameters())
-    opt = make_optimizer(all_params, optim_cfg)
+    z_dim = sim_world.z_dim
+
+    propagator = StatePropagator(
+        z_dim=z_dim,
+        hidden=model_cfg["propagator"]["hidden"],
+        layers=model_cfg["propagator"]["layers"],
+        steps=model_cfg["propagator"]["steps"],
+        dropout=model_cfg["propagator"]["dropout"],
+        use_env_film=model_cfg["propagator"]["use_env_film"],
+        use_target_cond=model_cfg["propagator"]["use_target_cond"],
+        target_embed_dim=model_cfg["propagator"]["target_embed_dim"],
+        n_envs=1,
+        n_genes=G,
+    ).to(device)
+
+    step0 = StepZeroClamp(
+        z_dim=z_dim,
+        n_labs=1,
+        hidden=model_cfg["step0"]["hidden"],
+        init_eff=model_cfg["step0"]["init_eff"],
+        mode=model_cfg["step0"]["mode"],
+    ).to(device)
+
+    mediated = MediatedHead(
+        z_dim=z_dim,
+        F=model_cfg["mediated"]["F"],
+        hidden=model_cfg["mediated"]["hidden"],
+    ).to(device)
+
+    direct = TrueSparseDirectHead(
+        z_dim=z_dim,
+        n_genes=G,
+        hidden=model_cfg["direct"]["hidden"],
+        target_embed_dim=model_cfg["direct"]["target_embed_dim"],
+    ).to(device)
+
+    params = list(propagator.parameters()) + list(step0.parameters()) \
+           + list(mediated.parameters()) + list(direct.parameters())
+    opt = make_optimizer(params, optim_cfg)
 
     dist_fn = pick_dist_fn("swd")
     w_dist = loss_cfg["distribution"]["weight"]
-    w_rex = 0
+    w_rex = loss_cfg.get("rex", {}).get("weight", 0.0)
     w_cons = loss_cfg["consistency"]["weight"]
     w_l1 = loss_cfg["direct"]["l1"]
     w_orth = loss_cfg["orthogonality"]["weight"]
 
-    # --- NEW: Trackers for loss components ---
-    loss_history = {'total': [], 'dist': [], 'cons': [], 'l1': [], 'orth': []}
-    final_results = {}
+    dataset = MockGraftDataset(sim_world, train_cfg["batch_size"], test_case_knobs)
+    iterator = iter(dataset)
 
-    for step in range(n_steps):
-        batch = next(data_iterator)
-        tb = to_device(batch, device)
-        y_true = tb["xbar_q"]
-        y_pred, x_clamped_authoritative, dx_dir, dx_med, z_ref, eff = make_prediction(tb, step0, head_med, head_dir, prop, U)
-        total_loss, loss_dist, loss_rex, loss_cons, loss_l1, loss_orth = compute_losses(
-            dist_fn, y_pred, y_true, dx_dir, U_t, tb, w_dist, w_rex, w_cons, w_l1, w_orth, device
+    loss_hist = {"total": [], "dist": [], "cons": [], "l1": [], "orth": []}
+    final = {}
+
+    for step in range(1, n_steps + 1):
+        tb_np = next(iterator)
+        # ensure env_code is in the batch the model expects
+        tb_np.setdefault("env_code", np.zeros(tb_np["xbar_q"].shape[0], dtype=np.int64))
+        tb = to_device(tb_np, device)
+
+        # Forward pass with your actual helper
+        y_pred, x_clamped_authoritative, dx_dir, dx_med, z_ref, eff = make_prediction(
+            tb, step0, mediated, direct, propagator, U_t
         )
-        
+
+        # Losses (masked distribution, consistency, L1, orth)
+        total, Ld, Lrex, Lc, Ll1, Lorth = compute_losses(
+            dist_fn, y_pred, tb["xbar_q"], dx_dir, U_t, tb,
+            w_dist, w_rex, w_cons, w_l1, w_orth, device
+        )
+
         opt.zero_grad()
-        total_loss.backward()
+        total.backward()
+        nn.utils.clip_grad_norm_(params, max_norm=5.0)
         opt.step()
 
-        # --- NEW: Store loss values ---
-        loss_history['total'].append(total_loss.item())
-        loss_history['dist'].append(loss_dist.item())
-        loss_history['cons'].append(loss_cons.item())
-        loss_history['l1'].append(loss_l1.item())
-        loss_history['orth'].append(loss_orth.item())
+        loss_hist["total"].append(float(total.item()))
+        loss_hist["dist"].append(float(Ld.item()))
+        loss_hist["cons"].append(float(Lc.item()))
+        loss_hist["l1"].append(float(Ll1.item()))
+        loss_hist["orth"].append(float(Lorth.item()))
 
-        if step % print_every == 0:
-            print(f"  Step {step:03d} | Loss: {total_loss.item():.4f}")
+        if step % print_every == 0 or step == 1 or step == n_steps:
+            print(f"[{step:05d}] total={total:.4f} dist={Ld:.4f} cons={Lc:.4f} l1={Ll1:.4f} orth={Lorth:.4f}")
 
-        if step == n_steps - 1:
-            final_results = {
-                'eff_pred': eff.detach().cpu().numpy(),
-                'eff_true': batch['eff_true'],
-                'dx_dir_pred': dx_dir.detach().cpu().numpy(),
-                'dx_dir_true': batch['delta_x_dir_true']
+        if step == n_steps:
+            final = {
+                "eff_pred": tb.get("eff_pred", eff.detach().cpu().numpy()),
+                "eff_true": tb_np["eff_true"],
+                "dx_dir_pred": dx_dir.detach().cpu().numpy(),
+                "dx_dir_true": tb_np["dx_dir_true"],
             }
 
-    # --- Final Evaluation Statistics ---
-    avg_eff = np.mean(final_results['eff_pred'])
-    print(f"\n  [Evaluation]")
-    # --- NEW: Print average loss components ---
-    print(f"  > Average Total Loss: {np.mean(loss_history['total']):.4f}")
-    print(f"    - Avg Distribution Loss: {np.mean(loss_history['dist']):.4f}")
-    print(f"    - Avg Consistency Loss:  {np.mean(loss_history['cons']):.4f}")
-    print(f"    - Avg L1 Loss:           {np.mean(loss_history['l1']):.4f}")
-    print(f"    - Avg Orthogonality Loss:{np.mean(loss_history['orth']):.4f}")
-    
-    print(f"  > Average Predicted Target Effectiveness (eff): {avg_eff:.3f} (True: {np.mean(final_results['eff_true']):.3f})")
+    # quick summary
+    out = Path(paths["output_dir"]) / "sim_summary.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w") as f:
+        json.dump({"test_case": test_case_knobs, "n_steps": n_steps, "loss_avg": {k: float(np.mean(v)) for k, v in loss_hist.items()}}, f)
+    print(f"Saved summary to {out}")
 
-    # Direct effects stats
-    pred_dir = final_results['dx_dir_pred']
-    true_dir = final_results['dx_dir_true']
-    
-    pred_sparsity_mask = np.abs(pred_dir) > 0.1
-    avg_pred_effects = pred_sparsity_mask.sum(axis=1).mean()
-    print(f"  > Avg Predicted # of Direct Effects (>0.1): {avg_pred_effects:.2f}")
-
-    true_sparsity_mask = np.abs(true_dir) > 0.0
-    correct_predictions = (pred_sparsity_mask & true_sparsity_mask).sum()
-    total_true_effects = true_sparsity_mask.sum()
-    if total_true_effects > 0:
-        percent_correct = 100 * (correct_predictions / total_true_effects)
-        print(f"  > Recall of True Direct Effects: {percent_correct:.2f}%")
+    # tiny eval readout
+    avg_eff = float(np.mean(final["eff_pred"]))
+    print("\n[Evaluation]")
+    print(f"  eff_pred avg = {avg_eff:.3f} | eff_true avg = {np.mean(final['eff_true']):.3f}")
+    # crude recall of sparse direct edges
+    pred_mask = (np.abs(final["dx_dir_pred"]) > 0.1)
+    true_mask = (np.abs(final["dx_dir_true"]) > 0.0)
+    if true_mask.sum() > 0:
+        recall = (pred_mask & true_mask).sum() / true_mask.sum()
+        print(f"  direct-edge recall (>0.1): {100*float(recall):.2f}%")
     else:
-        print("  > No true direct effects to measure recall against.")
+        print("  (no true direct edges in this case)")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--test_case", choices=["a", "b", "c"], default="b")
+    ap.add_argument("--n-steps", type=int, default=501)
+    ap.add_argument("--n_genes", type=int, default=2000)
+    ap.add_argument("--z_dim", type=int, default=32)
+    ap.add_argument("--F_dim", type=int, default=64)
+    ap.add_argument("--n_pert_genes", type=int, default=400)
+    args = ap.parse_args()
+
+    # knobs per case
+    if args.test_case == "a":
+        knobs = dict(mode="down", k_direct=0)    # step-0 only
+    elif args.test_case == "b":
+        knobs = dict(mode="down", k_direct=50)   # step-0 + sparse direct
+    else:
+        knobs = dict(mode="down", k_direct=50)   # step-0 + mediated + direct (decomp handled in sim)
+
+    sim = SimulatedGraftWorld(
+        n_genes=args.n_genes, z_dim=args.z_dim, F_dim=args.F_dim, n_pert_genes=args.n_pert_genes
+    )
+    pipeline = SpoofedDataPipeline(sim)
+    config_path = pipeline.setup()
+
+    try:
+        run_test_case(config_path, sim, knobs, n_steps=args.n_steps)
+    finally:
+        pipeline.teardown()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run simulation smoke tests for GRAFT.")
-    parser.add_argument("--test_case", choices=['a', 'b', 'c', 'all'], default='all', help="Test case")
-    parser.add_argument("--n-steps", type=int, default=101, help="Number of training steps.")
-    args = parser.parse_args()
-
-    # Define test case knobs with small baseline step0 effect
-    test_cases = {
-        'a': ("Step0 Clamp", {"alpha_step0": 0.5, "alpha_dir": 0.0, "alpha_med": 0.0}),
-        'b': ("Sparse Direct Head", {"alpha_step0": 0.1, "alpha_dir": 1.0, "alpha_med": 0.0}),
-        'c': ("State Propagator & Mediated Head", {"alpha_step0": 0.1, "alpha_dir": 0.0, "alpha_med": 1.0}),
-    }
-    
-    sim_world = SimulatedGraftWorld()
-    pipeline = SpoofedDataPipeline(sim_world)
-    
-    try:
-        config_path = pipeline.setup()
-        cases_to_run = test_cases.keys() if args.test_case == 'all' else [args.test_case]
-        
-        for case in cases_to_run:
-            name, knobs = test_cases[case]
-            print(f"\n--- Running Test Case ({case}): {name} ---")
-            print(f"Simulation Knobs: {knobs}")
-            run_test_case(config_path, sim_world, knobs, n_steps=args.n_steps)
-
-    finally:
-        pipeline.cleanup()
+    main()
