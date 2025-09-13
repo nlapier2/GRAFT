@@ -13,7 +13,9 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 import scvi
+from scvi.data._manager import AnnDataManager
 from scipy import sparse
+import gc
 
 import time
 
@@ -376,6 +378,19 @@ class GraftStreamingDataset:
             
         n_obs = A_b.n_obs
         cs = int(self.cfg.chunk_size)
+        tmpl_rows = cs
+
+        # Create template anndata object to avoid re-creating scVI managers
+        A_template = ad.AnnData(
+            X=sparse.csr_matrix((tmpl_rows, len(self.gene_list)), dtype=np.float32),
+            var=pd.DataFrame(index=self.gene_list),
+        )
+        A_template.obs = pd.DataFrame(
+            {"_scvi_batch": np.zeros(tmpl_rows, dtype=np.int64), "_scvi_labels": np.zeros(tmpl_rows, dtype=np.int64)},
+            index=np.arange(tmpl_rows),
+        )
+        ref_cats = self.scvi_reference_adata.obs["tech_batch_id"].astype("category").cat.categories
+        _batch_code_map = {cat: i for i, cat in enumerate(ref_cats)}
 
         try:
             for start in range(0, n_obs, cs):
@@ -397,12 +412,67 @@ class GraftStreamingDataset:
                 print(f"[profile] Chunk Preprocessing ({dsid} {start}-{end}): {t1 - t0:.4f} sec")
                 
                 t2 = time.time()
-                z_chunk = qmodel.get_latent_representation(A_chunk, batch_size=self.cfg.forward_batch_size)
-                xbar_chunk = qmodel.get_normalized_expression(A_chunk, batch_size=self.cfg.forward_batch_size, n_samples=1, library_size=1e4)
+
+                # --- use the fixed-size template: pad X/obs to chunk_size rows ---
+                from scipy.sparse import vstack as _sp_vstack, csr_matrix as _csr
+                n = A_chunk.n_obs
+                if n < A_template.n_obs:
+                    pad_rows = A_template.n_obs - n
+                    X_full = _sp_vstack(
+                        [A_chunk.X, _csr((pad_rows, A_chunk.n_vars), dtype=np.float32)],
+                        format="csr",
+                    )
+                    base_obs = A_chunk.obs.iloc[:1].copy()
+                    obs_pad = pd.concat([base_obs] * pad_rows, ignore_index=True)
+                    obs_full = pd.concat(
+                        [A_chunk.obs.reset_index(drop=True), obs_pad], ignore_index=True
+                    )
+                else:
+                    # n should not exceed chunk_size; if equal, no padding needed
+                    X_full = A_chunk.X
+                    obs_full = A_chunk.obs
+
+                # assign into the reusable template
+                A_template.X = X_full
+                A_template.obs = obs_full
+                A_template.obs_names = A_chunk.obs_names.tolist() + [f"pad_{i}" for i in range(A_template.n_obs - n)]
+
+                # --- use the fixed-size template: pad X only; keep obs identity ---
+                from scipy.sparse import vstack as _sp_vstack, csr_matrix as _csr
+                n = A_chunk.n_obs
+                if n < A_template.n_obs:
+                    pad_rows = A_template.n_obs - n
+                    X_full = _sp_vstack(
+                        [A_chunk.X, _csr((pad_rows, A_chunk.n_vars), dtype=np.float32)],
+                        format="csr",
+                    )
+                else:
+                    X_full = A_chunk.X
+                A_template.X = X_full
+
+                # Update just the required scVI registry column for the first n rows
+                tbi = (
+                    A_chunk.obs["tech_batch_id"].astype(str).map(_batch_code_map)
+                    .fillna(0).astype(np.int64).to_numpy()
+                )
+                if "_scvi_batch" not in A_template.obs.columns:
+                    A_template.obs["_scvi_batch"] = 0
+                if "_scvi_labels" not in A_template.obs.columns:
+                    A_template.obs["_scvi_labels"] = 0
+                A_template.obs.iloc[:n, A_template.obs.columns.get_loc("_scvi_batch")] = tbi
+
+                idx = np.arange(n)
+                z_chunk = qmodel.get_latent_representation(A_template, indices=idx, batch_size=self.cfg.forward_batch_size)
+                xbar_chunk = qmodel.get_normalized_expression(A_template, indices=idx, batch_size=self.cfg.forward_batch_size, n_samples=1, library_size=1e4)
                 if not isinstance(xbar_chunk, np.ndarray):
                     xbar_chunk = xbar_chunk.to_numpy()
                 t3 = time.time()
                 print(f"[profile] Query Cell Decoding (z+xbar): {t3 - t2:.4f} sec")
+
+                n_mgr = sum(1 for o in gc.get_objects() if isinstance(o, AnnDataManager))
+                n_adata = sum(1 for o in gc.get_objects() if isinstance(o, ad.AnnData))
+                print('NUMBER OF MANAGERS: ', n_mgr)
+                print('NUMBER OF ANNDATAS: ', n_adata)
 
                 tgt_idx_chunk = self._targets_for_ids(A_chunk.obs_names.astype(str))
 
@@ -455,6 +525,7 @@ class GraftStreamingDataset:
                     del z_q, xbar_q, ids_q, ctrl_idx, ctrl_ids, z_ctrl, x_bar_ctrl, ctrl_dist, batch
                 # clean up chunk-level variables
                 del A_chunk, z_chunk, xbar_chunk, tgt_idx_chunk, xbar_ctrl_chunk, ctrl_idx_chunk, ctrl_ids_chunk, ctrl_dist_chunk, z_ctrl_chunk
+                gc.collect()
         finally:
             try:
                 A_b.file.close()
