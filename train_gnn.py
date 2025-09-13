@@ -27,7 +27,6 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F  # <<< NEW (for masked losses)
 import yaml
 import time
 import anndata as ad # Added import for pre-calculation
@@ -65,16 +64,12 @@ def to_device(batch: Dict[str, np.ndarray], device: torch.device) -> Dict[str, t
     out = {}
     for k, v in batch.items():
         if isinstance(v, np.ndarray):
-            # Handle booleans correctly (for gene_mask)
-            if v.dtype == np.bool_ or v.dtype.kind == 'b':            # <<< NEW
-                out[k] = torch.as_tensor(v, dtype=torch.bool, device=device)
-                continue
             # Handle multi-dimensional arrays for control latents/expressions
             if v.ndim > 1 and v.dtype.kind in ('f',):
-                dtype = torch.float32
+                 dtype = torch.float32
             elif v.dtype.kind in ("f",):
                 dtype = torch.float32
-            elif v.dtype.kind in ("i", "u"):
+            elif v.dtype.kind in ("i", "u", "b"):
                 dtype = torch.int64
             else:
                 continue # Skip non-numeric types like string arrays
@@ -132,83 +127,35 @@ def make_prediction(tb, step0, head_med, head_dir, prop, U):    # Placeholder fo
     # Predict downstream changes from the new state z_ref
     m = head_med(z_ref)
     dx_med = m @ U
-    # Compose prediction (no extra full clone)
-    y_pred = x0 + dx_med + dx_dir  # <<< CHANGED (no .clone())
+    y_pred_downstream = x0 + dx_med + dx_dir
 
     # Surgically intervene to enforce the Step-0 clamp on the final prediction
+    y_pred = y_pred_downstream.clone()
     mask = tb["target_idx"] >= 0
     if torch.any(mask):
-        rows = torch.nonzero(mask, as_tuple=False).view(-1)
-        cols = tb["target_idx"][mask].view(-1)
-        # index_put_ avoids a full-tensor clone while keeping grads
-        y_pred.index_put_((rows, cols), x_clamped_authoritative[rows, cols])  # <<< CHANGED
+        rows_to_update = torch.nonzero(mask, as_tuple=False).view(-1)
+        cols_to_update = tb["target_idx"][mask]
+        clamped_values = x_clamped_authoritative[rows_to_update, cols_to_update]
+        y_pred[rows_to_update, cols_to_update] = clamped_values
     return y_pred, x_clamped_authoritative, dx_dir, dx_med, z_ref, eff
 
 
-def _masked_dist_loss(dist_fn, Xp, Xt, mask_BxG, *, min_keep=256):
-    """
-    Batch-intersection masking for distribution losses.
-    If too few genes intersect across the batch, fall back to masked MSE.
-    """
-    if mask_BxG is None:
-        return dist_fn(Xp, Xt)
-    keep = mask_BxG.all(dim=0)  # (G,)
-    n_keep = int(keep.sum().item())
-    if n_keep >= min_keep:
-        return dist_fn(Xp[:, keep], Xt[:, keep])
-    # Fallback: masked MSE over all observed entries
-    diff2 = (Xp - Xt).pow(2)
-    return diff2[mask_BxG].mean()
-
-
 def compute_losses(dist_fn, y_pred, y_true, dx_dir, U_t, tb, w_dist, w_rex, w_cons, w_l1, w_orth, device):
-    """
-    Adds masked distribution loss (via gene_mask) and masked target-consistency.
-    For per-environment losses, the batch-intersection is computed inside each env slice.
-    """
-    gene_mask_1d = tb.get("gene_mask", None)  # (G,) or None
-    if gene_mask_1d is not None:
-        B = y_true.shape[0]
-        mask_BxG_full = gene_mask_1d.view(1, -1).expand(B, -1)  # (B,G)
-    else:
-        mask_BxG_full = None
-
     per_env_losses = []
     unique_envs_in_batch = torch.unique(tb["env_code"])
     for env_code in unique_envs_in_batch:
-        mask_env = (tb["env_code"] == env_code)
-        if mask_env.any():
-            Xp = y_pred[mask_env]
-            Xt = y_true[mask_env]
-            mask_BxG_env = (mask_BxG_full[mask_env] if mask_BxG_full is not None else None)
-            loss = _masked_dist_loss(dist_fn, Xp, Xt, mask_BxG_env)
+        mask = (tb["env_code"] == env_code)
+        if mask.sum() > 0:
+            loss = dist_fn(y_pred[mask], y_true[mask])
             per_env_losses.append(loss)
             
     loss_dist = w_dist * (torch.stack(per_env_losses).mean() if per_env_losses else torch.tensor(0.0, device=device))
     loss_rex  = w_rex  * (risk_extrapolation(per_env_losses) if len(per_env_losses) > 1 else torch.tensor(0.0, device=device))
-
-    # --- Masked target-consistency on the target column when present ---
-    tidx = tb["target_idx"].long()  # (B,)
-    pred_t = y_pred.gather(1, tidx.view(-1,1)).squeeze(1)
-    true_t = y_true.gather(1, tidx.view(-1,1)).squeeze(1)
-    if gene_mask_1d is not None:
-        # Look up presence per sample at the target column
-        present_t = gene_mask_1d[tidx]  # (B,) since gene_mask_1d is 1D
-        if present_t.any():
-            loss_cons_val = (pred_t - true_t).pow(2)[present_t].mean()
-        else:
-            loss_cons_val = torch.tensor(0.0, device=device)
-    else:
-        # fallback to original helper if no masking provided
-        loss_cons_val = F.mse_loss(pred_t, true_t)
-    loss_cons = w_cons * loss_cons_val
-
-    # --- Regularizers ---
+    loss_cons = w_cons * target_knockdown_consistency(y_pred, y_true, tb["target_idx"], mode="mse")
     loss_l1   = w_l1   * dx_dir.abs().mean()
     loss_orth = torch.tensor(0.0, device=device)
     if w_orth > 0.0:
         loss_orth = w_orth * ((dx_dir @ U_t) ** 2).mean()
-
     total_loss = loss_dist + loss_rex + loss_cons + loss_l1 + loss_orth
     return total_loss, loss_dist, loss_rex, loss_cons, loss_l1, loss_orth
 
