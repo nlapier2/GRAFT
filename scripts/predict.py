@@ -125,6 +125,19 @@ def main():
         )
     n_envs_train = len(train_env_ds_ids)
 
+    # --- preload control pools for random sampling baseline ---
+    rng = np.random.default_rng(12345)
+    k_controls = int(cfg["training"].get("k_controls", 16))
+    G = len(gene_list)
+    # Load z_ctrl from the NPZ produced by train_scvi.py
+    with np.load(paths["control_z_npz"], allow_pickle=False) as zfile:
+        Z_ctrl = np.asarray(zfile["z"], dtype=np.float32, order="C")
+    with np.load(paths["control_xbar_npz"], allow_pickle=False) as xfile:
+        key = "xbar" if "xbar" in xfile.files else "X"
+        if key == "X":
+            print("[warn] control_xbar_npz does not contain 'xbar' key, using 'X' instead.")
+        XBAR_ctrl = np.asarray(xfile[key], dtype=np.float32, order="C")
+
     # --- 2. Set up Streaming Data Loader for Prediction ---
     print(f"Setting up streaming loader for prediction using controls from: {args.controls_dataset_id}")
     template_adata = ad.read_h5ad(args.template_h5ad, backed='r')
@@ -173,8 +186,8 @@ def main():
         batch_size=args.batch_size, chunk_size=train_cfg.get("chunk_size", 50000),
         k_controls=train_cfg["k_controls"], oversample=train_cfg["oversample"],
         match_within=train_cfg.get("match_within", "dataset"), forward_batch_size=train_cfg["forward_batch_size"],
-        include_controls_in_query=True,
-        filter_by_index=False # <-- IMPORTANT: Do not filter for unseen cells
+        include_controls_in_query=False,
+        filter_by_index=True  # Ok with temp index since we want all cells in the template
     )
     dataset = GraftStreamingDataset(ds_cfg, sampler)
 
@@ -183,15 +196,22 @@ def main():
     env_to_code = None
     
     # --- 4. Prediction Loop ---
-    print(f"Generating predictions for {template_adata.n_obs} cells...")
+    expected = dataset.by_ds[args.controls_dataset_id].shape[0]  # perturbed-only pool
+    print(f"Generating predictions for {expected} cells...")
     all_preds_normalized, all_cell_ids = [], []
     
     data_iterator = iter(dataset)
 
-    with torch.no_grad(), tqdm(total=template_adata.n_obs) as pbar:
-        while len(all_cell_ids) < template_adata.n_obs:
+    with torch.no_grad(), tqdm(total=expected) as pbar:
+        while len(all_cell_ids) < expected:
             try:
                 batch = next(data_iterator)
+                n = batch["z_q"].shape[0]
+                z_idx = rng.integers(0, Z_ctrl.shape[0], size=n, endpoint=False)
+                x_idx = rng.integers(0, XBAR_ctrl.shape[0], size=(n, k_controls), endpoint=False)
+                batch["z_ctrl"] = Z_ctrl[z_idx].astype(np.float32, copy=False)           # (N, z_dim)
+                batch["xbar_ctrl"] = XBAR_ctrl[x_idx].astype(np.float32, copy=False)     # (N, k_controls, G)
+
             except StopIteration:
                 break
 
@@ -221,11 +241,9 @@ def main():
             all_cell_ids.extend(batch['cell_ids'])
 
             pbar.update(len(batch['cell_ids']))
-
-    if temp_index_file and os.path.exists(temp_index_file):
-        os.remove(temp_index_file)
-    if temp_yaml_file and os.path.exists(temp_yaml_file):
-        os.remove(temp_yaml_file)
+        
+    # local ids for perturbed cells in the same order as predictions
+    pert_local_ids_in_order = [cid.split("::", 1)[1] for cid in all_cell_ids]
 
     # --- 5. Assemble, Re-noise, and Unscramble (Rewritten for Memory Efficiency) ---
     print("Finalizing predictions: re-noising and unscrambling genes...")
@@ -262,13 +280,34 @@ def main():
     print("Unscrambling genes in sparse format...")
     final_counts_unscrambled_sparse = sparse_counts_canonical @ back_projection
 
-    print(f"Writing final predicted AnnData to {args.output_h5ad}...")
+    print("Adding control cells back into the final output...")
     # The write_anndata helper can accept the sparse matrix directly
+    idx_tmp = pd.read_parquet(temp_index_file)
+    ctrl_global_ids = set(idx_tmp.loc[idx_tmp["is_control"].astype(bool), "cell_id"].astype(str))
+    ctrl_local_ids_in_template = [lid for lid in template_adata.obs_names.astype(str)
+                                  if f"{args.controls_dataset_id}::{lid}" in ctrl_global_ids]
+    ctrl_view = template_adata[ctrl_local_ids_in_template, :]
+    ctrl_X = ctrl_view.X
+    ctrl_counts_unscrambled = ctrl_X if sparse.issparse(ctrl_X) else sparse.csr_matrix(ctrl_X)
+
+    from scipy.sparse import vstack as sp_vstack
+    final_counts_unscrambled = sp_vstack([final_counts_unscrambled_sparse, ctrl_counts_unscrambled], format="csr")
+    final_obs = pd.concat(
+        [original_obs.loc[pert_local_ids_in_order], original_obs.loc[ctrl_local_ids_in_template]],
+        axis=0
+    )
+    
+    print(f"Writing final predicted AnnData to {args.output_h5ad}...")
     output_adata = write_anndata(
-        counts=final_counts_unscrambled_sparse,
+        counts=final_counts_unscrambled,
         var_names=original_genes,
         obs_df=final_obs
     )
+
+    if temp_index_file and os.path.exists(temp_index_file):
+        os.remove(temp_index_file)
+    if temp_yaml_file and os.path.exists(temp_yaml_file):
+        os.remove(temp_yaml_file)
 
     output_dir = os.path.dirname(args.output_h5ad)
     if output_dir: os.makedirs(output_dir, exist_ok=True)
