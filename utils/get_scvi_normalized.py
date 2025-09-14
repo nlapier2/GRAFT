@@ -44,6 +44,8 @@ def main():
     ap.add_argument("--output-h5ad", required=True, help="Where to write the normalized AnnData")
     ap.add_argument("--batch-size", type=int, default=4096, help="Streaming batch size")
     ap.add_argument("--save-original-to-layer", default=None, help="If set, stash original X in this layer name")
+    ap.add_argument("--posterior-counts", action="store_true",
+                    help="If set, request posterior predictive counts from scVI and write those to .X")
     args = ap.parse_args()
 
     # --- Load config and paths (same as predict.py) ---
@@ -98,7 +100,8 @@ def main():
         k_controls=train_cfg["k_controls"], oversample=train_cfg["oversample"],
         match_within=train_cfg.get("match_within", "dataset"), forward_batch_size=train_cfg["forward_batch_size"],
         include_controls_in_query=True,
-        filter_by_index=True  # Ok with temp index since we want all cells in the template
+        filter_by_index=True,
+        scvi_posterior_counts=args.posterior_counts,
     )
     ds = GraftStreamingDataset(ds_cfg, sampler)
     data_iterator = iter(ds)
@@ -120,14 +123,19 @@ def main():
             break
 
         cell_ids = batch["cell_ids"]  # list[str] like "DS::local_id"
-        # normalized expression for the query rows (what we want)
-        # Depending on your dataset version, the key is commonly "xbar_q".
-        if "xbar_q" in batch:
-            xbar = batch["xbar_q"]
-        elif "x_q" in batch:
-            xbar = batch["x_q"]
+        # Select posterior counts if requested and available; otherwise normalized expression
+        if args.posterior_counts:
+            if "x_counts_q" not in batch:
+                raise KeyError("Requested posterior counts, but 'x_counts_q' not present in batch. "
+                               "Did you enable scvi_posterior_counts in the loader config?")
+            xbar = batch["x_counts_q"]
         else:
-            raise KeyError("Batch missing normalized expression ('xbar_q' or 'x_q'). Please ensure dataset.py exposes it.")
+            if "xbar_q" in batch:
+                xbar = batch["xbar_q"]
+            elif "x_q" in batch:
+                xbar = batch["x_q"]
+            else:
+                raise KeyError("Batch missing normalized expression ('xbar_q' or 'x_q').")
 
         # Place rows into output in the exact input order
         # Extract local ids after the "::"

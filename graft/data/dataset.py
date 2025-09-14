@@ -236,6 +236,7 @@ class GraftStreamingConfig:
     forward_batch_size: int = 4096
     include_controls_in_query: bool = False  # usually False (query = perturbed only)
     filter_by_index: bool = True  # only process cells in index_parquet. True for training, False for prediction
+    scvi_posterior_counts: bool = False  # if True, sample from scVI posterior
 
 
 class GraftStreamingDataset:
@@ -486,6 +487,28 @@ class GraftStreamingDataset:
                 idx = np.arange(n)
                 z_chunk = qmodel.get_latent_representation(A_template, indices=idx, batch_size=self.cfg.forward_batch_size)
                 xbar_chunk = qmodel.get_normalized_expression(A_template, indices=idx, batch_size=self.cfg.forward_batch_size, n_samples=1, library_size=1e4)
+                x_counts_chunk = None
+                if self.cfg.scvi_posterior_counts:
+                    # scvi-tools public API
+                    if hasattr(qmodel, "posterior_predictive_sample"):
+                        x_counts_chunk = qmodel.posterior_predictive_sample(
+                            A_template,
+                            indices=idx,
+                            batch_size=self.cfg.forward_batch_size,
+                            n_samples=1,           # one draw per cell
+                        )
+                        if hasattr(x_counts_chunk, "to_numpy"):
+                            x_counts_chunk = x_counts_chunk.to_numpy()
+                        if hasattr(x_counts_chunk, "toarray"):
+                            x_counts_chunk = x_counts_chunk.toarray()
+                        if hasattr(x_counts_chunk, "todense"):
+                            x_counts_chunk = x_counts_chunk.todense()
+                        x_counts_chunk = np.asarray(x_counts_chunk, dtype=np.float32, order="C")
+                    else:
+                        raise RuntimeError(
+                            "scvi_posterior_counts=True requested, but SCVI model "
+                            "does not expose posterior_predictive_sample()."
+                        )
                 if not isinstance(xbar_chunk, np.ndarray):
                     xbar_chunk = xbar_chunk.to_numpy()
                 t3 = time.time()
@@ -517,6 +540,10 @@ class GraftStreamingDataset:
                     i1 = min(i0 + B, N)
                     z_q = z_chunk[i0:i1]
                     xbar_q = xbar_chunk[i0:i1]
+                    if x_counts_chunk is not None:
+                        x_counts_q = x_counts_chunk[i0:i1]
+                    else:
+                        x_counts_q = None
                     ids_q = np.array(A_chunk.obs_names[i0:i1], dtype=str)
                     ctrl_idx = ctrl_idx_chunk[i0:i1]
                     ctrl_ids = ctrl_ids_chunk[i0:i1]
@@ -536,6 +563,7 @@ class GraftStreamingDataset:
                         "xbar_ctrl": x_bar_ctrl,
                         "ctrl_dist": ctrl_dist,
                         "dataset_id": dsid,
+                        "x_counts_q": x_counts_q,  # may be None if not using posterior counts
                     }
                     yield batch # <<< Yield mini-batch here
                     # clean up mini-batch-level variables
