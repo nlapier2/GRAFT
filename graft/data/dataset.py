@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 import anndata as ad
+import scanpy as sc
 import numpy as np
 import pandas as pd
 import scvi
@@ -237,6 +238,7 @@ class GraftStreamingConfig:
     include_controls_in_query: bool = False  # usually False (query = perturbed only)
     filter_by_index: bool = True  # only process cells in index_parquet. True for training, False for prediction
     scvi_posterior_counts: bool = False  # if True, sample from scVI posterior
+    use_log1p_target: bool = False
 
 
 class GraftStreamingDataset:
@@ -486,7 +488,14 @@ class GraftStreamingDataset:
 
                 idx = np.arange(n)
                 z_chunk = qmodel.get_latent_representation(A_template, indices=idx, batch_size=self.cfg.forward_batch_size)
-                xbar_chunk = qmodel.get_normalized_expression(A_template, indices=idx, batch_size=self.cfg.forward_batch_size, n_samples=1, library_size=1e4)
+                if self.cfg.use_log1p_target:
+                    sc.pp.normalize_total(A_chunk, target_sum=1e4, key_added="ncounts")
+                    sc.pp.log1p(A_chunk)
+                    Xn = A_chunk.X.toarray() if sparse.issparse(A_chunk.X) else A_chunk.X
+                    xbar_chunk = np.asarray(Xn, dtype=np.float32, order="C")
+                else:
+                    xbar_chunk = qmodel.get_normalized_expression(A_template, indices=idx, batch_size=self.cfg.forward_batch_size, n_samples=1, library_size=1e4)
+
                 x_counts_chunk = None
                 if self.cfg.scvi_posterior_counts:
                     # scvi-tools public API

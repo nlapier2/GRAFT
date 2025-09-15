@@ -28,6 +28,7 @@ training:
   seed: 1337
   log_every: 5
   ckpt_every: 25
+  use_log1p_target: true
 
 loss:
   distribution:

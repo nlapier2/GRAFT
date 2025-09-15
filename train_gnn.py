@@ -241,6 +241,7 @@ def main():
         match_within=str(train_cfg.get("match_within", "dataset")),
         forward_batch_size=int(train_cfg.get("forward_batch_size", 4096)),
         include_controls_in_query=include_controls_in_query,
+        use_log1p_target=bool(train_cfg.get("use_log1p_target", False)),
     )
     # Pass the chooser to the dataset constructor as required by dataset.py refactoring
     ds = GraftStreamingDataset(ds_cfg, chooser)

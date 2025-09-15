@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 
 import anndata as ad
+import scanpy as sc
 import numpy as np
 import pandas as pd
 import torch
@@ -86,6 +87,7 @@ def main():
     parser.add_argument("--controls-dataset-id", required=True, help="The dataset_id from training to use for control matching.")
     parser.add_argument("--output-h5ad", required=True, help="Path to save the final predicted AnnData object.")
     parser.add_argument("--batch-size", type=int, default=512, help="Batch size for processing predictions.")
+    parser.add_argument("--skip-renoise", action="store_true", help="If set, skip the re-noising step and output normalized values.")
     args = parser.parse_args()
 
     # --- 1. Load Configs and Artifacts ---
@@ -187,7 +189,8 @@ def main():
         k_controls=train_cfg["k_controls"], oversample=train_cfg["oversample"],
         match_within=train_cfg.get("match_within", "dataset"), forward_batch_size=train_cfg["forward_batch_size"],
         include_controls_in_query=False,
-        filter_by_index=True  # Ok with temp index since we want all cells in the template
+        filter_by_index=True,  # Ok with temp index since we want all cells in the template
+        use_log1p_target=bool(train_cfg.get("use_log1p_target", False)),
     )
     dataset = GraftStreamingDataset(ds_cfg, sampler)
 
@@ -255,21 +258,25 @@ def main():
     processed_local_ids = [cid.split('::')[1] for cid in all_cell_ids]
     final_obs = original_obs.loc[processed_local_ids]
 
-    # Re-noise to get a dense matrix of canonical counts
-    final_counts_canonical = renoiser.sample_counts(
-        xbar=final_normalized_matrix,
-        dataset_ids=[args.controls_dataset_id] * len(final_obs),
-        mode="empirical",
-        chunk_size=5000
-    )
-    del final_normalized_matrix # Free memory
-    gc.collect()
+    if train_cfg.get("use_log1p_target", False):
+        final_counts_canonical = sparse.csr_matrix(final_normalized_matrix)
+    else:
+        # Re-noise to get a dense matrix of canonical counts
+        print('Re-noising to obtain counts in canonical gene space...')
+        final_counts_canonical = renoiser.sample_counts(
+            xbar=final_normalized_matrix,
+            dataset_ids=[args.controls_dataset_id] * len(final_obs),
+            mode="empirical",
+            chunk_size=5000
+        )
+        del final_normalized_matrix # Free memory
+        gc.collect()
 
     # ---- KEY CHANGE: Convert to sparse BEFORE unscrambling ----
     print("Converting to sparse format before gene unscrambling...")
     # Using int16 if counts are within range, otherwise int32
-    dtype = np.int16 if final_counts_canonical.max() < 32767 else np.int32
-    sparse_counts_canonical = sparse.csr_matrix(final_counts_canonical, dtype=dtype)
+    # dtype = np.int16 if final_counts_canonical.max() < 32767 else np.int32
+    sparse_counts_canonical = sparse.csr_matrix(final_counts_canonical) #, dtype=dtype)
     del final_counts_canonical # Free the dense canonical matrix
     gc.collect()
 
@@ -287,6 +294,10 @@ def main():
     ctrl_local_ids_in_template = [lid for lid in template_adata.obs_names.astype(str)
                                   if f"{args.controls_dataset_id}::{lid}" in ctrl_global_ids]
     ctrl_view = template_adata[ctrl_local_ids_in_template, :]
+    if train_cfg.get("use_log1p_target", False):
+        ctrl_view = ctrl_view.to_memory()
+        sc.pp.normalize_total(ctrl_view, target_sum=1e4, key_added="ncounts")
+        sc.pp.log1p(ctrl_view)
     ctrl_X = ctrl_view.X
     ctrl_counts_unscrambled = ctrl_X if sparse.issparse(ctrl_X) else sparse.csr_matrix(ctrl_X)
 
@@ -296,7 +307,7 @@ def main():
         [original_obs.loc[pert_local_ids_in_order], original_obs.loc[ctrl_local_ids_in_template]],
         axis=0
     )
-    
+
     print(f"Writing final predicted AnnData to {args.output_h5ad}...")
     output_adata = write_anndata(
         counts=final_counts_unscrambled,
