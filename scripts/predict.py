@@ -229,25 +229,14 @@ def main():
                     # 1) get the same rows as this batch
                     local_ids = [cid.split("::", 1)[1] for cid in batch["cell_ids"]]
                     sub = template_adata[local_ids, :].to_memory()
-
-                    # 2) align columns to canonical gene_list by name (missing genes -> zeros)
-                    genes_src = np.asarray(sub.var_names, dtype=str)
-                    genes_tgt = np.asarray(gene_list, dtype=str)
-
-                    # map intersection src->tgt positions
-                    pos_src = {g: i for i, g in enumerate(genes_src)}
-                    tgt_present = [j for j, g in enumerate(genes_tgt) if g in pos_src]
-                    src_present = [pos_src[genes_tgt[j]] for j in tgt_present]
-
-                    # build canonical matrix (N, G) and fill present columns
-                    N, G = sub.n_obs, genes_tgt.size
+                    # 2) align to canonical gene_list using the same projection helper as chunk_preprocess
+                    #    Build P with (src=template var_names, dst=canonical gene_list) so: Xcanon = X_sub @ P
+                    P = _build_projection(sub.var_names.astype(str), gene_list)
                     if sparse.issparse(sub.X):
-                        X_src = sub.X.tocsr()[:, src_present].toarray()
+                        Xcanon_ = sub.X.tocsr() @ P
                     else:
-                        X_src = np.asarray(sub.X[:, src_present], dtype=np.float32, order="C")
-                    Xcanon = np.zeros((N, G), dtype=np.float32)
-                    if len(tgt_present) > 0:
-                        Xcanon[:, tgt_present] = X_src.astype(np.float32, copy=False)
+                        Xcanon_ = np.asarray(sub.X, dtype=np.float32, order="C") @ P
+                    Xcanon = Xcanon_.toarray() if sparse.issparse(Xcanon_) else np.asarray(Xcanon_, dtype=np.float32, order="C")
 
                     # 3) CP10k over canonical genes, then optional log1p
                     s = Xcanon.sum(axis=1, keepdims=True)

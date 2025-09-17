@@ -69,20 +69,29 @@ def _build_projection(var_names_src: Iterable[str], gene_list_dst: Sequence[str]
     Build a sparse projection P (G_src x G_dst) so that X_aligned = X_src @ P
     reorders columns by name and pads zeros for missing genes.
     """
-    src = list(map(str, var_names_src))
-    dst = list(map(str, gene_list_dst))
-    dst_pos = {g: j for j, g in enumerate(dst)}
+    src = np.asarray(var_names_src, dtype=str)
+    dst = np.asarray(gene_list_dst, dtype=str)
+    n_src, n_dst = len(src), len(dst)
+
+    # Exact, case-sensitive map first
+    pos_exact = {g: i for i, g in enumerate(src)}
+    # Case-insensitive fallback (first occurrence wins)
+    pos_lower = {}
+    for i, g in enumerate(src):
+        gl = g.lower()
+        if gl not in pos_lower:
+            pos_lower[gl] = i
 
     rows, cols = [], []
-    for i, g in enumerate(src):
-        j = dst_pos.get(g)
-        if j is not None:
+    for j, g in enumerate(dst):
+        i = pos_exact.get(g)
+        if i is None:
+            i = pos_lower.get(g.lower())
+        if i is not None:
             rows.append(i); cols.append(j)
+
     data = np.ones(len(rows), dtype=np.float32)
-    Gs, Gd = len(src), len(dst)
-    if len(rows) == 0:
-        raise ValueError("No overlapping genes between dataset var_names and target gene_list.")
-    return sparse.csr_matrix((data, (rows, cols)), shape=(Gs, Gd))
+    return sparse.csr_matrix((data, (rows, cols)), shape=(n_src, n_dst))
 
 
 def preprocess_chunk(
