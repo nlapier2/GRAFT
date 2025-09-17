@@ -81,6 +81,8 @@ def main():
     ap.add_argument("--lambda-prior", type=float, default=1e-3)
     ap.add_argument("--lambda-W", type=float, default=1e-5)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--use_log1p_target", action="store_true",
+                    help="Train the decoder to reconstruct log1p(CP10k) instead of scVI xbar means.")
     ap.add_argument("--output-dir", default="artifacts", help="Output dir for learned W (default: artifacts/)")
     args = ap.parse_args()
 
@@ -144,6 +146,9 @@ def main():
 
             # Stream x̄ for just these rows (NumPy -> torch)
             xbar_np = scvi_stream.get_xbar(indices=idx, return_numpy=True)
+            if args.use_log1p_target:
+                # Match the rest of the pipeline: log1p(CP10k)
+                xbar_np = np.log1p(xbar_np, dtype=np.float32)
             xbar = torch.from_numpy(xbar_np).to(args.device, non_blocking=True)
 
             # (Optional) quick per-gene z-score using running stats or precomputed stats.
