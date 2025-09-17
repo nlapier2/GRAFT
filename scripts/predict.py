@@ -148,6 +148,14 @@ def main():
     original_genes = template_adata.var_names.astype(str).tolist()
     original_obs = template_adata.obs.copy()
 
+    # Compute median library size of the template in its original count space
+    # (the evaluator expects normalization to this median).
+    expr = template_adata.to_memory().X.toarray()
+    template_median_libsize = float(np.median(expr.sum(axis=1)))
+    del expr
+    gc.collect()
+    print(f"template median library size: {template_median_libsize:.2f}")
+
     # CORRECTED LOGIC: Create a temporary YAML where the user-provided dataset_id
     # points to the template H5AD file.
     temp_index_file = None
@@ -344,6 +352,21 @@ def main():
         [original_obs.loc[pert_local_ids_in_order], original_obs.loc[ctrl_local_ids_in_template]],
         axis=0
     )
+
+    # If we operated in log1p(CP10k) space, rescale to the evaluator's median-libsize convention:
+    # X_log1p_CP10k  ->  expm1, scale by (median/1e4), then log1p again.
+    if train_cfg.get("use_log1p_target", False):
+        scale = template_median_libsize / 1e4
+        if scale != 1.0:
+            # Ensure CSR for in-place, elementwise transform on .data
+            final_counts_unscrambled = final_counts_unscrambled.tocsr(copy=False)
+            data = final_counts_unscrambled.data
+            # log1p(expm1(x) * scale) applied elementwise
+            np.expm1(data, out=data)
+            data *= scale
+            np.log1p(data, out=data)
+            final_counts_unscrambled.data = data.astype(np.float32, copy=False)
+        print(f"rescaled log1p matrix to median libsize ({template_median_libsize:.2f}); scale={scale:.6f}")
 
     print(f"Writing final predicted AnnData to {args.output_h5ad}...")
     output_adata = write_anndata(
