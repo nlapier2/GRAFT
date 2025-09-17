@@ -537,6 +537,9 @@ class GraftStreamingDataset:
                 t6 = time.time()
                 clipped_indices = ctrl_idx_chunk.clip(min=0)
                 xbar_ctrl_chunk = self.ann.xbar_ctrl[clipped_indices]
+                if self.cfg.use_log1p_target:
+                    # If using log1p target, ensure xbar_ctrl_chunk is also log1p transformed
+                    xbar_ctrl_chunk = np.log1p(xbar_ctrl_chunk)
                 invalid_mask = ctrl_idx_chunk < 0 
                 xbar_ctrl_chunk[invalid_mask] = 0.0
                 t7 = time.time()

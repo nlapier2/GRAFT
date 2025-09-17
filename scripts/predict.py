@@ -213,7 +213,14 @@ def main():
                 z_idx = rng.integers(0, Z_ctrl.shape[0], size=n, endpoint=False)
                 x_idx = rng.integers(0, XBAR_ctrl.shape[0], size=(n, k_controls), endpoint=False)
                 batch["z_ctrl"] = Z_ctrl[z_idx].astype(np.float32, copy=False)           # (N, z_dim)
-                batch["xbar_ctrl"] = XBAR_ctrl[x_idx].astype(np.float32, copy=False)     # (N, k_controls, G)
+                xbar_temp = XBAR_ctrl[x_idx].astype(np.float32, copy=False)                  # (N, k, G)
+                if train_cfg.get("use_log1p_target", False):
+                    # enforce CP10k per control, then log1p — keep (N, k, G); mean happens in make_prediction()
+                    s = xbar_temp.sum(axis=2, keepdims=True)                                 # (N, k, 1)
+                    np.maximum(s, 1e-12, out=s)
+                    xbar_temp = np.log1p(xbar_temp * (1e4 / s)).astype(np.float32, copy=False)
+
+                batch["xbar_ctrl"] = xbar_temp     
 
             except StopIteration:
                 break

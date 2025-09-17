@@ -144,11 +144,28 @@ def compute_losses(dist_fn, y_pred, y_true, dx_dir, U_t, tb, w_dist, w_rex, w_co
     per_env_losses = []
     unique_envs_in_batch = torch.unique(tb["env_code"])
     for env_code in unique_envs_in_batch:
-        mask = (tb["env_code"] == env_code)
-        if mask.sum() > 0:
-            loss = dist_fn(y_pred[mask], y_true[mask])
-            per_env_losses.append(loss)
-            
+        mask_env = (tb["env_code"] == env_code)
+        if mask_env.sum() == 0:
+            continue
+
+        # --- perturbation-stratified distribution loss within this env ---
+        pert_losses = []
+        for pid in torch.unique(tb["target_idx"][mask_env]):
+            mask = mask_env & (tb["target_idx"] == pid)
+            # Some distribution metrics need >1 sample; if too small, skip this group
+            if mask.sum().item() < 2:
+                continue
+            pert_losses.append(dist_fn(y_pred[mask], y_true[mask]))
+
+        if len(pert_losses) > 0:
+            # Average per-pert losses to get the env-level distribution loss
+            env_loss = torch.stack(pert_losses).mean()
+        else:
+            # Fallback: if no valid per-pert groups (e.g., all singletons), use the env-level loss
+            env_loss = dist_fn(y_pred[mask_env], y_true[mask_env])
+
+        per_env_losses.append(env_loss)
+
     loss_dist = w_dist * (torch.stack(per_env_losses).mean() if per_env_losses else torch.tensor(0.0, device=device))
     loss_rex  = w_rex  * (risk_extrapolation(per_env_losses) if len(per_env_losses) > 1 else torch.tensor(0.0, device=device))
     loss_cons = w_cons * target_knockdown_consistency(y_pred, y_true, tb["target_idx"], mode="mse")
@@ -156,6 +173,7 @@ def compute_losses(dist_fn, y_pred, y_true, dx_dir, U_t, tb, w_dist, w_rex, w_co
     loss_orth = torch.tensor(0.0, device=device)
     if w_orth > 0.0:
         loss_orth = w_orth * ((dx_dir @ U_t) ** 2).mean()
+
     total_loss = loss_dist + loss_rex + loss_cons + loss_l1 + loss_orth
     return total_loss, loss_dist, loss_rex, loss_cons, loss_l1, loss_orth
 
