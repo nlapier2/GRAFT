@@ -16,6 +16,7 @@ Workflow:
 7.  Saves the final AnnData object.
 """
 import argparse
+from html import parser
 import os
 import sys
 from pathlib import Path
@@ -87,7 +88,8 @@ def main():
     parser.add_argument("--controls-dataset-id", required=True, help="The dataset_id from training to use for control matching.")
     parser.add_argument("--output-h5ad", required=True, help="Path to save the final predicted AnnData object.")
     parser.add_argument("--batch-size", type=int, default=512, help="Batch size for processing predictions.")
-    parser.add_argument("--skip-renoise", action="store_true", help="If set, skip the re-noising step and output normalized values.")
+    parser.add_argument("--use-template-perturbed", action="store_true",
+                    help="Bypass the model: copy perturbed rows from the template (CP10k, and log1p if use_log1p_target).")
     args = parser.parse_args()
 
     # --- 1. Load Configs and Artifacts ---
@@ -221,6 +223,45 @@ def main():
                     xbar_temp = np.log1p(xbar_temp * (1e4 / s)).astype(np.float32, copy=False)
 
                 batch["xbar_ctrl"] = xbar_temp     
+
+                # ---- In-place shortcut: copy true perturbed data from template instead of predicting ----
+                if args.use_template_perturbed:
+                    # 1) get the same rows as this batch
+                    local_ids = [cid.split("::", 1)[1] for cid in batch["cell_ids"]]
+                    sub = template_adata[local_ids, :].to_memory()
+
+                    # 2) align columns to canonical gene_list by name (missing genes -> zeros)
+                    genes_src = np.asarray(sub.var_names, dtype=str)
+                    genes_tgt = np.asarray(gene_list, dtype=str)
+
+                    # map intersection src->tgt positions
+                    pos_src = {g: i for i, g in enumerate(genes_src)}
+                    tgt_present = [j for j, g in enumerate(genes_tgt) if g in pos_src]
+                    src_present = [pos_src[genes_tgt[j]] for j in tgt_present]
+
+                    # build canonical matrix (N, G) and fill present columns
+                    N, G = sub.n_obs, genes_tgt.size
+                    if sparse.issparse(sub.X):
+                        X_src = sub.X.tocsr()[:, src_present].toarray()
+                    else:
+                        X_src = np.asarray(sub.X[:, src_present], dtype=np.float32, order="C")
+                    Xcanon = np.zeros((N, G), dtype=np.float32)
+                    if len(tgt_present) > 0:
+                        Xcanon[:, tgt_present] = X_src.astype(np.float32, copy=False)
+
+                    # 3) CP10k over canonical genes, then optional log1p
+                    s = Xcanon.sum(axis=1, keepdims=True)
+                    np.maximum(s, 1e-12, out=s)
+                    Xcanon = Xcanon * (1e4 / s)
+                    if train_cfg.get("use_log1p_target", False):
+                        Xcanon = np.log1p(Xcanon, dtype=np.float32)
+
+                    # 4) append in-place like a normal prediction batch
+                    all_preds_normalized.append(Xcanon)
+                    all_cell_ids.extend(batch["cell_ids"])
+                    pbar.update(len(batch["cell_ids"]))
+                    continue
+
 
             except StopIteration:
                 break
