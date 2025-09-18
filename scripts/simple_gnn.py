@@ -72,6 +72,19 @@ def make_base_adjacency(G: int, self_loops: bool = True) -> torch.Tensor:
     A = A / (A.sum(dim=1, keepdim=True) + 1e-8)
     return A
 
+# Add near your utilities
+def collapse_to_pseudobulk(adata, target_label: str):
+    """Return a new AnnData with one row per label (perturbation + control)."""
+    import pandas as pd
+    X = to_numpy(adata.X).astype(np.float32)
+    labels = adata.obs[target_label].astype(str).values
+    df = pd.DataFrame(X, columns=adata.var_names).groupby(labels).mean()
+    from anndata import AnnData
+    ad_bulk = AnnData(df.values.astype(np.float32))
+    ad_bulk.var_names = adata.var_names.copy()
+    ad_bulk.obs[target_label] = df.index.astype(str)
+    return ad_bulk
+
 # ----------------------------
 # Model: Step0 + MPNN + Readout
 # ----------------------------
@@ -303,7 +316,7 @@ def train(
 
             yhat, x0 = model(bx_ctrl, tidx, A_base)
 
-            loss_mse = mse_loss(yhat, bx_pert)
+            loss_mse = mse_loss(yhat - x0, bx_pert - x0)
             loss_t = target_consistency_loss(yhat, bx_ctrl, tidx, mode="knockdown", margin=0.0)
             loss_loc = locality_damping(yhat, x0, tidx, weight=1.0) if weight_local > 0 else yhat.new_tensor(0.0)
 
@@ -558,10 +571,14 @@ def main():
     ap.add_argument("--weight_local", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tau", type=float, default=0.0, help="Step-0 anchor (e.g., 0.0 for CRISPRi).")
+    ap.add_argument("--use_pseudobulk", action="store_true",
+                    help="Collapse to one mean row per perturbation (incl. control).")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 
     adata = ad.read_h5ad(args.in_h5ad)
+    if args.use_pseudobulk:
+        adata = collapse_to_pseudobulk(adata, args.target_label)
     sc.pp.normalize_total(adata, inplace=True)
     sc.pp.log1p(adata)
     if sparse.isspmatrix(adata.X) and not sparse.isspmatrix_csr(adata.X):
