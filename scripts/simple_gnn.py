@@ -182,8 +182,12 @@ class Step0Clamp(nn.Module):
             bmask = (target_idx >= 0)
             rows = torch.arange(B, device=x_ctrl.device)[bmask]
             cols = target_idx[bmask]
-            # x_t := (1 - alpha) * x_ctrl_t + alpha * tau
-            x0[rows, cols] = (1.0 - alpha[bmask]) * x_ctrl[rows, cols] + alpha[bmask] * self.tau
+            # multiplicative knockdown on counts: x0_t = log1p( m * (exp(x_ctrl_t)-1) )
+            # where m = (1 - alpha) ∈ (0,1). With tau≈0 counts, this is the correct semantics.
+            ctrl_lin = torch.expm1(x_ctrl[rows, cols].clamp_min(0.0))
+            m = (1.0 - alpha).expand_as(rows.float()) if alpha.dim() == 0 else (1.0 - alpha[bmask])
+            x0_lin = m * ctrl_lin                       # tau=0 → just multiply counts
+            x0[rows, cols] = torch.log1p(x0_lin)
         return x0
 
 class PrototypeGenerator(nn.Module):
@@ -318,6 +322,12 @@ class GeneMPNN(nn.Module):
         y = self.readout(h).squeeze(-1)  # (B,G)
         # add gene-conditioned prototype mean-effect
         y = y + b_proto
+        # Preserve Step-0 at the target: y_t := x0_t
+        freeze_mask = (target_idx >= 0)
+        if freeze_mask.any():
+            rows = torch.arange(B, device=device)[freeze_mask]
+            cols = target_idx[freeze_mask]
+            y[rows, cols] = x0[rows, cols]
         return y, x0  # return x0 for optional locality loss
 
 # ----------------------------
