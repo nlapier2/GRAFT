@@ -262,8 +262,12 @@ class GeneMPNN(nn.Module):
         self.G = G
         self.hidden = hidden
         self.T = T
-        # per-node input is scalar (expression); use a shared linear to lift to hidden
-        self.embed = nn.Linear(1, hidden)
+        # per-gene node embeddings (used by all nodes, every batch)
+        self.node_dim = 32
+        self.node_E = nn.Embedding(G, self.node_dim)
+        nn.init.normal_(self.node_E.weight, std=0.02)
+        # input becomes [log1p expression, node embedding] per gene
+        self.embed = nn.Linear(1 + self.node_dim, hidden)
         self.layers = nn.ModuleList([MPNNLayer(hidden) for _ in range(T)])
         self.readout = nn.Linear(hidden, 1)
         # gene-conditioned prototype & alpha; FiLM from gene embedding
@@ -284,11 +288,17 @@ class GeneMPNN(nn.Module):
 
         # Gene-conditioned prototype & efficacy
         b_proto, alpha_t, e_t = self.proto(target_idx, meta=None)   # (B,G), (B,), (B,64)
+        if hasattr(self, "alpha_mean_train"):
+            alpha_t = 0.2 * alpha_t + 0.8 * self.alpha_mean_train  # shrink toward train mean for stability
         # Step-0 clamp in expression space using alpha_t
         x0 = self.step0(x_ctrl, target_idx, pert_rowidx=None, alpha_override=alpha_t)  # (B,G)
 
         # Initial hidden state (shared 1->hidden linear applied per gene)
-        h = self.embed(x0.unsqueeze(-1))  # (B,G,hidden)
+        # assemble per-node embeddings for all genes
+        idx_all = torch.arange(G, device=device)
+        node_feats = self.node_E(idx_all).unsqueeze(0).expand(B, G, -1)  # (B,G,node_dim)
+        x_in = torch.cat([x0.unsqueeze(-1), node_feats], dim=-1)         # (B,G,1+node_dim)
+        h = self.embed(x_in)
         # FiLM condition on target gene embedding (broadcast across genes)
         gamma = torch.tanh(self.film_gamma(e_t)).unsqueeze(1)  # (B,1,H)
         beta  = self.film_beta(e_t).unsqueeze(1)               # (B,1,H)
@@ -531,6 +541,26 @@ def train(
                 f"loc={running['loc']/denom:.5f}  "
                 f"proto={running['proto']/denom:.5f}  "
                 f"total={running['tot']/denom:.5f}")
+
+    # estimate mean alpha on training targets (linear KD from pseudobulk)
+    with torch.no_grad():
+        # quick calc using control pseudobulk + training perts
+        X = to_numpy(adata.X).astype(np.float32)
+        labels = adata.obs[target_label].astype(str).values
+        ctrl_mean = X[labels == control_label].mean(axis=0)
+        t2gi = build_target_to_gene_index(adata, target_label)
+        train_perts = sorted({l for l in labels if l != control_label})
+        alphas = []
+        for p in train_perts:
+            idx = np.where(labels == p)[0]
+            if len(idx)==0: continue
+            t = t2gi.get(p, -1)
+            if t < 0: continue
+            true_t = np.expm1(X[idx, t]).mean()
+            ctrl_t = np.expm1(ctrl_mean[t])
+            a = np.clip(1.0 - true_t/(ctrl_t + 1e-8), 0.0, 1.0)
+            alphas.append(a)
+        model.register_buffer("alpha_mean_train", torch.tensor(float(np.mean(alphas) if alphas else 0.8)))
 
     return model
 
