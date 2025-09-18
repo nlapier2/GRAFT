@@ -664,6 +664,7 @@ def evaluate_model(
     pred_bulk = {}
     true_bulk = {}
     mae_per_pert = {}
+    bulk_mae_per_pert = {}
 
     # map pert_names (length Np) to row indices for quick grouping
     from collections import defaultdict
@@ -677,7 +678,10 @@ def evaluate_model(
         ytrue_p = true_mat[rows] # (n_p, G)
         pred_bulk[p] = yhat_p.mean(axis=0)
         true_bulk[p] = ytrue_p.mean(axis=0)
+        # per-cell MAE (cells+genes)
         mae_per_pert[p] = np.mean(np.abs(yhat_p - ytrue_p))
+        # pseudobulk MAE (genes only)
+        bulk_mae_per_pert[p] = float(np.mean(np.abs(pred_bulk[p] - true_bulk[p])))
 
     # knockdown efficiency at target gene (abs & %), true vs predicted
     # uses GLOBAL control pseudobulk as the "control" reference
@@ -724,42 +728,43 @@ def evaluate_model(
     min_corr = float(corr_mat[iu].min()) if iu[0].size > 0 else np.nan
 
     # PDS (Perturbation Discrimination Score)
-    # Distance between predicted pseudobulk for p and true pseudobulks for t
-    # Exclude the target gene of *each* perturbation in the distance (both p's and t's, if present).
-    # Rank of true t==p among all t (ascending distance). PDS_p = 1 - (rank-1)/(K-1).
-    # Overall PDS = mean over p.
-    # Build target indexes per perturbation (or -1 if N/A)
+    # - use absolute deltas vs control
+    # - exclude only the TRUE target gene for expression data, by name
+    # - zero-based rank normalized by N (not N-1): PDS_p = 1 - rank/N
+    # absolute deltas vs global control mean
+    true_bulk_mat = np.stack([np.abs(true_bulk[p] - ctrl_mean) for p in perts], axis=0)  # (K,G)
+    pred_bulk_mat = np.stack([np.abs(pred_bulk[p] - ctrl_mean) for p in perts], axis=0)  # (K,G)
     t_idx_per_pert = {p: t2gi.get(p, -1) for p in perts}
-    true_bulk_mat = np.stack([true_bulk[p] for p in perts], axis=0)  # (K,G)
-    pred_bulk_mat = np.stack([pred_bulk[p] for p in perts], axis=0)  # (K,G)
 
     # precompute masks per pair to exclude targets
+    from sklearn.metrics import pairwise_distances
+    Kp = len(perts)
     PDS_scores = []
     for i, p in enumerate(perts):
-        # distances to every t
-        dists = []
-        for j, tname in enumerate(perts):
-            mask = np.ones(G, dtype=bool)
-            # ti = t_idx_per_pert[p]
-            tj = t_idx_per_pert[tname]
-            # if ti >= 0: mask[ti] = False
-            if tj >= 0: mask[tj] = False
-            # L1 distance over masked genes
-            d = np.abs(pred_bulk_mat[i, mask] - true_bulk_mat[j, mask]).sum()
-            dists.append(d)
-        dists = np.asarray(dists)
-        # rank of the true target (j==i) in ascending distances
-        order = np.argsort(dists)
-        rank = int(np.where(order == i)[0][0]) + 1  # 1-based
-        Kp = len(perts)
-        PDS_p = 1.0 if Kp == 1 else (1.0 - (rank - 1) / (Kp - 1))
-        PDS_scores.append(PDS_p)
+        # build include mask: exclude target gene IF its name equals the perturbation label
+        mask = np.ones(G, dtype=bool)
+        tj = t_idx_per_pert[p]
+        if tj >= 0:
+            mask[tj] = False
+        # distances from ALL real effects to this predicted effect
+        dists = pairwise_distances(
+            true_bulk_mat[:, mask],    # (K, G')
+            pred_bulk_mat[i, mask][None, :],  # (1, G')
+            metric="manhattan",
+        ).ravel()
+        order = np.argsort(dists)          # ascending
+        # rank of the correct perturbation (zero-based)
+        p_index = i  # same ordering
+        rank0 = int(np.flatnonzero(order == p_index)[0])
+        # normalize by K (not K-1), then invert
+        PDS_scores.append(1.0 - rank0 / Kp)
 
     PDS_mean = float(np.mean(PDS_scores)) if len(PDS_scores) > 0 else np.nan
 
     # ---- Print concise report ----
     print("\n=== Evaluation ===")
-    print(f"Per-perturbation MAE (mean ± sd): {np.mean(list(mae_per_pert.values())):.5f} ± {np.std(list(mae_per_pert.values())):.5f}")
+    # print(f"Per-cell MAE (mean ± sd over perts): {np.mean(list(mae_per_pert.values())):.5f} ± {np.std(list(mae_per_pert.values())):.5f}")
+    print(f"Pseudobulk MAE (mean over perts):   {np.mean(list(bulk_mae_per_pert.values())):.5f}")
     print(f"Perturbation similarity (pred mean effects): mean corr={mean_corr:.4f}, min corr={min_corr:.4f}")
     print(f"PDS (mean over perts): {PDS_mean:.4f}")
     print("\nKnockdown efficiency per perturbation (target gene, true_abs, true_pct, pred_abs, pred_pct):")
@@ -772,6 +777,7 @@ def evaluate_model(
 
     return {
         "mae_per_pert": mae_per_pert,
+        "bulk_mae_per_pert": bulk_mae_per_pert,
         "kd_eff": kd_eff,
         "mean_corr_pred_effects": mean_corr,
         "min_corr_pred_effects": min_corr,
