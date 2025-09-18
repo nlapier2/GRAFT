@@ -328,6 +328,219 @@ def train(
 
     return model
 
+
+import itertools
+
+@torch.no_grad()
+def predict_all_perturbations(
+    adata: ad.AnnData,
+    model: nn.Module,
+    target_label: str,
+    control_label: str,
+    device: str = "cuda",
+    batch_size: int = 256,
+    seed: int = 0,
+):
+    """
+    For every perturbed cell, match a random control, run model, and collect predictions.
+    Returns:
+      pred_mat: (N_pert, G) predicted expressions (aligned to perturbed rows)
+      true_mat: (N_pert, G) true perturbed expressions
+      pert_names: list[str] of length N_pert (labels for each row)
+      ctrl_mean: (G,) global control pseudobulk (mean of all control cells)
+    """
+    rng = np.random.default_rng(seed)
+    X = to_numpy(adata.X).astype(np.float32)
+    labels = adata.obs[target_label].astype(str).values
+    G = adata.n_vars
+
+    # pools
+    ctrl_idx = np.where(labels == control_label)[0]
+    pert_idx = np.where(labels != control_label)[0]
+    if len(ctrl_idx) == 0 or len(pert_idx) == 0:
+        raise ValueError("Need both control and perturbed cells for evaluation.")
+
+    # control pseudobulk (global)
+    ctrl_mean = X[ctrl_idx].mean(axis=0)
+
+    # target mapping (label -> gene index), -1 if not a gene in panel
+    t2gi = build_target_to_gene_index(adata, target_label)
+
+    # adjacency
+    A_base = make_base_adjacency(G, self_loops=True).to(device)
+
+    # allocate
+    Np = len(pert_idx)
+    pred_mat = np.zeros((Np, G), dtype=np.float32)
+    true_mat = X[pert_idx]  # (Np,G)
+    pert_names = labels[pert_idx].tolist()
+
+    # batched forward with random control matches
+    model.eval()
+    for start in range(0, Np, batch_size):
+        end = min(start + batch_size, Np)
+        b_idx = np.arange(start, end)
+        # random controls (with replacement)
+        rand_ctrl = rng.choice(ctrl_idx, size=len(b_idx), replace=True)
+
+        bx_ctrl = torch.from_numpy(X[rand_ctrl]).float().to(device)
+        tidx = torch.tensor([t2gi.get(p, -1) for p in pert_names[start:end]], dtype=torch.long, device=device)
+
+        yhat, _ = model(bx_ctrl, tidx, A_base)
+        pred_mat[b_idx] = yhat.detach().cpu().numpy()
+
+    return pred_mat, true_mat, pert_names, ctrl_mean
+
+
+def evaluate_model(
+    adata: ad.AnnData,
+    model: nn.Module,
+    target_label: str,
+    control_label: str,
+    device: str = "cuda",
+    batch_size: int = 256,
+    seed: int = 0,
+):
+    """
+    Computes:
+      - per-perturbation MAE
+      - knockdown efficiency (abs & %) for true vs predicted at the target gene
+      - perturbation similarity: mean & min pairwise Pearson corr between predicted mean effect vectors
+      - PDS (Perturbation Discrimination Score): mean over perturbations
+    Prints a concise report and returns a dict with all metrics.
+    """
+    pred_mat, true_mat, pert_names, ctrl_mean = predict_all_perturbations(
+        adata, model, target_label, control_label, device=device, batch_size=batch_size, seed=seed
+    )
+    G = adata.n_vars
+    df_obs = adata.obs
+    labels = df_obs[target_label].astype(str).values
+
+    # group indices by perturbation (excluding control)
+    perts = sorted(set(pert_names))
+    # target mapping
+    t2gi = build_target_to_gene_index(adata, target_label)
+
+    # per-pert pseudobulks (pred & true) and MAE
+    pred_bulk = {}
+    true_bulk = {}
+    mae_per_pert = {}
+
+    # map pert_names (length Np) to row indices for quick grouping
+    from collections import defaultdict
+    rows_by_pert = defaultdict(list)
+    for i, p in enumerate(pert_names):
+        rows_by_pert[p].append(i)
+
+    for p in perts:
+        rows = rows_by_pert[p]
+        yhat_p = pred_mat[rows]  # (n_p, G)
+        ytrue_p = true_mat[rows] # (n_p, G)
+        pred_bulk[p] = yhat_p.mean(axis=0)
+        true_bulk[p] = ytrue_p.mean(axis=0)
+        mae_per_pert[p] = np.mean(np.abs(yhat_p - ytrue_p))
+
+    # knockdown efficiency at target gene (abs & %), true vs predicted
+    # uses GLOBAL control pseudobulk as the "control" reference
+    eps = 1e-8
+    kd_eff = {}  # p -> dict
+    for p in perts:
+        t = t2gi.get(p, -1)
+        if t < 0:
+            kd_eff[p] = {"target_gene": None,
+                         "true_abs": np.nan, "true_pct": np.nan,
+                         "pred_abs": np.nan, "pred_pct": np.nan}
+            continue
+        ctrl_t = float(ctrl_mean[t])
+        true_t = float(true_bulk[p][t])
+        pred_t = float(pred_bulk[p][t])
+
+        # absolute "knockdown" (positive if below control)
+        true_abs = ctrl_t - true_t
+        pred_abs = ctrl_t - pred_t
+        # percentage relative to control level
+        true_pct = true_abs / (ctrl_t + eps)
+        pred_pct = pred_abs / (ctrl_t + eps)
+
+        kd_eff[p] = {"target_gene": adata.var_names[t],
+                     "true_abs": true_abs, "true_pct": true_pct,
+                     "pred_abs": pred_abs, "pred_pct": pred_pct}
+
+    # perturbation similarity (correlations between predicted mean effect vectors)
+    # use predicted (pred_bulk[p] - ctrl_mean) as effect vector
+    effect_vecs = []
+    for p in perts:
+        effect_vecs.append(pred_bulk[p] - ctrl_mean)
+    effect_mat = np.stack(effect_vecs, axis=0)  # (K,G)
+    # pairwise Pearson correlation matrix
+    K = effect_mat.shape[0]
+    # normalize
+    em = effect_mat - effect_mat.mean(axis=1, keepdims=True)
+    denom = np.sqrt((em ** 2).sum(axis=1, keepdims=True)) + 1e-8
+    emn = em / denom
+    corr_mat = emn @ emn.T  # (K,K)
+    # take upper triangle excluding diagonal
+    iu = np.triu_indices(K, k=1)
+    mean_corr = float(corr_mat[iu].mean()) if iu[0].size > 0 else np.nan
+    min_corr = float(corr_mat[iu].min()) if iu[0].size > 0 else np.nan
+
+    # PDS (Perturbation Discrimination Score)
+    # Distance between predicted pseudobulk for p and true pseudobulks for t
+    # Exclude the target gene of *each* perturbation in the distance (both p's and t's, if present).
+    # Rank of true t==p among all t (ascending distance). PDS_p = 1 - (rank-1)/(K-1).
+    # Overall PDS = mean over p.
+    # Build target indexes per perturbation (or -1 if N/A)
+    t_idx_per_pert = {p: t2gi.get(p, -1) for p in perts}
+    true_bulk_mat = np.stack([true_bulk[p] for p in perts], axis=0)  # (K,G)
+    pred_bulk_mat = np.stack([pred_bulk[p] for p in perts], axis=0)  # (K,G)
+
+    # precompute masks per pair to exclude targets
+    PDS_scores = []
+    for i, p in enumerate(perts):
+        # distances to every t
+        dists = []
+        for j, tname in enumerate(perts):
+            mask = np.ones(G, dtype=bool)
+            ti = t_idx_per_pert[p]
+            tj = t_idx_per_pert[tname]
+            if ti >= 0: mask[ti] = False
+            if tj >= 0: mask[tj] = False
+            # L1 distance over masked genes
+            d = np.abs(pred_bulk_mat[i, mask] - true_bulk_mat[j, mask]).sum()
+            dists.append(d)
+        dists = np.asarray(dists)
+        # rank of the true target (j==i) in ascending distances
+        order = np.argsort(dists)
+        rank = int(np.where(order == i)[0][0]) + 1  # 1-based
+        Kp = len(perts)
+        PDS_p = 1.0 if Kp == 1 else (1.0 - (rank - 1) / (Kp - 1))
+        PDS_scores.append(PDS_p)
+
+    PDS_mean = float(np.mean(PDS_scores)) if len(PDS_scores) > 0 else np.nan
+
+    # ---- Print concise report ----
+    print("\n=== Evaluation ===")
+    print(f"Per-perturbation MAE (mean ± sd): {np.mean(list(mae_per_pert.values())):.5f} ± {np.std(list(mae_per_pert.values())):.5f}")
+    print(f"Perturbation similarity (pred mean effects): mean corr={mean_corr:.4f}, min corr={min_corr:.4f}")
+    print(f"PDS (mean over perts): {PDS_mean:.4f}")
+    print("\nKnockdown efficiency per perturbation (target gene, true_abs, true_pct, pred_abs, pred_pct):")
+    # show a few lines sorted by true_abs descending
+    preview = sorted(kd_eff.items(), key=lambda kv: (np.nan_to_num(kv[1]['true_abs'], nan=-1e9)), reverse=True)
+    for p, d in preview[: min(10, len(preview))]:
+        tg = d['target_gene'] or "N/A"
+        print(f"  {p:20s}  tg={tg:12s}  true_abs={d['true_abs']:.4f}  true_pct={d['true_pct']:.2%}  "
+              f"pred_abs={d['pred_abs']:.4f}  pred_pct={d['pred_pct']:.2%}")
+
+    return {
+        "mae_per_pert": mae_per_pert,
+        "kd_eff": kd_eff,
+        "mean_corr_pred_effects": mean_corr,
+        "min_corr_pred_effects": min_corr,
+        "PDS_mean": PDS_mean,
+        "PDS_scores": dict(zip(perts, PDS_scores)),
+    }
+
+
 # ----------------------------
 # CLI
 # ----------------------------
@@ -368,6 +581,17 @@ def main():
         seed=args.seed,
         tau=args.tau,
         device=args.device,
+    )
+
+    # Evaluate on the same panel (training fit quality)
+    _ = evaluate_model(
+        adata=adata,
+        model=model,
+        target_label=args.target_label,
+        control_label=args.control_label,
+        device=args.device,
+        batch_size=512,
+        seed=args.seed,
     )
 
     # Optional: save weights
