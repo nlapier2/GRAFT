@@ -93,26 +93,34 @@ class Step0Clamp(nn.Module):
     Simple Step-0: clamp the target node toward an anchor 'tau' with learnable efficacy alpha in (0,1).
     For CRISPRi-like behavior, tau=0.0 (in normalized space).
     """
-    def __init__(self, tau: float = 0.0):
+    def __init__(self, tau: float = 0.0, num_perts: int = None):
         super().__init__()
-        # single learnable alpha (could be made per-target or small MLP if desired)
-        self.logit_alpha = nn.Parameter(torch.tensor(0.0))  # sigmoid -> ~0.5 initially
+        # global alpha by default; if num_perts is given, use per-pert embedding for alpha
+        if num_perts is not None:
+            self.alpha_table = nn.Embedding(num_perts, 1)
+            nn.init.zeros_(self.alpha_table.weight)  # sigmoid(0)=0.5
+        else:
+            self.alpha_table = None
+            self.logit_alpha = nn.Parameter(torch.tensor(0.0))  # sigmoid -> ~0.5 initially
         self.register_buffer("tau", torch.tensor(float(tau)))
 
-    def forward(self, x_ctrl: torch.Tensor, target_idx: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_ctrl: torch.Tensor, target_idx: torch.Tensor, pert_rowidx: torch.Tensor = None) -> torch.Tensor:
         """
         x_ctrl: (B,G)
         target_idx: (B,) int tensor with -1 when unknown (i.e., target label not a gene)
         """
         B, G = x_ctrl.shape
         x0 = x_ctrl.clone()
-        alpha = torch.sigmoid(self.logit_alpha)  # (scalar)
+        if self.alpha_table is not None and pert_rowidx is not None:
+            alpha = torch.sigmoid(self.alpha_table(pert_rowidx)).view(-1)  # (B,)
+        else:
+            alpha = torch.sigmoid(self.logit_alpha).expand(B)  # (B,)
         if (target_idx >= 0).any():
             bmask = (target_idx >= 0)
             rows = torch.arange(B, device=x_ctrl.device)[bmask]
             cols = target_idx[bmask]
             # x_t := (1 - alpha) * x_ctrl_t + alpha * tau
-            x0[rows, cols] = (1.0 - alpha) * x_ctrl[rows, cols] + alpha * self.tau
+            x0[rows, cols] = (1.0 - alpha[bmask]) * x_ctrl[rows, cols] + alpha[bmask] * self.tau
         return x0
 
 class MPNNLayer(nn.Module):
@@ -146,7 +154,7 @@ class MPNNLayer(nn.Module):
         return h_out
 
 class GeneMPNN(nn.Module):
-    def __init__(self, G: int, hidden: int = 128, T: int = 2, tau: float = 0.0):
+    def __init__(self, G: int, hidden: int = 128, T: int = 2, tau: float = 0.0, num_perts: int = None):
         super().__init__()
         self.G = G
         self.hidden = hidden
@@ -155,9 +163,13 @@ class GeneMPNN(nn.Module):
         self.embed = nn.Linear(1, hidden)
         self.layers = nn.ModuleList([MPNNLayer(hidden) for _ in range(T)])
         self.readout = nn.Linear(hidden, 1)
-        self.step0 = Step0Clamp(tau=tau)
+        # simple perturbation embedding for FiLM + per-pert alpha in Step-0
+        self.pert_emb = nn.Embedding(num_perts, hidden) if num_perts is not None else None
+        self.film_gamma = nn.Linear(hidden, hidden) if self.pert_emb is not None else None
+        self.film_beta  = nn.Linear(hidden, hidden) if self.pert_emb is not None else None
+        self.step0 = Step0Clamp(tau=tau, num_perts=num_perts)
 
-    def forward(self, x_ctrl: torch.Tensor, target_idx: torch.Tensor, A_base: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_ctrl: torch.Tensor, target_idx: torch.Tensor, A_base: torch.Tensor, pert_rowidx: torch.Tensor = None) -> torch.Tensor:
         """
         x_ctrl: (B,G)
         target_idx: (B,) int tensor with -1 where unknown
@@ -167,11 +179,17 @@ class GeneMPNN(nn.Module):
         B, G = x_ctrl.shape
         assert G == self.G
 
-        # Step-0 clamp in expression space
-        x0 = self.step0(x_ctrl, target_idx)  # (B,G)
+        # Step-0 clamp in expression space (per-pert alpha if available)
+        x0 = self.step0(x_ctrl, target_idx, pert_rowidx=pert_rowidx)  # (B,G)
 
         # Initial hidden state (shared 1->hidden linear applied per gene)
         h = self.embed(x0.unsqueeze(-1))  # (B,G,hidden)
+        # FiLM condition on perturbation embedding (broadcast across genes)
+        if self.pert_emb is not None and pert_rowidx is not None:
+            e = self.pert_emb(pert_rowidx)                 # (B,hidden)
+            gamma = torch.tanh(self.film_gamma(e)).unsqueeze(1)  # (B,1,hidden)
+            beta  = self.film_beta(e).unsqueeze(1)               # (B,1,hidden)
+            h = h * (1 + gamma) + beta
 
         # Prepare per-sample adjacency (block inbound to target)
         # Start from base A, then zero the row 't' per sample.
@@ -290,7 +308,13 @@ def train(
         tgt_idx[i] = t2gi.get(lab, -1)
 
     # Model
-    model = GeneMPNN(G=G, hidden=hidden, T=T, tau=tau).to(device)
+    # Build stable mapping from label -> embedding row
+    pert_names_unique = sorted(set(labels.tolist()))
+    pert2row = {p: i for i, p in enumerate(pert_names_unique)}
+    num_perts = len(pert_names_unique)
+
+    # Model
+    model = GeneMPNN(G=G, hidden=hidden, T=T, tau=tau, num_perts=num_perts).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
     # Base adjacency (fully connected, row-normalized)
@@ -314,7 +338,9 @@ def train(
             bx_pert = bx_pert.to(device)
             tidx = tidx.to(device)
 
-            yhat, x0 = model(bx_ctrl, tidx, A_base)
+            # per-sample perturbation row indices for embedding / FiLM
+            pert_rowidx = torch.tensor([pert2row[t] for t in btargets], dtype=torch.long, device=device)
+            yhat, x0 = model(bx_ctrl, tidx, A_base, pert_rowidx=pert_rowidx)
 
             loss_mse = mse_loss(yhat - x0, bx_pert - x0)
             loss_t = target_consistency_loss(yhat, bx_ctrl, tidx, mode="knockdown", margin=0.0)
@@ -341,8 +367,6 @@ def train(
 
     return model
 
-
-import itertools
 
 @torch.no_grad()
 def predict_all_perturbations(
@@ -388,6 +412,10 @@ def predict_all_perturbations(
     true_mat = X[pert_idx]  # (Np,G)
     pert_names = labels[pert_idx].tolist()
 
+    # stable mapping label -> row index (should match training order if same labels set)
+    pert_names_unique = sorted(set(labels.tolist()))
+    pert2row = {p: i for i, p in enumerate(pert_names_unique)}
+
     # batched forward with random control matches
     model.eval()
     for start in range(0, Np, batch_size):
@@ -398,8 +426,9 @@ def predict_all_perturbations(
 
         bx_ctrl = torch.from_numpy(X[rand_ctrl]).float().to(device)
         tidx = torch.tensor([t2gi.get(p, -1) for p in pert_names[start:end]], dtype=torch.long, device=device)
+        pert_rowidx = torch.tensor([pert2row[p] for p in pert_names[start:end]], dtype=torch.long, device=device)
 
-        yhat, _ = model(bx_ctrl, tidx, A_base)
+        yhat, _ = model(bx_ctrl, tidx, A_base, pert_rowidx=pert_rowidx)
         pred_mat[b_idx] = yhat.detach().cpu().numpy()
 
     return pred_mat, true_mat, pert_names, ctrl_mean
