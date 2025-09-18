@@ -164,15 +164,18 @@ class Step0Clamp(nn.Module):
             self.logit_alpha = nn.Parameter(torch.tensor(0.0))  # sigmoid -> ~0.5 initially
         self.register_buffer("tau", torch.tensor(float(tau)))
 
-    def forward(self, x_ctrl: torch.Tensor, target_idx: torch.Tensor, pert_rowidx: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, x_ctrl: torch.Tensor, target_idx: torch.Tensor, pert_rowidx: torch.Tensor = None,
+                alpha_override: torch.Tensor | None = None) -> torch.Tensor:
         """
         x_ctrl: (B,G)
         target_idx: (B,) int tensor with -1 when unknown (i.e., target label not a gene)
         """
         B, G = x_ctrl.shape
         x0 = x_ctrl.clone()
-        if self.alpha_table is not None and pert_rowidx is not None:
-            alpha = torch.sigmoid(self.alpha_table(pert_rowidx)).view(-1)  # (B,)
+        if alpha_override is not None:
+            alpha = alpha_override  # (B,)
+        elif self.alpha_table is not None and pert_rowidx is not None:
+             alpha = torch.sigmoid(self.alpha_table(pert_rowidx)).view(-1)  # (B,)
         else:
             alpha = torch.sigmoid(self.logit_alpha).expand(B)  # (B,)
         if (target_idx >= 0).any():
@@ -182,6 +185,40 @@ class Step0Clamp(nn.Module):
             # x_t := (1 - alpha) * x_ctrl_t + alpha * tau
             x0[rows, cols] = (1.0 - alpha[bmask]) * x_ctrl[rows, cols] + alpha[bmask] * self.tau
         return x0
+
+class PrototypeGenerator(nn.Module):
+    """
+    Gene-conditioned generator:
+      - learns a per-gene embedding e_t in R^d
+      - maps e_t to a prototype mean-effect vector b_t in R^G
+      - predicts a Step-0 efficacy alpha_t in (0,1) from e_t (and optional meta covariates)
+    """
+    def __init__(self, G: int, d: int = 64):
+        super().__init__()
+        self.G = G
+        self.E = nn.Embedding(G, d)
+        nn.init.normal_(self.E.weight, std=0.02)
+        # e_t -> gene-space prototype
+        self.W_out = nn.Linear(d, G, bias=False)
+        # e_t (+ meta) -> alpha
+        self.alpha_head = nn.Sequential(
+            nn.Linear(d, 64), nn.SiLU(), nn.Linear(64, 1)
+        )
+
+    def forward(self, target_idx: torch.LongTensor, meta: torch.Tensor | None = None):
+        """
+        target_idx: (B,) gene indices (>=0); if -1, we still produce something but it won't be used.
+        meta: optional (B, M) covariates; ignored in this minimal version.
+        Returns:
+          b: (B,G) prototype vector
+          alpha: (B,) efficacy in (0,1)
+          e_t: (B,d) gene embeddings
+        """
+        e_t = self.E(torch.clamp(target_idx, min=0))  # (B,d); clamp just to index safely
+        b = self.W_out(e_t)                           # (B,G)
+        alpha = torch.sigmoid(self.alpha_head(e_t)).squeeze(-1)  # (B,)
+        return b, alpha, e_t
+
 
 class MPNNLayer(nn.Module):
     """
@@ -225,14 +262,11 @@ class GeneMPNN(nn.Module):
         self.embed = nn.Linear(1, hidden)
         self.layers = nn.ModuleList([MPNNLayer(hidden) for _ in range(T)])
         self.readout = nn.Linear(hidden, 1)
-        # simple perturbation embedding for FiLM + per-pert alpha in Step-0
-        self.pert_emb = nn.Embedding(num_perts, hidden) if num_perts is not None else None
-        self.film_gamma = nn.Linear(hidden, hidden) if self.pert_emb is not None else None
-        self.film_beta  = nn.Linear(hidden, hidden) if self.pert_emb is not None else None
-        self.step0 = Step0Clamp(tau=tau, num_perts=num_perts)
-        self.prototype = nn.Embedding(num_perts, G) if num_perts is not None else None
-        if self.prototype is not None:
-            nn.init.zeros_(self.prototype.weight)
+        # gene-conditioned prototype & alpha; FiLM from gene embedding
+        self.proto = PrototypeGenerator(G=G, d=64)
+        self.film_gamma = nn.Linear(64, hidden)
+        self.film_beta  = nn.Linear(64, hidden)
+        self.step0 = Step0Clamp(tau=tau, num_perts=None)  # no per-pert table anymore
 
     def forward(self, x_ctrl: torch.Tensor, target_idx: torch.Tensor, A_base: torch.Tensor, pert_rowidx: torch.Tensor = None) -> torch.Tensor:
         """
@@ -244,17 +278,17 @@ class GeneMPNN(nn.Module):
         B, G = x_ctrl.shape
         assert G == self.G
 
-        # Step-0 clamp in expression space (per-pert alpha if available)
-        x0 = self.step0(x_ctrl, target_idx, pert_rowidx=pert_rowidx)  # (B,G)
+        # Gene-conditioned prototype & efficacy
+        b_proto, alpha_t, e_t = self.proto(target_idx, meta=None)   # (B,G), (B,), (B,64)
+        # Step-0 clamp in expression space using alpha_t
+        x0 = self.step0(x_ctrl, target_idx, pert_rowidx=None, alpha_override=alpha_t)  # (B,G)
 
         # Initial hidden state (shared 1->hidden linear applied per gene)
         h = self.embed(x0.unsqueeze(-1))  # (B,G,hidden)
-        # FiLM condition on perturbation embedding (broadcast across genes)
-        if self.pert_emb is not None and pert_rowidx is not None:
-            e = self.pert_emb(pert_rowidx)                 # (B,hidden)
-            gamma = torch.tanh(self.film_gamma(e)).unsqueeze(1)  # (B,1,hidden)
-            beta  = self.film_beta(e).unsqueeze(1)               # (B,1,hidden)
-            h = h * (1 + gamma) + beta
+        # FiLM condition on target gene embedding (broadcast across genes)
+        gamma = torch.tanh(self.film_gamma(e_t)).unsqueeze(1)  # (B,1,H)
+        beta  = self.film_beta(e_t).unsqueeze(1)               # (B,1,H)
+        h = h * (1 + gamma) + beta
 
         # Prepare per-sample adjacency (block inbound to target)
         # Start from base A, then zero the row 't' per sample.
@@ -282,8 +316,8 @@ class GeneMPNN(nn.Module):
 
         # Readout back to expression space
         y = self.readout(h).squeeze(-1)  # (B,G)
-        if self.prototype is not None and pert_rowidx is not None:
-            y = y + self.prototype(pert_rowidx)  # add per-perturbation delta
+        # add gene-conditioned prototype mean-effect
+        y = y + b_proto
         return y, x0  # return x0 for optional locality loss
 
 # ----------------------------
@@ -340,6 +374,7 @@ def train(
     lr: float = 1e-3,
     weight_target: float = 0.1,
     weight_local: float = 0.0,
+    w_proto: float = 0.2,
     seed: int = 0,
     tau: float = 0.0,
     device: str = "cuda",
@@ -401,7 +436,7 @@ def train(
 
     for epoch in range(1, epochs + 1):
         model.train()
-        running = {"mse": 0.0, "targ": 0.0, "loc": 0.0, "proto": 0.0, "proto_l2": 0.0, "tot": 0.0}
+        running = {"mse": 0.0, "targ": 0.0, "loc": 0.0, "proto": 0.0, "tot": 0.0}
         for step in range(steps_per_epoch):
             if match_controls == "knn":
                 # lazily build cosine norms if requested
@@ -461,18 +496,11 @@ def train(
             if groups > 0:
                 loss_proto = loss_proto / groups
 
-            # weight the prototype loss modestly (e.g., 0.2)
-            w_proto = 0.2
-
             loss_mse = mse_loss(yhat - x0, bx_pert - x0)
             loss_t = target_consistency_loss(yhat, bx_ctrl, tidx, mode="knockdown", margin=0.0)
             loss_loc = locality_damping(yhat, x0, tidx, weight=1.0) if weight_local > 0 else yhat.new_tensor(0.0)
 
-            proto_l2 = yhat.new_tensor(0.0)
-            if hasattr(model, "prototype") and model.prototype is not None:
-                proto_l2 = (model.prototype.weight ** 2).mean()
-            w_proto_l2 = 1e-4
-            loss = loss_mse + weight_target * loss_t + weight_local * loss_loc + w_proto * loss_proto + w_proto_l2 * proto_l2
+            loss = loss_mse + weight_target * loss_t + weight_local * loss_loc + w_proto * loss_proto
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -483,7 +511,6 @@ def train(
             running["targ"] += float(loss_t.item())
             running["loc"]  += float(loss_loc.item())
             running["proto"] += float(loss_proto.item())
-            running["proto_l2"] += float(proto_l2.item())
             running["tot"]  += float(loss.item())
 
         denom = max(steps_per_epoch, 1)
@@ -493,7 +520,6 @@ def train(
                 f"targ={running['targ']/denom:.5f}  "
                 f"loc={running['loc']/denom:.5f}  "
                 f"proto={running['proto']/denom:.5f}  "
-                f"proto_l2={running['proto_l2']/denom:.5f}  "
                 f"total={running['tot']/denom:.5f}")
 
     return model
