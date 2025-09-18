@@ -588,7 +588,7 @@ def predict_all_perturbations(
         yhat, _ = model(bx_ctrl, tidx, A_base, pert_rowidx=pert_rowidx)
         pred_mat[b_idx] = yhat.detach().cpu().numpy()
 
-    return pred_mat, true_mat, pert_names, ctrl_mean
+    return pred_mat, true_mat, pert_names, ctrl_mean, pert_idx
 
 
 def evaluate_model(
@@ -608,7 +608,7 @@ def evaluate_model(
       - PDS (Perturbation Discrimination Score): mean over perturbations
     Prints a concise report and returns a dict with all metrics.
     """
-    pred_mat, true_mat, pert_names, ctrl_mean = predict_all_perturbations(
+    pred_mat, true_mat, pert_names, ctrl_mean, pert_idx = predict_all_perturbations(
         adata, model, target_label, control_label, device=device, batch_size=batch_size, seed=seed
     )
     G = adata.n_vars
@@ -746,6 +746,8 @@ def evaluate_model(
 def main():
     ap = argparse.ArgumentParser(description="Step0-aware MPNN to fit perturbed gene vectors on a small panel.")
     ap.add_argument("--in_h5ad", required=True, help="Small input AnnData object.")
+    ap.add_argument("--out_pred_h5ad", type=str, default="",
+                    help="If set, write an AnnData with predictions for the evaluation split.")
     ap.add_argument("--target_label", default="target_gene", help="obs column with perturbation labels.")
     ap.add_argument("--control_label", default="non-targeting", help="label value for control cells.")
     ap.add_argument("--hidden", type=int, default=128)
@@ -765,6 +767,8 @@ def main():
     ap.add_argument("--knn_temp", type=float, default=0.1, help="Softmax temperature over distances.")
     ap.add_argument("--knn_metric", choices=["l2", "cosine"], default="l2",
                     help="Distance metric for kNN control matching.")
+    ap.add_argument("--test_pct_perts", type=float, default=0.0,
+                    help="Fraction of perturbation labels (excluding control) to hold out for testing. 0.0 = no holdout.")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 
@@ -776,8 +780,37 @@ def main():
     if sparse.isspmatrix(adata.X) and not sparse.isspmatrix_csr(adata.X):
         adata.X = adata.X.tocsr()  # nicer slicing, though we load to numpy anyway
 
+    # ---------------------------
+    # Split perts into train/test (leave-perturbations-out)
+    # ---------------------------
+    labels_all = adata.obs[args.target_label].astype(str).values
+    rng = np.random.default_rng(args.seed)
+    # all perturbations excluding the control label
+    all_perts = sorted({lbl for lbl in labels_all if lbl != args.control_label})
+    n_test = int(round(args.test_pct_perts * len(all_perts)))
+    if n_test > 0:
+        test_perts = set(rng.choice(np.array(all_perts), size=n_test, replace=False).tolist())
+    else:
+        test_perts = set()
+    train_perts = [p for p in all_perts if p not in test_perts]
+
+    # build train and (optional) test AnnData views
+    mask_train = adata.obs[args.target_label].isin([args.control_label] + train_perts)
+    adata_train = adata[mask_train].copy()
+    if n_test > 0:
+        mask_test = adata.obs[args.target_label].isin([args.control_label] + list(test_perts))
+        adata_test = adata[mask_test].copy()
+    else:
+        adata_test = None
+
+    print("=== Split summary ===")
+    print(f"Total perts (excl. control): {len(all_perts)}  |  Held-out test perts: {len(test_perts)}")
+    if n_test > 0:
+        print(f"Test perts: {sorted(test_perts)[:10]}{' ...' if len(test_perts) > 10 else ''}")
+    print(f"Train cells: {adata_train.n_obs}, Test cells: {adata_test.n_obs if adata_test is not None else 0}")
+
     model = train(
-        adata=adata,
+        adata=adata_train,
         target_label=args.target_label,
         control_label=args.control_label,
         hidden=args.hidden,
@@ -796,9 +829,13 @@ def main():
         knn_metric=args.knn_metric,
     )
 
+    # Evaluate: if holding out perts, evaluate on test split; else on training split
+    eval_adata = adata_test if adata_test is not None else adata_train
+    print("\n=== Evaluation on {} set ===".format("TEST (held-out perts)" if adata_test is not None else "TRAIN (no holdout)"))
+
     # Evaluate on the same panel (training fit quality)
-    _ = evaluate_model(
-        adata=adata,
+    eval_metrics = evaluate_model(
+        adata=eval_adata,
         model=model,
         target_label=args.target_label,
         control_label=args.control_label,
@@ -813,6 +850,26 @@ def main():
                 "G": model.G,
                 "hidden": model.hidden,
                 "T": model.T}, out_path)
+
+    # ---------------------------
+    # Optional: write predictions AnnData for the evaluation split
+    # ---------------------------
+    if args.out_pred_h5ad:
+        print(f"\n[write] Generating predictions AnnData → {args.out_pred_h5ad}")
+        # run the same batched predictor to get per-pert predictions + their row indices
+        pred_mat, _, pert_names_eval, _, pert_idx = predict_all_perturbations(
+            eval_adata, model, args.target_label, args.control_label,
+            device=args.device, batch_size=512, seed=args.seed
+        )
+        # start from a copy of eval_adata.X and replace perturbed rows with predictions
+        from anndata import AnnData
+        X_eval = to_numpy(eval_adata.X).astype(np.float32, copy=True)
+        X_eval[pert_idx, :] = pred_mat  # controls remain unchanged
+        ad_pred = AnnData(X_eval, obs=eval_adata.obs.copy(), var=eval_adata.var.copy())
+        ad_pred.write_h5ad(args.out_pred_h5ad, compression="lzf")
+        eval_adata.write_h5ad(os.path.splitext(args.out_pred_h5ad)[0] + ".true.h5ad", compression="lzf")
+        print(f"[done] Wrote {args.out_pred_h5ad} (cells={ad_pred.n_obs}, genes={ad_pred.n_vars})")
+
     print(f"[done] saved model to {out_path}")
 
 if __name__ == "__main__":
