@@ -60,6 +60,66 @@ def sample_minibatch(
     btargets = pert_labels[choice].tolist()
     return bx_ctrl, bx_pert, btargets
 
+def sample_minibatch_knn(
+    X: np.ndarray,
+    labels: np.ndarray,
+    control_label: str,
+    batch_size: int,
+    rng: np.random.Generator,
+    knn_k: int = 32,
+    knn_temp: float = 0.1,
+    metric: str = "l2",
+    pre_norm_ctrl: np.ndarray | None = None,
+    pre_norm_pert: np.ndarray | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
+    """
+    Choose B perturbed cells; for each, sample one control from its top-k nearest controls
+    with softmax(-dist / temp). Supports L2 or cosine. Small-panel friendly (no index lib).
+    """
+    # index pools
+    ctrl_idx = np.where(labels == control_label)[0]
+    pert_idx = np.where(labels != control_label)[0]
+    if len(pert_idx) == 0 or len(ctrl_idx) == 0:
+        raise ValueError("Need both control and perturbed cells.")
+    # choose pert rows
+    if len(pert_idx) < batch_size:
+        sel_pert = rng.choice(pert_idx, size=batch_size, replace=True)
+    else:
+        sel_pert = rng.choice(pert_idx, size=batch_size, replace=False)
+    Xp = X[sel_pert]  # (B,G)
+    Xc = X[ctrl_idx]  # (Nc,G)
+    # distances (B,Nc)
+    if metric == "cosine":
+        # use pre-normalized rows if provided
+        P = pre_norm_pert if pre_norm_pert is not None else (Xp / (np.linalg.norm(Xp, axis=1, keepdims=True) + 1e-8))
+        C = pre_norm_ctrl if pre_norm_ctrl is not None else (Xc / (np.linalg.norm(Xc, axis=1, keepdims=True) + 1e-8))
+        # cosine distance = 1 - cosine similarity
+        dists = 1.0 - (P @ C.T)
+    else:  # l2
+        # (a-b)^2 = a^2  b^2 - 2ab
+        a2 = np.sum(Xp * Xp, axis=1, keepdims=True)        # (B,1)
+        b2 = np.sum(Xc * Xc, axis=1, keepdims=True).T      # (1,Nc)
+        dists = a2 + b2 - 2.0 * (Xp @ Xc.T)                # (B,Nc)
+        dists = np.maximum(dists, 0.0)
+    # top-k and softmax sampling
+    B = sel_pert.shape[0]
+    sel_ctrl = np.empty(B, dtype=int)
+    for i in range(B):
+        di = dists[i]
+        k = min(knn_k, di.shape[0])
+        cand = np.argpartition(di, k-1)[:k]      # indices of k smallest
+        # softmax over -dist / temp  (smaller distance => higher prob)
+        logits = -di[cand] / max(knn_temp, 1e-6)
+        logits -= logits.max()                   # stabilize
+        p = np.exp(logits)
+        p /= p.sum()
+        sel_ctrl[i] = rng.choice(cand, p=p)
+    # pack tensors
+    bx_ctrl = torch.from_numpy(Xc[sel_ctrl]).float()
+    bx_pert = torch.from_numpy(Xp).float()
+    btargets = labels[sel_pert].tolist()
+    return bx_ctrl, bx_pert, btargets
+
 def make_base_adjacency(G: int, self_loops: bool = True) -> torch.Tensor:
     """
     Dense fully-connected adjacency (uniform), normalized row-wise.
@@ -283,6 +343,10 @@ def train(
     seed: int = 0,
     tau: float = 0.0,
     device: str = "cuda",
+    match_controls: str = "knn",  # or "random"
+    knn_k: int = 32,
+    knn_temp: float = 0.1,
+    knn_metric: str = "l2",  # or "cosine"
 ):
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
@@ -306,6 +370,8 @@ def train(
     X_ctrl = X  # we’ll pick rows via indices
     X_pert = X
     pert_labels = labels
+    # Precompute normalized rows for cosine kNN (one-time)
+    pre_norm_ctrl = pre_norm_pert = None
 
     # Map perturbation label -> gene index (for Step-0); unknown => -1
     t2gi = build_target_to_gene_index(adata, target_label)
@@ -337,10 +403,24 @@ def train(
         model.train()
         running = {"mse": 0.0, "targ": 0.0, "loc": 0.0, "proto": 0.0, "proto_l2": 0.0, "tot": 0.0}
         for step in range(steps_per_epoch):
-            bx_ctrl, bx_pert, btargets = sample_minibatch(
-                X_ctrl=X_ctrl, X_pert=X_pert, pert_labels=pert_labels,
-                control_label=control_label, batch_size=batch_size, rng=rng
-            )
+            if match_controls == "knn":
+                # lazily build cosine norms if requested
+                if knn_metric == "cosine":
+                    if pre_norm_ctrl is None:
+                        ctrl_idx_all = np.where(labels == control_label)[0]
+                        pre_norm_ctrl = X[ctrl_idx_all] / (np.linalg.norm(X[ctrl_idx_all], axis=1, keepdims=True) + 1e-8)
+                        pre_norm_pert = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-8)
+                bx_ctrl, bx_pert, btargets = sample_minibatch_knn(
+                    X=X, labels=labels, control_label=control_label,
+                    batch_size=batch_size, rng=rng,
+                    knn_k=knn_k, knn_temp=knn_temp, metric=knn_metric,
+                    pre_norm_ctrl=pre_norm_ctrl, pre_norm_pert=pre_norm_pert
+                )
+            else:
+                bx_ctrl, bx_pert, btargets = sample_minibatch(
+                    X_ctrl=X_ctrl, X_pert=X_pert, pert_labels=pert_labels,
+                    control_label=control_label, batch_size=batch_size, rng=rng
+                )
             # per-sample target index tensor
             tidx = torch.tensor([t2gi.get(t, -1) for t in btargets], dtype=torch.long)
 
@@ -653,6 +733,12 @@ def main():
     ap.add_argument("--tau", type=float, default=0.0, help="Step-0 anchor (e.g., 0.0 for CRISPRi).")
     ap.add_argument("--use_pseudobulk", action="store_true",
                     help="Collapse to one mean row per perturbation (incl. control).")
+    ap.add_argument("--match_controls", choices=["random", "knn"], default="knn",
+                    help="How to choose a control for each perturbed cell.")
+    ap.add_argument("--knn_k", type=int, default=32, help="Top-k controls to sample from.")
+    ap.add_argument("--knn_temp", type=float, default=0.1, help="Softmax temperature over distances.")
+    ap.add_argument("--knn_metric", choices=["l2", "cosine"], default="l2",
+                    help="Distance metric for kNN control matching.")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 
@@ -678,6 +764,10 @@ def main():
         seed=args.seed,
         tau=args.tau,
         device=args.device,
+        match_controls=args.match_controls,
+        knn_k=args.knn_k,
+        knn_temp=args.knn_temp,
+        knn_metric=args.knn_metric,
     )
 
     # Evaluate on the same panel (training fit quality)
