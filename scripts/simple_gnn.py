@@ -263,7 +263,7 @@ class GeneMPNN(nn.Module):
         self.hidden = hidden
         self.T = T
         # per-gene node embeddings (used by all nodes, every batch)
-        self.node_dim = 32
+        self.node_dim = 64
         self.node_E = nn.Embedding(G, self.node_dim)
         nn.init.normal_(self.node_E.weight, std=0.02)
         # input becomes [log1p expression, node embedding] per gene
@@ -815,6 +815,8 @@ def main():
                     help="Distance metric for kNN control matching.")
     ap.add_argument("--test_pct_perts", type=float, default=0.0,
                     help="Fraction of perturbation labels (excluding control) to hold out for testing. 0.0 = no holdout.")
+    ap.add_argument("--test_h5ad", type=str, default="",
+                    help="Optional path to a separate test AnnData. If set, overrides --test_pct_perts.")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 
@@ -827,33 +829,41 @@ def main():
         adata.X = adata.X.tocsr()  # nicer slicing, though we load to numpy anyway
 
     # ---------------------------
-    # Split perts into train/test (leave-perturbations-out)
+    # Train/Test setup
+    # If --test_h5ad is provided, use that file for evaluation and ignore --test_pct_perts.
+    # Otherwise, do the leave-perturbations-out split as before.
     # ---------------------------
-    labels_all = adata.obs[args.target_label].astype(str).values
-    rng = np.random.default_rng(args.seed)
-    # all perturbations excluding the control label
-    all_perts = sorted({lbl for lbl in labels_all if lbl != args.control_label})
-    n_test = int(round(args.test_pct_perts * len(all_perts)))
-    if n_test > 0:
-        test_perts = set(rng.choice(np.array(all_perts), size=n_test, replace=False).tolist())
+    if args.test_h5ad:
+        print(f"=== Using external TEST set: {args.test_h5ad} (overrides --test_pct_perts) ===")
+        adata_train = adata
+        adata_test = ad.read_h5ad(args.test_h5ad)
+        # (Optional) apply the same pseudobulk collapse if requested
+        if args.use_pseudobulk:
+            adata_test = collapse_to_pseudobulk(adata_test, args.target_label)
+        sc.pp.normalize_total(adata_test, inplace=True)
+        sc.pp.log1p(adata_test)
+        if sparse.isspmatrix(adata_test.X) and not sparse.isspmatrix_csr(adata_test.X):
+            adata_test.X = adata_test.X.tocsr()  # nicer slicing, though we load to numpy anyway
+        # Sanity check: same genes / order (as guaranteed by user)
+        assert np.array_equal(adata_train.var_names.values, adata_test.var_names.values), \
+            "Train and test var_names differ or are out of order."
+        print(f"Train cells: {adata_train.n_obs}, Test cells: {adata_test.n_obs}")
     else:
-        test_perts = set()
-    train_perts = [p for p in all_perts if p not in test_perts]
-
-    # build train and (optional) test AnnData views
-    mask_train = adata.obs[args.target_label].isin([args.control_label] + train_perts)
-    adata_train = adata[mask_train].copy()
-    if n_test > 0:
-        mask_test = adata.obs[args.target_label].isin([args.control_label] + list(test_perts))
-        adata_test = adata[mask_test].copy()
-    else:
-        adata_test = None
-
-    print("=== Split summary ===")
-    print(f"Total perts (excl. control): {len(all_perts)}  |  Held-out test perts: {len(test_perts)}")
-    if n_test > 0:
-        print(f"Test perts: {sorted(test_perts)[:10]}{' ...' if len(test_perts) > 10 else ''}")
-    print(f"Train cells: {adata_train.n_obs}, Test cells: {adata_test.n_obs if adata_test is not None else 0}")
+        # Leave-perturbations-out split (previous behavior)
+        labels_all = adata.obs[args.target_label].astype(str).values
+        rng = np.random.default_rng(args.seed)
+        all_perts = sorted({lbl for lbl in labels_all if lbl != args.control_label})
+        n_test = int(round(args.test_pct_perts * len(all_perts)))
+        test_perts = set(rng.choice(np.array(all_perts), size=n_test, replace=False).tolist()) if n_test > 0 else set()
+        train_perts = [p for p in all_perts if p not in test_perts]
+        mask_train = adata.obs[args.target_label].isin([args.control_label] + train_perts)
+        adata_train = adata[mask_train].copy()
+        adata_test = adata[adata.obs[args.target_label].isin([args.control_label] + list(test_perts))].copy() if n_test > 0 else None
+        print("=== Split summary ===")
+        print(f"Total perts (excl. control): {len(all_perts)}  |  Held-out test perts: {len(test_perts)}")
+        if n_test > 0:
+            print(f"Test perts: {sorted(test_perts)[:10]}{' ...' if len(test_perts) > 10 else ''}")
+        print(f"Train cells: {adata_train.n_obs}, Test cells: {adata_test.n_obs if adata_test is not None else 0}")
 
     model = train(
         adata=adata_train,
@@ -875,11 +885,9 @@ def main():
         knn_metric=args.knn_metric,
     )
 
-    # Evaluate: if holding out perts, evaluate on test split; else on training split
+    # Evaluate: external test if provided, else held-out split, else train split
     eval_adata = adata_test if adata_test is not None else adata_train
     print("\n=== Evaluation on {} set ===".format("TEST (held-out perts)" if adata_test is not None else "TRAIN (no holdout)"))
-
-    # Evaluate on the same panel (training fit quality)
     eval_metrics = evaluate_model(
         adata=eval_adata,
         model=model,

@@ -70,6 +70,7 @@ def build_gene_panel(
     max_ctrl_cells: int = 5000,
     max_cells_per_pert: int = 1000,
     random_seed: int = 0,
+    test_h5ad: str = "",
 ):
     """
     Returns a new AnnData with a small gene panel and capped per-pert/control cell counts.
@@ -114,6 +115,27 @@ def build_gene_panel(
     target_genes_to_add = [p for p in chosen_perts if p in adata.var_names]
     if target_genes_to_add:
         chosen_genes.update(target_genes_to_add)
+
+    # --- NEW: force-include all genes targeted in the external TEST set ---
+    if test_h5ad:
+        print(f"[panel] Loading test AnnData for required genes: {test_h5ad}")
+        adata_test = ad.read_h5ad(test_h5ad, backed="r")
+        # collect perturbation labels in test (excluding control)
+        test_labels = adata_test.obs[target_label].astype(str).values
+        test_perts = sorted({p for p in test_labels if p != control_label})
+        # interpret perturbation labels as gene symbols; include those that are present in training var_names
+        train_gene_universe = set(adata.var_names.astype(str).tolist())
+        required_from_test = {g for g in test_perts if g in train_gene_universe}
+        missing_from_train = [g for g in test_perts if g not in train_gene_universe]
+        if missing_from_train:
+            print(f"[panel][warn] {len(missing_from_train)} test target(s) not found in training var_names "
+                  f"(first few): {missing_from_train[:10]}")
+        # union into chosen_genes
+        before = len(chosen_genes)
+        chosen_genes |= required_from_test
+        added = len(chosen_genes) - before
+        print(f"[panel] Force-included {added} test-target gene(s) into training panel "
+              f"(now {len(chosen_genes)} genes).")
 
     if missing_perts:
         # Shouldn't happen often, but just in case of label mismatches
@@ -165,6 +187,8 @@ def main():
     ap = argparse.ArgumentParser(description="Build a small gene-panel AnnData from a larger dataset.")
     ap.add_argument("--in_h5ad", required=True, help="Input AnnData .h5ad")
     ap.add_argument("--out_h5ad", required=True, help="Output AnnData .h5ad (panel)")
+    ap.add_argument("--test_h5ad", type=str, default="",
+                    help="Optional test AnnData. If set, all genes targeted in this file will be force-included in the training panel.")
     ap.add_argument("--target_label", default="target_gene", help="obs column for perturbation label")
     ap.add_argument("--control_label", default="non-targeting", help="label value for control cells")
     ap.add_argument("--top_n_perts", type=int, default=20, help="Number of most frequent perturbations to keep")
@@ -189,6 +213,7 @@ def main():
         max_ctrl_cells=args.max_ctrl_cells,
         max_cells_per_pert=args.max_cells_per_pert,
         random_seed=args.random_seed,
+        test_h5ad=args.test_h5ad,
     )
 
     panel.write_h5ad(args.out_h5ad, compression="lzf")
