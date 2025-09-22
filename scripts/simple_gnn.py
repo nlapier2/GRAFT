@@ -11,6 +11,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy import sparse
 
+# Ensure local modules can be imported
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from graft.losses.distribution import sliced_wasserstein, mmd_rbf, energy_distance
+
 # ----------------------------
 # Utilities
 # ----------------------------
@@ -39,6 +43,7 @@ def sample_minibatch(
     control_label: str,
     batch_size: int,
     rng: np.random.Generator,
+    fixed_label: str | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
     """
     Returns batch_x_ctrl (B,G), batch_x_pert (B,G), batch_targets (list of labels).
@@ -46,8 +51,10 @@ def sample_minibatch(
     """
     B = batch_size
     # indices for perturbed cells (exclude controls)
-    pert_mask = pert_labels != control_label
-    pert_idx = np.where(pert_mask)[0]
+    if fixed_label is None:
+        pert_idx = np.where(pert_labels != control_label)[0]
+    else:
+        pert_idx = np.where(pert_labels == fixed_label)[0]
     if len(pert_idx) < B:
         choice = rng.choice(pert_idx, size=B, replace=True)
     else:
@@ -71,6 +78,7 @@ def sample_minibatch_knn(
     metric: str = "l2",
     pre_norm_ctrl: np.ndarray | None = None,
     pre_norm_pert: np.ndarray | None = None,
+    fixed_label: str | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
     """
     Choose B perturbed cells; for each, sample one control from its top-k nearest controls
@@ -78,7 +86,10 @@ def sample_minibatch_knn(
     """
     # index pools
     ctrl_idx = np.where(labels == control_label)[0]
-    pert_idx = np.where(labels != control_label)[0]
+    if fixed_label is None:
+        pert_idx = np.where(labels != control_label)[0]
+    else:
+        pert_idx = np.where(labels == fixed_label)[0]
     if len(pert_idx) == 0 or len(ctrl_idx) == 0:
         raise ValueError("Need both control and perturbed cells.")
     # choose pert rows
@@ -402,6 +413,10 @@ def train(
     knn_k: int = 32,
     knn_temp: float = 0.1,
     knn_metric: str = "l2",  # or "cosine"
+    dist_loss: str = "mmd",  # or "swd" or "energy"
+    swd_projections: int = 128,
+    dist_weight: float = 1.0,
+    single_pert_batches: bool = False,
 ):
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
@@ -421,6 +436,8 @@ def train(
     pert_mask = ~ctrl_mask
     if pert_mask.sum() == 0:
         raise ValueError("No perturbed cells found.")
+    # unique perturbation labels (exclude control)
+    pert_unique = sorted({l for l in labels if l != control_label})
 
     X_ctrl = X  # we’ll pick rows via indices
     X_pert = X
@@ -456,8 +473,13 @@ def train(
 
     for epoch in range(1, epochs + 1):
         model.train()
-        running = {"mse": 0.0, "targ": 0.0, "loc": 0.0, "proto": 0.0, "tot": 0.0}
+        running = {"mse": 0.0, "targ": 0.0, "loc": 0.0, "proto": 0.0, "dist": 0.0, "tot": 0.0}
         for step in range(steps_per_epoch):
+            # if requested, choose a single perturbation label for this batch
+            fixed_label = None
+            if single_pert_batches:
+                fixed_label = rng.choice(np.array(pert_unique)) if len(pert_unique) > 0 else None
+
             if match_controls == "knn":
                 # lazily build cosine norms if requested
                 if knn_metric == "cosine":
@@ -469,12 +491,14 @@ def train(
                     X=X, labels=labels, control_label=control_label,
                     batch_size=batch_size, rng=rng,
                     knn_k=knn_k, knn_temp=knn_temp, metric=knn_metric,
-                    pre_norm_ctrl=pre_norm_ctrl, pre_norm_pert=pre_norm_pert
+                    pre_norm_ctrl=pre_norm_ctrl, pre_norm_pert=pre_norm_pert,
+                    fixed_label=fixed_label
                 )
             else:
                 bx_ctrl, bx_pert, btargets = sample_minibatch(
                     X_ctrl=X_ctrl, X_pert=X_pert, pert_labels=pert_labels,
-                    control_label=control_label, batch_size=batch_size, rng=rng
+                    control_label=control_label, batch_size=batch_size, rng=rng,
+                    fixed_label=fixed_label
                 )
             # per-sample target index tensor
             tidx = torch.tensor([t2gi.get(t, -1) for t in btargets], dtype=torch.long)
@@ -520,7 +544,44 @@ def train(
             loss_t = target_consistency_loss(yhat, bx_ctrl, tidx, mode="knockdown", margin=0.0)
             loss_loc = locality_damping(yhat, x0, tidx, weight=1.0) if weight_local > 0 else yhat.new_tensor(0.0)
 
-            loss = loss_mse + weight_target * loss_t + weight_local * loss_loc + w_proto * loss_proto
+            # --- Distribution loss on per-perturbation deltas (optional) ---
+            loss_dist = yhat.new_tensor(0.0)
+            if dist_loss != "none":
+                from collections import defaultdict
+                by_lbl = defaultdict(list)
+                for i, lbl in enumerate(btargets):
+                    by_lbl[lbl].append(i)
+                for lbl, idxs in by_lbl.items():
+                    if len(idxs) < 2:
+                        continue
+                    idx = torch.tensor(idxs, device=yhat.device, dtype=torch.long)
+                    # deltas vs per-sample Step-0 baseline (robust to control matching)
+                    d_pred = (yhat[idx] - x0[idx])         # (n_p, G)
+                    d_true = (bx_pert[idx] - x0[idx])      # (n_p, G)
+                    # mask target gene column
+                    t = t2gi.get(lbl, -1)
+                    if t >= 0:
+                        d_pred = torch.cat([d_pred[:, :t], d_pred[:, t+1:]], dim=1)
+                        d_true = torch.cat([d_true[:, :t], d_true[:, t+1:]], dim=1)
+                    # choose loss
+                    if dist_loss == "mmd":
+                        loss_dist = loss_dist + mmd_rbf(d_pred, d_true)
+                    elif dist_loss == "swd":
+                        loss_dist = loss_dist + sliced_wasserstein(d_pred, d_true, num_proj=swd_projections)
+                    elif dist_loss == "energy":
+                        loss_dist = loss_dist + energy_distance(d_pred, d_true)
+                # average across present perts
+                n_groups = sum(1 for v in by_lbl.values() if len(v) >= 2)
+                if n_groups > 0:
+                    loss_dist = loss_dist / n_groups
+
+            loss = loss_mse \
+                 + weight_target * loss_t \
+                 + weight_local * loss_loc \
+                 + w_proto * loss_proto \
+                 + dist_weight * loss_dist
+
+            # loss = loss_mse + weight_target * loss_t + weight_local * loss_loc + w_proto * loss_proto
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -531,15 +592,17 @@ def train(
             running["targ"] += float(loss_t.item())
             running["loc"]  += float(loss_loc.item())
             running["proto"] += float(loss_proto.item())
+            running["dist"] += float(loss_dist.item())
             running["tot"]  += float(loss.item())
 
         denom = max(steps_per_epoch, 1)
-        if epoch % 5 == 0 or epoch == 1 or epoch == epochs:
+        if epoch > 0:  # epoch % 5 == 0 or epoch == 1 or epoch == epochs:
             print(f"[epoch {epoch:03d}] "
                 f"mse={running['mse']/denom:.5f}  "
                 f"targ={running['targ']/denom:.5f}  "
                 f"loc={running['loc']/denom:.5f}  "
                 f"proto={running['proto']/denom:.5f}  "
+                f"dist={running['dist']/denom:.5f}  "
                 f"total={running['tot']/denom:.5f}")
 
     # estimate mean alpha on training targets (linear KD from pseudobulk)
@@ -817,6 +880,12 @@ def main():
                     help="Fraction of perturbation labels (excluding control) to hold out for testing. 0.0 = no holdout.")
     ap.add_argument("--test_h5ad", type=str, default="",
                     help="Optional path to a separate test AnnData. If set, overrides --test_pct_perts.")
+    ap.add_argument("--dist_loss", choices=["none","mmd","swd","energy"], default="mmd",
+                    help="Distribution loss between predicted and true deltas per perturbation.")
+    ap.add_argument("--dist_weight", type=float, default=1.0, help="Weight for distribution loss.")
+    ap.add_argument("--swd_projections", type=int, default=128, help="Num random projections for SWD.")
+    ap.add_argument("--single_pert_batches", action="store_true",
+                    help="If set, each batch contains cells from a single perturbation label.")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 
@@ -883,6 +952,10 @@ def main():
         knn_k=args.knn_k,
         knn_temp=args.knn_temp,
         knn_metric=args.knn_metric,
+        dist_loss=args.dist_loss,
+        dist_weight=args.dist_weight,
+        swd_projections=args.swd_projections,
+        single_pert_batches=args.single_pert_batches,
     )
 
     # Evaluate: external test if provided, else held-out split, else train split
