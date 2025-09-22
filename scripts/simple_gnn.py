@@ -285,6 +285,8 @@ class GeneMPNN(nn.Module):
         self.readout = nn.Linear(hidden, 1)
         # gene-conditioned prototype & alpha; FiLM from gene embedding
         self.proto = PrototypeGenerator(G=G, d=64)
+        # Tie prototype embedding to the node embedding so both share the same e_t
+        self.proto.E = self.node_E
         self.film_gamma = nn.Linear(64, hidden)
         self.film_beta  = nn.Linear(64, hidden)
         self.step0 = Step0Clamp(tau=tau, num_perts=None)  # no per-pert table anymore
