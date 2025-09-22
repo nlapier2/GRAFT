@@ -268,7 +268,7 @@ class MPNNLayer(nn.Module):
         return h_out
 
 class GeneMPNN(nn.Module):
-    def __init__(self, G: int, hidden: int = 128, T: int = 2, tau: float = 0.0, num_perts: int = None):
+    def __init__(self, G: int, hidden: int = 128, T: int = 2, tau: float = 0.0, num_perts: int = None, prior_dim: int | None = None):
         super().__init__()
         self.G = G
         self.hidden = hidden
@@ -277,6 +277,8 @@ class GeneMPNN(nn.Module):
         self.node_dim = 64
         self.node_E = nn.Embedding(G, self.node_dim)
         nn.init.normal_(self.node_E.weight, std=0.02)
+        # Optional small projector: prior (R) -> node_dim
+        self.prior_proj = nn.Linear(prior_dim, self.node_dim, bias=False) if prior_dim is not None else None
         # input becomes [log1p expression, node embedding] per gene
         self.embed = nn.Linear(1 + self.node_dim, hidden)
         self.layers = nn.ModuleList([MPNNLayer(hidden) for _ in range(T)])
@@ -286,6 +288,18 @@ class GeneMPNN(nn.Module):
         self.film_gamma = nn.Linear(64, hidden)
         self.film_beta  = nn.Linear(64, hidden)
         self.step0 = Step0Clamp(tau=tau, num_perts=None)  # no per-pert table anymore
+
+    @torch.no_grad()
+    def init_from_prior(self, W_meta: torch.Tensor):
+        """
+        W_meta: (R, G) tensor matching var_names order. Projects columns to node_dim and uses
+        as an initialization for node_E. Requires prior_proj to be present.
+        """
+        assert self.prior_proj is not None, "prior_proj not initialized (set prior_dim when constructing GeneMPNN)."
+        # Project each gene's R-dim vector to node_dim
+        # W_meta.T: (G, R) -> (G, node_dim)
+        E0 = self.prior_proj(W_meta.T)  # (G, node_dim)
+        self.node_E.weight.copy_(E0)
 
     def forward(self, x_ctrl: torch.Tensor, target_idx: torch.Tensor, A_base: torch.Tensor, pert_rowidx: torch.Tensor = None) -> torch.Tensor:
         """
@@ -405,7 +419,8 @@ def train(
     lr: float = 1e-3,
     weight_target: float = 0.1,
     weight_local: float = 0.0,
-    w_proto: float = 0.2,
+    weight_mse: float = 1.0,
+    weight_proto: float = 0.2,
     seed: int = 0,
     tau: float = 0.0,
     device: str = "cuda",
@@ -417,6 +432,10 @@ def train(
     swd_projections: int = 128,
     dist_weight: float = 1.0,
     single_pert_batches: bool = False,
+    W_meta: np.ndarray | None = None,
+    init_from_meta: bool = False,
+    weight_prior: float = 0.0,
+    meta_topk: int = 0,
 ):
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
@@ -462,18 +481,46 @@ def train(
     ctrl_mean = torch.from_numpy(ctrl_mean_np).to(device)
 
     # Model
-    model = GeneMPNN(G=G, hidden=hidden, T=T, tau=tau, num_perts=num_perts).to(device)
+    # If a prior is provided, tell the model its input prior dimension for the projector
+    prior_dim = W_meta.shape[0] if W_meta is not None else None
+    model = GeneMPNN(G=G, hidden=hidden, T=T, tau=tau, num_perts=num_perts, prior_dim=prior_dim).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
-    # Base adjacency (fully connected, row-normalized)
-    A_base = make_base_adjacency(G, self_loops=True).to(device)
+    # Optionally initialize node embeddings from prior
+    if (W_meta is not None) and init_from_meta:
+        Wm_torch = torch.from_numpy(W_meta.astype(np.float32)).to(device)  # (R,G)
+        model.init_from_prior(Wm_torch)
+
+    # Base adjacency: either dense (as before) or prior-based top-k cosine graph
+    if (W_meta is not None) and (meta_topk > 0):
+        # build kNN in prior space (cosine), symmetric, row-normalized
+        Wm = W_meta.astype(np.float32)  # (R,G)
+        # cosine over columns
+        V = Wm.T  # (G,R)
+        Vn = V / (np.linalg.norm(V, axis=1, keepdims=True) + 1e-8)
+        S = Vn @ Vn.T  # (G,G) cosine similarity
+        # for each row, keep top-k (including self), set others to 0
+        k = min(meta_topk, G)
+        A = np.zeros_like(S, dtype=np.float32)
+        idx = np.argpartition(-S, kth=k-1, axis=1)[:, :k]
+        rows = np.repeat(np.arange(G)[:, None], k, axis=1)
+        A[rows, idx] = S[rows, idx]
+        # symmetrize by max
+        A = np.maximum(A, A.T)
+        # row-normalize
+        A = A / (A.sum(axis=1, keepdims=True) + 1e-8)
+        A_base = torch.from_numpy(A).to(device)
+        print(f"[graph] Using prior kNN graph (top-k={k}) from M_meta.")
+    else:
+        # dense fully-connected adjacency (previous behavior)
+        A_base = make_base_adjacency(G, self_loops=True).to(device)
 
     # Simple schedule
     steps_per_epoch = math.ceil(pert_mask.sum() / batch_size)
 
     for epoch in range(1, epochs + 1):
         model.train()
-        running = {"mse": 0.0, "targ": 0.0, "loc": 0.0, "proto": 0.0, "dist": 0.0, "tot": 0.0}
+        running = {"mse": 0.0, "targ": 0.0, "loc": 0.0, "proto": 0.0, "dist": 0.0, "prior": 0.0, "tot": 0.0}
         for step in range(steps_per_epoch):
             # if requested, choose a single perturbation label for this batch
             fixed_label = None
@@ -575,11 +622,21 @@ def train(
                 if n_groups > 0:
                     loss_dist = loss_dist / n_groups
 
-            loss = loss_mse \
+            # Optional proximity loss: keep node_E near projected prior (Phase 1 adaptation)
+            loss_prior = yhat.new_tensor(0.0)
+            if (weight_prior > 0.0) and (W_meta is not None) and (model.prior_proj is not None):
+                # compute current projected prior: (G,node_dim)
+                with torch.no_grad():
+                    Wm_torch = torch.from_numpy(W_meta.astype(np.float32)).to(yhat.device)
+                E_prior = model.prior_proj(Wm_torch.T)  # (G,node_dim)
+                loss_prior = F.mse_loss(model.node_E.weight, E_prior)
+
+            loss = weight_mse * loss_mse \
                  + weight_target * loss_t \
                  + weight_local * loss_loc \
-                 + w_proto * loss_proto \
-                 + dist_weight * loss_dist
+                 + weight_proto * loss_proto \
+                 + dist_weight * loss_dist \
+                 + weight_prior * loss_prior
 
             # loss = loss_mse + weight_target * loss_t + weight_local * loss_loc + w_proto * loss_proto
 
@@ -593,6 +650,7 @@ def train(
             running["loc"]  += float(loss_loc.item())
             running["proto"] += float(loss_proto.item())
             running["dist"] += float(loss_dist.item())
+            running["prior"] += float(loss_prior.item())
             running["tot"]  += float(loss.item())
 
         denom = max(steps_per_epoch, 1)
@@ -603,6 +661,7 @@ def train(
                 f"loc={running['loc']/denom:.5f}  "
                 f"proto={running['proto']/denom:.5f}  "
                 f"dist={running['dist']/denom:.5f}  "
+                f"prior={running['prior']/denom:.5f}  "
                 f"total={running['tot']/denom:.5f}")
 
     # estimate mean alpha on training targets (linear KD from pseudobulk)
@@ -886,6 +945,14 @@ def main():
     ap.add_argument("--swd_projections", type=int, default=128, help="Num random projections for SWD.")
     ap.add_argument("--single_pert_batches", action="store_true",
                     help="If set, each batch contains cells from a single perturbation label.")
+    ap.add_argument("--meta_path", type=str, default="",
+                    help="Path to M_meta.npy produced by embed_pathways.py (shape R x G; columns aligned to var_names).")
+    ap.add_argument("--init_from_meta", action="store_true",
+                    help="If set, initialize node embeddings from the projected pathway prior.")
+    ap.add_argument("--weight_prior", type=float, default=0.0,
+                    help="L2 proximity loss weight to keep node embeddings near the projected pathway prior (Phase 1).")
+    ap.add_argument("--meta_topk", type=int, default=0,
+                    help="If >0, build a top-k cosine kNN adjacency from the pathway prior instead of dense A.")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 
@@ -934,6 +1001,14 @@ def main():
             print(f"Test perts: {sorted(test_perts)[:10]}{' ...' if len(test_perts) > 10 else ''}")
         print(f"Train cells: {adata_train.n_obs}, Test cells: {adata_test.n_obs if adata_test is not None else 0}")
 
+    # ----- Optional: load pathway prior M_meta.npy (R x G) -----
+    W_meta = None
+    if args.meta_path:
+        print(f"[prior] Loading pathway meta from {args.meta_path}")
+        W_meta = np.load(args.meta_path)
+        assert W_meta.ndim == 2 and W_meta.shape[1] == adata_train.n_vars, \
+            f"M_meta shape mismatch: got {W_meta.shape}, expected (R,{adata_train.n_vars}) aligned to var_names."
+
     model = train(
         adata=adata_train,
         target_label=args.target_label,
@@ -956,6 +1031,10 @@ def main():
         dist_weight=args.dist_weight,
         swd_projections=args.swd_projections,
         single_pert_batches=args.single_pert_batches,
+        W_meta=W_meta,
+        init_from_meta=args.init_from_meta,
+        weight_prior=args.weight_prior,
+        meta_topk=args.meta_topk,
     )
 
     # Evaluate: external test if provided, else held-out split, else train split
