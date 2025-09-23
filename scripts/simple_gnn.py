@@ -159,47 +159,46 @@ def collapse_to_pseudobulk(adata, target_label: str):
 # ----------------------------
 # Model: Step0 + MPNN + Readout
 # ----------------------------
-class Step0Clamp(nn.Module):
+class Step0Head(nn.Module):
     """
-    Simple Step-0: clamp the target node toward an anchor 'tau' with learnable efficacy alpha in (0,1).
-    For CRISPRi-like behavior, tau=0.0 (in normalized space).
+    Predict efficacy alpha_t from the target embedding and APPLY the counts-space clamp.
+    Returns the clamped input x0 and the efficacy vector alpha_t.
     """
-    def __init__(self, tau: float = 0.0, num_perts: int = None):
+    def __init__(self, tau: float = 0.0, d: int = 64):
         super().__init__()
-        # global alpha by default; if num_perts is given, use per-pert embedding for alpha
-        if num_perts is not None:
-            self.alpha_table = nn.Embedding(num_perts, 1)
-            nn.init.zeros_(self.alpha_table.weight)  # sigmoid(0)=0.5
-        else:
-            self.alpha_table = None
-            self.logit_alpha = nn.Parameter(torch.tensor(0.0))  # sigmoid -> ~0.5 initially
-        self.register_buffer("tau", torch.tensor(float(tau)))
+        self.alpha_head = nn.Sequential(nn.Linear(d, d), nn.SiLU(), nn.Linear(d, 1))
+        self.alpha_mean_train: torch.Tensor | None = None  # set externally if available
+        self.tau = tau
 
-    def forward(self, x_ctrl: torch.Tensor, target_idx: torch.Tensor, pert_rowidx: torch.Tensor = None,
-                alpha_override: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x_ctrl: torch.Tensor,             # (B,G), log1p
+        target_idx: torch.Tensor,         # (B,), -1 for control
+        e_t: torch.Tensor,                # (B,d) target embedding
+        alpha_cap: float = 1.0,
+        mean_shrink: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        x_ctrl: (B,G)
-        target_idx: (B,) int tensor with -1 when unknown (i.e., target label not a gene)
+        Learn alpha_t = sigmoid(MLP(e_t)), optionally shrink to train mean,
+        then clamp the target coordinate in counts space and map back to log1p.
         """
-        B, G = x_ctrl.shape
+        # 1) predict efficacy
+        alpha_t = torch.sigmoid(self.alpha_head(e_t)).squeeze(-1)     # (B,)
+        if self.alpha_mean_train is not None and mean_shrink > 0.0:
+            alpha_t = (1 - mean_shrink) * alpha_t + mean_shrink * self.alpha_mean_train
+        alpha_t = alpha_t.clamp(0.0, float(alpha_cap))
+
+        # 2) counts-space clamp at the target
         x0 = x_ctrl.clone()
-        if alpha_override is not None:
-            alpha = alpha_override  # (B,)
-        elif self.alpha_table is not None and pert_rowidx is not None:
-             alpha = torch.sigmoid(self.alpha_table(pert_rowidx)).view(-1)  # (B,)
-        else:
-            alpha = torch.sigmoid(self.logit_alpha).expand(B)  # (B,)
-        if (target_idx >= 0).any():
-            bmask = (target_idx >= 0)
-            rows = torch.arange(B, device=x_ctrl.device)[bmask]
-            cols = target_idx[bmask]
-            # multiplicative knockdown on counts: x0_t = log1p( m * (exp(x_ctrl_t)-1) )
-            # where m = (1 - alpha) ∈ (0,1). With tau≈0 counts, this is the correct semantics.
-            ctrl_lin = torch.expm1(x_ctrl[rows, cols].clamp_min(0.0))
-            m = (1.0 - alpha).expand_as(rows.float()) if alpha.dim() == 0 else (1.0 - alpha[bmask])
-            x0_lin = m * ctrl_lin                       # tau=0 → just multiply counts
-            x0[rows, cols] = torch.log1p(x0_lin)
-        return x0
+        mask = (target_idx >= 0)
+        if mask.any():
+            rows = torch.arange(x_ctrl.shape[0], device=x_ctrl.device)[mask]
+            cols = target_idx[mask]
+            counts = torch.expm1(x0[rows, cols].clamp_min(0.0))
+            m = (1.0 - alpha_t[mask]).clamp(0.0, 1.0)
+            new_counts = counts * m
+            x0[rows, cols] = torch.log1p(new_counts.clamp_min(0.0))
+        return x0, alpha_t
 
 class PrototypeGenerator(nn.Module):
     """
@@ -210,17 +209,18 @@ class PrototypeGenerator(nn.Module):
     """
     def __init__(self, G: int, d: int = 64):
         super().__init__()
-        self.G = G
         self.E = nn.Embedding(G, d)
         nn.init.normal_(self.E.weight, std=0.02)
-        # e_t -> gene-space prototype
-        self.W_out = nn.Linear(d, G, bias=False)
-        # e_t (+ meta) -> alpha
-        self.alpha_head = nn.Sequential(
-            nn.Linear(d, 64), nn.SiLU(), nn.Linear(64, 1)
+        # MLP to produce a hidden code from [e_t, alpha]
+        self.phi = nn.Sequential(
+            nn.Linear(d + 1, d), nn.SiLU(),
+            nn.Linear(d, d), nn.SiLU(),
         )
+        self.W_out = nn.Linear(d, G, bias=False)
+        # kept for backward-compat; may not be used when external alpha is provided
+        self.alpha_head = nn.Sequential(nn.Linear(d, d), nn.SiLU(), nn.Linear(d, 1))
 
-    def forward(self, target_idx: torch.LongTensor, meta: torch.Tensor | None = None):
+    def forward(self, target_idx: torch.LongTensor, meta: torch.Tensor | None = None, external_alpha: torch.Tensor | None = None):
         """
         target_idx: (B,) gene indices (>=0); if -1, we still produce something but it won't be used.
         meta: optional (B, M) covariates; ignored in this minimal version.
@@ -229,9 +229,13 @@ class PrototypeGenerator(nn.Module):
           alpha: (B,) efficacy in (0,1)
           e_t: (B,d) gene embeddings
         """
-        e_t = self.E(torch.clamp(target_idx, min=0))  # (B,d); clamp just to index safely
-        b = self.W_out(e_t)                           # (B,G)
-        alpha = torch.sigmoid(self.alpha_head(e_t)).squeeze(-1)  # (B,)
+        e_t = self.E(torch.clamp(target_idx, min=0))    # (B,d)
+        alpha = (torch.sigmoid(self.alpha_head(e_t)).squeeze(-1)
+                 if external_alpha is None else external_alpha)       # (B,)
+        # Nonlinear conditioning on efficacy: concat and pass through phi
+        z = torch.cat([e_t, alpha.unsqueeze(-1)], dim=-1)             # (B,d+1)
+        h = self.phi(z)                                               # (B,d)
+        b = self.W_out(h)                                             # (B,G)
         return b, alpha, e_t
 
 
@@ -268,11 +272,12 @@ class MPNNLayer(nn.Module):
         return h_out
 
 class GeneMPNN(nn.Module):
-    def __init__(self, G: int, hidden: int = 128, T: int = 2, tau: float = 0.0, num_perts: int = None, prior_dim: int | None = None):
+    def __init__(self, G: int, hidden: int = 128, T: int = 2, tau: float = 0.0, alpha_cap: float = 1.0, prior_dim: int | None = None):
         super().__init__()
         self.G = G
         self.hidden = hidden
         self.T = T
+        self.alpha_cap = alpha_cap
         # per-gene node embeddings (used by all nodes, every batch)
         self.node_dim = 64
         self.node_E = nn.Embedding(G, self.node_dim)
@@ -287,9 +292,9 @@ class GeneMPNN(nn.Module):
         self.proto = PrototypeGenerator(G=G, d=64)
         # Tie prototype embedding to the node embedding so both share the same e_t
         self.proto.E = self.node_E
-        self.film_gamma = nn.Linear(64, hidden)
-        self.film_beta  = nn.Linear(64, hidden)
-        self.step0 = Step0Clamp(tau=tau, num_perts=None)  # no per-pert table anymore
+        self.film_gamma = nn.Linear(self.node_dim + 1, hidden)  # +1 for alpha_t
+        self.film_beta  = nn.Linear(self.node_dim + 1, hidden)
+        self.step0_head = Step0Head(tau=tau, d=self.node_dim)
 
     @torch.no_grad()
     def init_from_prior(self, W_meta: torch.Tensor):
@@ -313,12 +318,12 @@ class GeneMPNN(nn.Module):
         B, G = x_ctrl.shape
         assert G == self.G
 
-        # Gene-conditioned prototype & efficacy
-        b_proto, alpha_t, e_t = self.proto(target_idx, meta=None)   # (B,G), (B,), (B,64)
+        # --- Step-0: learn efficacy and apply counts-space clamp in one place ---
+        e_t = self.node_E(torch.clamp(target_idx, min=0))                       # (B,64)
+        # hand mean alpha to the head if we have it
         if hasattr(self, "alpha_mean_train"):
-            alpha_t = 0.2 * alpha_t + 0.8 * self.alpha_mean_train  # shrink toward train mean for stability
-        # Step-0 clamp in expression space using alpha_t
-        x0 = self.step0(x_ctrl, target_idx, pert_rowidx=None, alpha_override=alpha_t)  # (B,G)
+            self.step0_head.alpha_mean_train = self.alpha_mean_train
+        x0, alpha_t = self.step0_head(x_ctrl, target_idx, e_t, alpha_cap=self.alpha_cap)
 
         # Initial hidden state (shared 1->hidden linear applied per gene)
         # assemble per-node embeddings for all genes
@@ -326,9 +331,10 @@ class GeneMPNN(nn.Module):
         node_feats = self.node_E(idx_all).unsqueeze(0).expand(B, G, -1)  # (B,G,node_dim)
         x_in = torch.cat([x0.unsqueeze(-1), node_feats], dim=-1)         # (B,G,1+node_dim)
         h = self.embed(x_in)
-        # FiLM condition on target gene embedding (broadcast across genes)
-        gamma = torch.tanh(self.film_gamma(e_t)).unsqueeze(1)  # (B,1,H)
-        beta  = self.film_beta(e_t).unsqueeze(1)               # (B,1,H)
+        # FiLM conditions on both the identity (e_t) and strength (alpha_t) of the hit
+        e_aug = torch.cat([e_t, alpha_t.unsqueeze(-1)], dim=-1)       # (B,65)
+        gamma = torch.tanh(self.film_gamma(e_aug)).unsqueeze(1)       # (B,1,H)
+        beta  = self.film_beta(e_aug).unsqueeze(1)                    # (B,1,H)
         h = h * (1 + gamma) + beta
 
         # Prepare per-sample adjacency (block inbound to target)
@@ -357,7 +363,8 @@ class GeneMPNN(nn.Module):
 
         # Readout back to expression space
         y = self.readout(h).squeeze(-1)  # (B,G)
-        # add gene-conditioned prototype mean-effect
+        # add gene-conditioned prototype mean-effect (conditioned on alpha_t)
+        b_proto, _, _ = self.proto(target_idx, meta=None, external_alpha=alpha_t)   # (B,G), (B,), (B,64)
         y = y + b_proto
         # Preserve Step-0 at the target: y_t := x0_t
         freeze_mask = (target_idx >= 0)
@@ -365,7 +372,7 @@ class GeneMPNN(nn.Module):
             rows = torch.arange(B, device=device)[freeze_mask]
             cols = target_idx[freeze_mask]
             y[rows, cols] = x0[rows, cols]
-        return y, x0  # return x0 for optional locality loss
+        return y, x0, alpha_t
 
 # ----------------------------
 # Losses
@@ -419,9 +426,9 @@ def train(
     epochs: int = 10,
     batch_size: int = 64,
     lr: float = 1e-3,
-    weight_target: float = 0.1,
+    weight_target: float = 0.2,
     weight_local: float = 0.0,
-    weight_mse: float = 1.0,
+    weight_mse: float = 0.0,
     weight_proto: float = 0.2,
     seed: int = 0,
     tau: float = 0.0,
@@ -477,7 +484,6 @@ def train(
     # Build stable mapping from label -> embedding row
     pert_names_unique = sorted(set(labels.tolist()))
     pert2row = {p: i for i, p in enumerate(pert_names_unique)}
-    num_perts = len(pert_names_unique)
 
     ctrl_mean_np = X[ctrl_mask].mean(axis=0).astype(np.float32)
     ctrl_mean = torch.from_numpy(ctrl_mean_np).to(device)
@@ -485,7 +491,7 @@ def train(
     # Model
     # If a prior is provided, tell the model its input prior dimension for the projector
     prior_dim = W_meta.shape[0] if W_meta is not None else None
-    model = GeneMPNN(G=G, hidden=hidden, T=T, tau=tau, num_perts=num_perts, prior_dim=prior_dim).to(device)
+    model = GeneMPNN(G=G, hidden=hidden, T=T, tau=tau, prior_dim=prior_dim).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
     # Optionally initialize node embeddings from prior
@@ -558,7 +564,7 @@ def train(
 
             # per-sample perturbation row indices for embedding / FiLM
             pert_rowidx = torch.tensor([pert2row[t] for t in btargets], dtype=torch.long, device=device)
-            yhat, x0 = model(bx_ctrl, tidx, A_base, pert_rowidx=pert_rowidx)
+            yhat, x0, alpha_vec = model(bx_ctrl, tidx, A_base, pert_rowidx=pert_rowidx)
 
             # --- Prototype / bulk-delta loss (aligns to PDS) ---
             # Group rows by perturbation label in this batch
@@ -590,8 +596,19 @@ def train(
                 loss_proto = loss_proto / groups
 
             loss_mse = mse_loss(yhat - x0, bx_pert - x0)
-            loss_t = target_consistency_loss(yhat, bx_ctrl, tidx, mode="knockdown", margin=0.0)
             loss_loc = locality_damping(yhat, x0, tidx, weight=1.0) if weight_local > 0 else yhat.new_tensor(0.0)
+
+            # --- Efficacy supervision (repurpose "target" loss): per-cell estimate in counts space ---
+            loss_t = yhat.new_tensor(0.0)
+            if (tidx >= 0).any():
+                mask = (tidx >= 0)
+                rows = torch.arange(tidx.numel(), device=yhat.device)[mask]
+                cols = tidx[mask]
+                # counts for target gene in matched control vs perturbed cell
+                ctrl_cnt = torch.expm1(bx_ctrl[rows, cols].clamp_min(0.0))
+                pert_cnt = torch.expm1(bx_pert[rows, cols].clamp_min(0.0))
+                true_alpha = (1.0 - pert_cnt / (ctrl_cnt + 1e-8)).clamp(0.0, 1.0)
+                loss_t = F.mse_loss(alpha_vec[mask], true_alpha)
 
             # --- Distribution loss on per-perturbation deltas (optional) ---
             loss_dist = yhat.new_tensor(0.0)
@@ -749,7 +766,7 @@ def predict_all_perturbations(
         tidx = torch.tensor([t2gi.get(p, -1) for p in pert_names[start:end]], dtype=torch.long, device=device)
         pert_rowidx = torch.tensor([pert2row[p] for p in pert_names[start:end]], dtype=torch.long, device=device)
 
-        yhat, _ = model(bx_ctrl, tidx, A_base, pert_rowidx=pert_rowidx)
+        yhat, _, _ = model(bx_ctrl, tidx, A_base, pert_rowidx=pert_rowidx)
         pred_mat[b_idx] = yhat.detach().cpu().numpy()
 
     return pred_mat, true_mat, pert_names, ctrl_mean, pert_idx
