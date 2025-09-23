@@ -691,8 +691,10 @@ def train(
                 if t >= 0:
                     mask = torch.ones_like(d_pred, dtype=torch.bool)
                     mask[t] = False
-                d_pred = (yhat[idx].mean(dim=0) - ctrl_mean)    # (G,)
-                d_true = (bx_pert[idx].mean(dim=0) - ctrl_mean) # (G,)
+                # Use the group's own control mean for this batch (crucial in Stage-1)
+                ctrl_mean_grp = bx_ctrl[idx].mean(dim=0)        # (G,)
+                d_pred = (yhat[idx].mean(dim=0) - ctrl_mean_grp)
+                d_true = (bx_pert[idx].mean(dim=0) - ctrl_mean_grp)
                 if pretrain_mode:
                     # mask missing genes from external pseudobulk: NaN or -1 placeholders
                     mnan = torch.isnan(d_true)
@@ -799,7 +801,7 @@ def train(
 
         denom = max(steps_per_epoch, 1)
         do_print = True
-        if pretrain_mode and epoch != 1 and epoch % 5 != 0 and epoch != epochs:
+        if pretrain_mode and epoch != 1 and epoch % 20 != 0 and epoch != epochs:
             do_print = False
         if do_print:
             print(f"[epoch {epoch:03d}] "
@@ -1119,6 +1121,7 @@ def main():
 
     adata = ad.read_h5ad(args.in_h5ad)
     if args.use_pseudobulk:
+        args.batch_size = 1  # enforce single-row batches
         adata = collapse_to_pseudobulk(adata, args.target_label)
     sc.pp.normalize_total(adata, inplace=True)
     sc.pp.log1p(adata)
@@ -1187,7 +1190,7 @@ def main():
             hidden=args.hidden,
             T=args.T,
             epochs=args.pretrain_epochs,
-            batch_size=args.batch_size,
+            batch_size=1,
             lr=args.lr,
             weight_target=args.weight_target,     # keep α supervision for gene perts
             weight_local=0.0,
