@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # gnn_fit_panel.py
+from email import parser
 import argparse, math, os, sys, random
 from typing import Tuple, Dict, List
 import numpy as np
@@ -207,20 +208,21 @@ class PrototypeGenerator(nn.Module):
       - maps e_t to a prototype mean-effect vector b_t in R^G
       - predicts a Step-0 efficacy alpha_t in (0,1) from e_t (and optional meta covariates)
     """
-    def __init__(self, G: int, d: int = 64):
+    def __init__(self, G: int, d: int = 64, extra_cond_dim: int = 0):
         super().__init__()
         self.E = nn.Embedding(G, d)
         nn.init.normal_(self.E.weight, std=0.02)
-        # MLP to produce a hidden code from [e_t, alpha]
+        # MLP to produce a hidden code from [e_t, alpha, (optional z_d, z_ct)]
         self.phi = nn.Sequential(
-            nn.Linear(d + 1, d), nn.SiLU(),
+            nn.Linear(d + 1 + extra_cond_dim, d), nn.SiLU(),
             nn.Linear(d, d), nn.SiLU(),
         )
         self.W_out = nn.Linear(d, G, bias=False)
         # kept for backward-compat; may not be used when external alpha is provided
         self.alpha_head = nn.Sequential(nn.Linear(d, d), nn.SiLU(), nn.Linear(d, 1))
 
-    def forward(self, target_idx: torch.LongTensor, meta: torch.Tensor | None = None, external_alpha: torch.Tensor | None = None):
+    def forward(self, target_idx: torch.LongTensor, meta: torch.Tensor | None = None, 
+                external_alpha: torch.Tensor | None = None, z_extra: torch.Tensor | None = None):
         """
         target_idx: (B,) gene indices (>=0); if -1, we still produce something but it won't be used.
         meta: optional (B, M) covariates; ignored in this minimal version.
@@ -232,8 +234,11 @@ class PrototypeGenerator(nn.Module):
         e_t = self.E(torch.clamp(target_idx, min=0))    # (B,d)
         alpha = (torch.sigmoid(self.alpha_head(e_t)).squeeze(-1)
                  if external_alpha is None else external_alpha)       # (B,)
-        # Nonlinear conditioning on efficacy: concat and pass through phi
-        z = torch.cat([e_t, alpha.unsqueeze(-1)], dim=-1)             # (B,d+1)
+        # Nonlinear conditioning on efficacy (+ optional dataset/celltype embedding)
+        if z_extra is None:
+            z = torch.cat([e_t, alpha.unsqueeze(-1)], dim=-1)         # (B,d+1)
+        else:
+            z = torch.cat([e_t, alpha.unsqueeze(-1), z_extra], dim=-1) # (B,d+1+extra)
         h = self.phi(z)                                               # (B,d)
         b = self.W_out(h)                                             # (B,G)
         return b, alpha, e_t
@@ -272,7 +277,8 @@ class MPNNLayer(nn.Module):
         return h_out
 
 class GeneMPNN(nn.Module):
-    def __init__(self, G: int, hidden: int = 128, T: int = 2, tau: float = 0.0, alpha_cap: float = 1.0, prior_dim: int | None = None):
+    def __init__(self, G: int, hidden: int = 128, T: int = 2, tau: float = 0.0, alpha_cap: float = 1.0, prior_dim: int | None = None,
+                 dset_vocab: int = 0, dset_dim: int = 0, ct_vocab: int = 0, ct_dim: int = 0):
         super().__init__()
         self.G = G
         self.hidden = hidden
@@ -288,13 +294,19 @@ class GeneMPNN(nn.Module):
         self.embed = nn.Linear(1 + self.node_dim, hidden)
         self.layers = nn.ModuleList([MPNNLayer(hidden) for _ in range(T)])
         self.readout = nn.Linear(hidden, 1)
+        # Optional dataset/cell-type embeddings
+        self.dset_E = nn.Embedding(dset_vocab, dset_dim) if dset_vocab > 0 and dset_dim > 0 else None
+        self.ct_E   = nn.Embedding(ct_vocab,   ct_dim)   if ct_vocab   > 0 and ct_dim   > 0 else None
+        extra_cond_dim = (dset_dim if self.dset_E is not None else 0) + (ct_dim if self.ct_E is not None else 0)
+        # FiLM will see [e_t, alpha, (z_d), (z_ct)]
+        self.film_gamma = nn.Linear(self.node_dim + 1 + extra_cond_dim, hidden)
+        self.film_beta  = nn.Linear(self.node_dim + 1 + extra_cond_dim, hidden)
+        # Step-0 head: predict efficiency and apply the clamp
+        self.step0_head = Step0Head(tau=tau, d=self.node_dim)
         # gene-conditioned prototype & alpha; FiLM from gene embedding
-        self.proto = PrototypeGenerator(G=G, d=64)
+        self.proto = PrototypeGenerator(G=G, d=self.node_dim, extra_cond_dim=extra_cond_dim)
         # Tie prototype embedding to the node embedding so both share the same e_t
         self.proto.E = self.node_E
-        self.film_gamma = nn.Linear(self.node_dim + 1, hidden)  # +1 for alpha_t
-        self.film_beta  = nn.Linear(self.node_dim + 1, hidden)
-        self.step0_head = Step0Head(tau=tau, d=self.node_dim)
 
     @torch.no_grad()
     def init_from_prior(self, W_meta: torch.Tensor):
@@ -308,7 +320,8 @@ class GeneMPNN(nn.Module):
         E0 = self.prior_proj(W_meta.T)  # (G, node_dim)
         self.node_E.weight.copy_(E0)
 
-    def forward(self, x_ctrl: torch.Tensor, target_idx: torch.Tensor, A_base: torch.Tensor, pert_rowidx: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, x_ctrl: torch.Tensor, target_idx: torch.Tensor, A_base: torch.Tensor, pert_rowidx: torch.Tensor = None,
+                dset_idx: torch.Tensor | None = None, ct_idx: torch.Tensor | None = None) -> torch.Tensor:
         """
         x_ctrl: (B,G)
         target_idx: (B,) int tensor with -1 where unknown
@@ -323,7 +336,12 @@ class GeneMPNN(nn.Module):
         # hand mean alpha to the head if we have it
         if hasattr(self, "alpha_mean_train"):
             self.step0_head.alpha_mean_train = self.alpha_mean_train
-        x0, alpha_t = self.step0_head(x_ctrl, target_idx, e_t, alpha_cap=self.alpha_cap)
+        # For non-gene perts (target_idx == -1), skip clamp and set alpha=0
+        if (target_idx >= 0).any():
+            x0, alpha_t = self.step0_head(x_ctrl, target_idx, e_t, alpha_cap=self.alpha_cap)
+        else:
+            x0 = x_ctrl
+            alpha_t = torch.zeros(x_ctrl.size(0), device=x_ctrl.device)
 
         # Initial hidden state (shared 1->hidden linear applied per gene)
         # assemble per-node embeddings for all genes
@@ -332,7 +350,15 @@ class GeneMPNN(nn.Module):
         x_in = torch.cat([x0.unsqueeze(-1), node_feats], dim=-1)         # (B,G,1+node_dim)
         h = self.embed(x_in)
         # FiLM conditions on both the identity (e_t) and strength (alpha_t) of the hit
-        e_aug = torch.cat([e_t, alpha_t.unsqueeze(-1)], dim=-1)       # (B,65)
+        # Gather optional conditioning from dataset / cell-type
+        z_list = []
+        if self.dset_E is not None and dset_idx is not None:
+            z_list.append(self.dset_E(dset_idx))                      # (B, dset_dim)
+        if self.ct_E is not None and ct_idx is not None:
+            z_list.append(self.ct_E(ct_idx))                          # (B, ct_dim)
+        z_extra = torch.cat(z_list, dim=-1) if len(z_list) > 0 else None
+        # FiLM conditions on [e_t, alpha_t, (z_d), (z_ct)]
+        e_aug = torch.cat([e_t, alpha_t.unsqueeze(-1)], dim=-1) if z_extra is None else torch.cat([e_t, alpha_t.unsqueeze(-1), z_extra], dim=-1)
         gamma = torch.tanh(self.film_gamma(e_aug)).unsqueeze(1)       # (B,1,H)
         beta  = self.film_beta(e_aug).unsqueeze(1)                    # (B,1,H)
         h = h * (1 + gamma) + beta
@@ -363,8 +389,8 @@ class GeneMPNN(nn.Module):
 
         # Readout back to expression space
         y = self.readout(h).squeeze(-1)  # (B,G)
-        # add gene-conditioned prototype mean-effect (conditioned on alpha_t)
-        b_proto, _, _ = self.proto(target_idx, meta=None, external_alpha=alpha_t)   # (B,G), (B,), (B,64)
+        # add gene-conditioned prototype mean-effect (now nonlinear in alpha_t and optional z_extra)
+        b_proto, _, _ = self.proto(target_idx, meta=None, external_alpha=alpha_t, z_extra=z_extra)
         y = y + b_proto
         # Preserve Step-0 at the target: y_t := x0_t
         freeze_mask = (target_idx >= 0)
@@ -439,12 +465,14 @@ def train(
     knn_metric: str = "l2",  # or "cosine"
     dist_loss: str = "mmd",  # or "swd" or "energy"
     swd_projections: int = 128,
-    dist_weight: float = 1.0,
+    weight_dist: float = 1.0,
     single_pert_batches: bool = False,
     W_meta: np.ndarray | None = None,
     init_from_meta: bool = False,
     weight_prior: float = 0.0,
     meta_topk: int = 0,
+    model: nn.Module | None = None,
+    pretrain_mode: bool = False,
 ):
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
@@ -488,16 +516,31 @@ def train(
     ctrl_mean_np = X[ctrl_mask].mean(axis=0).astype(np.float32)
     ctrl_mean = torch.from_numpy(ctrl_mean_np).to(device)
 
-    # Model
-    # If a prior is provided, tell the model its input prior dimension for the projector
-    prior_dim = W_meta.shape[0] if W_meta is not None else None
-    model = GeneMPNN(G=G, hidden=hidden, T=T, tau=tau, prior_dim=prior_dim).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    # Dataset / cell-type categorical codes (only if present; safe to ignore otherwise)
+    dset_codes = None
+    ct_codes = None
+    if "dataset_id" in adata.obs.columns:
+        dset_codes = pd.Categorical(adata.obs["dataset_id"]).codes.astype(np.int64)
+    if "cell_type" in adata.obs.columns:
+        ct_col = adata.obs["cell_type"]
+        # Casting to str avoids Categorical fillna errors for unseen categories
+        if isinstance(ct_col.dtype, pd.CategoricalDtype):
+            ct_col = ct_col.astype(str)
+        else:
+            ct_col = ct_col.astype(str)
+        # Normalize missing/mixed to UNK
+        ct_vals = ct_col.replace({"<NA>": "UNK", "mixed": "UNK"}).fillna("UNK")
+        ct_codes = pd.Categorical(ct_vals).codes.astype(np.int64)
 
-    # Optionally initialize node embeddings from prior
-    if (W_meta is not None) and init_from_meta:
-        Wm_torch = torch.from_numpy(W_meta.astype(np.float32)).to(device)  # (R,G)
-        model.init_from_prior(Wm_torch)
+    # Model (reuse if provided)
+    if model is None:
+        prior_dim = W_meta.shape[0] if W_meta is not None else None
+        model = GeneMPNN(G=G, hidden=hidden, T=T, tau=tau, prior_dim=prior_dim).to(device)
+        # Optionally initialize node embeddings from prior
+        if (W_meta is not None) and init_from_meta:
+            Wm_torch = torch.from_numpy(W_meta.astype(np.float32)).to(device)  # (R,G)
+            model.init_from_prior(Wm_torch)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
     # Base adjacency: either dense (as before) or prior-based top-k cosine graph
     if (W_meta is not None) and (meta_topk > 0):
@@ -526,6 +569,16 @@ def train(
     # Simple schedule
     steps_per_epoch = math.ceil(pert_mask.sum() / batch_size)
 
+    # Stage-1: build per-dataset control pseudobulks (if available)
+    ctrl_by_dset = None
+    if pretrain_mode and ("dataset_id" in adata.obs.columns):
+        ctrl_by_dset = {}
+        dsets = adata.obs["dataset_id"].astype(str).values
+        for d in sorted(set(dsets)):
+            m = (labels == control_label) & (dsets == d)
+            if m.any():
+                ctrl_by_dset[d] = X[m].mean(axis=0).astype(np.float32)
+
     for epoch in range(1, epochs + 1):
         model.train()
         running = {"mse": 0.0, "targ": 0.0, "loc": 0.0, "proto": 0.0, "dist": 0.0, "prior": 0.0, "tot": 0.0}
@@ -535,7 +588,30 @@ def train(
             if single_pert_batches:
                 fixed_label = rng.choice(np.array(pert_unique)) if len(pert_unique) > 0 else None
 
-            if match_controls == "knn":
+            if pretrain_mode and (ctrl_by_dset is not None):
+                # --- Stage-1 pseudobulk controls: match control by dataset_id, not by sampling ---
+                # choose perturbed rows for this batch
+                if fixed_label is None:
+                    pert_idx = np.where(labels != control_label)[0]
+                else:
+                    pert_idx = np.where(labels == fixed_label)[0]
+                if len(pert_idx) < batch_size:
+                    sel_pert = rng.choice(pert_idx, size=batch_size, replace=True)
+                else:
+                    sel_pert = rng.choice(pert_idx, size=batch_size, replace=False)
+                bx_pert = torch.from_numpy(X[sel_pert]).float()
+                # build per-row control vector from the SAME dataset; fallback to global control mean
+                dsets = adata.obs["dataset_id"].astype(str).values
+                bx_ctrl_rows = []
+                for j in sel_pert:
+                    dj = dsets[j]
+                    if (dj in ctrl_by_dset):
+                        bx_ctrl_rows.append(ctrl_by_dset[dj])
+                    else:
+                        bx_ctrl_rows.append(ctrl_mean_np)
+                bx_ctrl = torch.from_numpy(np.stack(bx_ctrl_rows, axis=0)).float()
+                btargets = labels[sel_pert].tolist()
+            elif match_controls == "knn":
                 # lazily build cosine norms if requested
                 if knn_metric == "cosine":
                     if pre_norm_ctrl is None:
@@ -562,9 +638,36 @@ def train(
             bx_pert = bx_pert.to(device)
             tidx = tidx.to(device)
 
+            # dataset / cell-type indices pulled from the SAME rows as bx_pert
+            z_d, z_ct = None, None
+            # identify the row indices that produced bx_pert
+            if 'sel_pert' in locals():           # pretrain_mode branch (or random sampler)
+                idx_rows = np.asarray(sel_pert, dtype=int)
+            elif 'pert_rowidx' in locals() and pert_rowidx is not None:
+                # KNN sampler should provide these indices (may be a CUDA tensor)
+                if torch.is_tensor(pert_rowidx):
+                    idx_rows = pert_rowidx.detach().cpu().numpy().astype(int)
+                else:
+                    idx_rows = np.asarray(pert_rowidx, dtype=int)
+            else:
+                idx_rows = None
+            if idx_rows is not None:
+                if "dataset_id" in adata.obs.columns:
+                    z_d = torch.tensor(pd.Categorical(adata.obs.iloc[idx_rows]["dataset_id"]).codes,
+                                        device=device)
+                if "cell_type" in adata.obs.columns:
+                    ct_slice = adata.obs.iloc[idx_rows]["cell_type"]
+                    # Cast to str before fill/replace to avoid Categorical category errors
+                    if isinstance(ct_slice.dtype, pd.CategoricalDtype):
+                        ct_slice = ct_slice.astype(str)
+                    else:
+                        ct_slice = ct_slice.astype(str)
+                    ct_slice = ct_slice.replace({"<NA>": "UNK", "mixed": "UNK"}).fillna("UNK")
+                    z_ct = torch.tensor(pd.Categorical(ct_slice).codes, device=device)
+
             # per-sample perturbation row indices for embedding / FiLM
             pert_rowidx = torch.tensor([pert2row[t] for t in btargets], dtype=torch.long, device=device)
-            yhat, x0, alpha_vec = model(bx_ctrl, tidx, A_base, pert_rowidx=pert_rowidx)
+            yhat, x0, alpha_vec = model(bx_ctrl, tidx, A_base, pert_rowidx=pert_rowidx, dset_idx=z_d, ct_idx=z_ct)
 
             # --- Prototype / bulk-delta loss (aligns to PDS) ---
             # Group rows by perturbation label in this batch
@@ -590,12 +693,21 @@ def train(
                     mask[t] = False
                 d_pred = (yhat[idx].mean(dim=0) - ctrl_mean)    # (G,)
                 d_true = (bx_pert[idx].mean(dim=0) - ctrl_mean) # (G,)
-                loss_proto = loss_proto + torch.mean(torch.abs(d_pred - d_true))
+                if pretrain_mode:
+                    # mask missing genes from external pseudobulk: NaN or -1 placeholders
+                    mnan = torch.isnan(d_true)
+                    mneg1 = (d_true == -1)
+                    mask_cols = ~(mnan | mneg1)
+                    if mask_cols.any():
+                        loss_proto = loss_proto + torch.mean(torch.abs(d_pred[mask_cols] - d_true[mask_cols]))
+                else:
+                    loss_proto = loss_proto + torch.mean(torch.abs(d_pred - d_true))
                 groups += 1
             if groups > 0:
                 loss_proto = loss_proto / groups
 
-            loss_mse = mse_loss(yhat - x0, bx_pert - x0)
+            # In Stage-1 pretraining, pseudobulk may contain NaNs/-1 for missing genes; skip MSE entirely.
+            loss_mse = (yhat - x0).new_tensor(0.0) if pretrain_mode else mse_loss(yhat - x0, bx_pert - x0)
             loss_loc = locality_damping(yhat, x0, tidx, weight=1.0) if weight_local > 0 else yhat.new_tensor(0.0)
 
             # --- Efficacy supervision (repurpose "target" loss): per-cell estimate in counts space ---
@@ -612,7 +724,7 @@ def train(
 
             # --- Distribution loss on per-perturbation deltas (optional) ---
             loss_dist = yhat.new_tensor(0.0)
-            if dist_loss != "none":
+            if (not pretrain_mode) and (dist_loss != "none"):
                 from collections import defaultdict
                 by_lbl = defaultdict(list)
                 for i, lbl in enumerate(btargets):
@@ -641,7 +753,7 @@ def train(
                 if n_groups > 0:
                     loss_dist = loss_dist / n_groups
 
-            # Optional proximity loss: keep node_E near projected prior (Phase 1 adaptation)
+            # Optional proximity loss: keep node_E near projected prior
             loss_prior = yhat.new_tensor(0.0)
             if (weight_prior > 0.0) and (W_meta is not None) and (model.prior_proj is not None):
                 # compute current projected prior: (G,node_dim)
@@ -650,11 +762,24 @@ def train(
                 E_prior = model.prior_proj(Wm_torch.T)  # (G,node_dim)
                 loss_prior = F.mse_loss(model.node_E.weight, E_prior)
 
+            if weight_mse == 0.0:
+                loss_mse = loss_mse * 0.0
+            if weight_target == 0.0:
+                loss_t = loss_t * 0.0
+            if weight_local == 0.0:
+                loss_loc = loss_loc * 0.0
+            if weight_proto == 0.0:
+                loss_proto = loss_proto * 0.0
+            if weight_dist == 0.0:
+                loss_dist = loss_dist * 0.0
+            if weight_prior == 0.0:
+                loss_prior = loss_prior * 0.0
+
             loss = weight_mse * loss_mse \
                  + weight_target * loss_t \
                  + weight_local * loss_loc \
                  + weight_proto * loss_proto \
-                 + dist_weight * loss_dist \
+                 + weight_dist * loss_dist \
                  + weight_prior * loss_prior
 
             # loss = loss_mse + weight_target * loss_t + weight_local * loss_loc + w_proto * loss_proto
@@ -673,7 +798,10 @@ def train(
             running["tot"]  += float(loss.item())
 
         denom = max(steps_per_epoch, 1)
-        if epoch > 0:  # epoch % 5 == 0 or epoch == 1 or epoch == epochs:
+        do_print = True
+        if pretrain_mode and epoch != 1 and epoch % 5 != 0 and epoch != epochs:
+            do_print = False
+        if do_print:
             print(f"[epoch {epoch:03d}] "
                 f"mse={running['mse']/denom:.5f}  "
                 f"targ={running['targ']/denom:.5f}  "
@@ -960,7 +1088,7 @@ def main():
                     help="Optional path to a separate test AnnData. If set, overrides --test_pct_perts.")
     ap.add_argument("--dist_loss", choices=["none","mmd","swd","energy"], default="mmd",
                     help="Distribution loss between predicted and true deltas per perturbation.")
-    ap.add_argument("--dist_weight", type=float, default=1.0, help="Weight for distribution loss.")
+    ap.add_argument("--weight_dist", type=float, default=1.0, help="Weight for distribution loss.")
     ap.add_argument("--swd_projections", type=int, default=128, help="Num random projections for SWD.")
     ap.add_argument("--single_pert_batches", action="store_true",
                     help="If set, each batch contains cells from a single perturbation label.")
@@ -972,6 +1100,20 @@ def main():
                     help="L2 proximity loss weight to keep node embeddings near the projected pathway prior (Phase 1).")
     ap.add_argument("--meta_topk", type=int, default=0,
                     help="If >0, build a top-k cosine kNN adjacency from the pathway prior instead of dense A.")
+    ap.add_argument("--pretrain_pseudobulk", type=str, default="",
+                    help="Path to a pseudobulk .h5ad for Stage-1 pretraining; empty = skip Stage-1")
+    ap.add_argument("--pretrain_epochs", type=int, default=10,
+                    help="Epochs to run Stage-1 pseudobulk pretraining")
+    ap.add_argument("--use_dset_embed", action="store_true",
+                    help="Enable dataset_id embeddings (used in FiLM/proto conditioning)")
+    ap.add_argument("--use_celltype_embed", action="store_true",
+                    help="Enable cell_type embeddings (used in FiLM/proto conditioning)")
+    ap.add_argument("--dset_embed_dim", type=int, default=16,
+                    help="Dimensionality of dataset embedding (if enabled)")
+    ap.add_argument("--ct_embed_dim", type=int, default=16,
+                    help="Dimensionality of cell_type embedding (if enabled)")
+    ap.add_argument("--missing_gene_fill", type=str, default="nan", choices=["nan", "-1"],
+                        help="Placeholder used in pseudobulk for missing genes; masked in Stage-1 losses")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 
@@ -1027,7 +1169,48 @@ def main():
         W_meta = np.load(args.meta_path)
         assert W_meta.ndim == 2 and W_meta.shape[1] == adata_train.n_vars, \
             f"M_meta shape mismatch: got {W_meta.shape}, expected (R,{adata_train.n_vars}) aligned to var_names."
+        
+    # Optional Stage-1: pseudobulk pretraining (reuses the same train() loop)
+    model = None
+    if args.pretrain_pseudobulk:
+        print(f"=== Stage-1: pretraining on pseudobulk {args.pretrain_pseudobulk} ===")
+        pb = ad.read_h5ad(args.pretrain_pseudobulk)
+        sc.pp.normalize_total(pb, inplace=True)
+        sc.pp.log1p(pb)
+        assert list(pb.var_names) == list(adata_train.var_names), "Pseudobulk genes/order must match target dataset."
+        # (optional) light normalization if needed; skip if your pseudobulk is already normalized/log1p
+        # sc.pp.normalize_total(pb, inplace=True); sc.pp.log1p(pb)
+        model = train(
+            adata=pb,
+            target_label=args.target_label,
+            control_label=args.control_label,
+            hidden=args.hidden,
+            T=args.T,
+            epochs=args.pretrain_epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            weight_target=args.weight_target,     # keep α supervision for gene perts
+            weight_local=0.0,
+            seed=args.seed,
+            tau=args.tau,
+            device=args.device,
+            match_controls="random",              # ignored in pretrain_mode due to per-dataset controls
+            knn_k=args.knn_k,
+            knn_temp=args.knn_temp,
+            knn_metric=args.knn_metric,
+            dist_loss="none",                     # no distribution loss in Stage-1
+            weight_dist=0.0,
+            swd_projections=args.swd_projections,
+            single_pert_batches=False,
+            W_meta=W_meta,
+            init_from_meta=args.init_from_meta,
+            weight_prior=args.weight_prior,
+            meta_topk=args.meta_topk,
+            model=None,
+            pretrain_mode=True,
+        )
 
+    print(f"=== Stage-2: training on {'train+test' if adata_test is not None else 'train'} set ===")
     model = train(
         adata=adata_train,
         target_label=args.target_label,
@@ -1047,13 +1230,15 @@ def main():
         knn_temp=args.knn_temp,
         knn_metric=args.knn_metric,
         dist_loss=args.dist_loss,
-        dist_weight=args.dist_weight,
+        weight_dist=args.weight_dist,
         swd_projections=args.swd_projections,
         single_pert_batches=args.single_pert_batches,
         W_meta=W_meta,
         init_from_meta=args.init_from_meta,
         weight_prior=args.weight_prior,
         meta_topk=args.meta_topk,
+        model=model,  # continue from Stage-1 if done
+        pretrain_mode=False,
     )
 
     # Evaluate: external test if provided, else held-out split, else train split
