@@ -23,6 +23,7 @@ import os
 import sys
 import hashlib
 from typing import Dict, Tuple, Optional
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
@@ -86,6 +87,9 @@ def main():
     cell_val: Dict[Tuple[str, Optional[int], Optional[str]], Optional[str]] = {}
     cell_mixed: Dict[Tuple[str, Optional[int], Optional[str]], bool] = {}
 
+    # round-robin shard pointer per perturbation (optionally per-strata if you ever add that)
+    rr_next = defaultdict(int)
+
     # Helper: decide group key for each row in a chunk's obs
     def row_to_group(row: pd.Series) -> Tuple[str, Optional[int], Optional[str]]:
         # Determine perturbation label name
@@ -106,9 +110,12 @@ def main():
             val = row.get(args.stratify_by, None)
             strata = str(val) if val is not None else "NA"
         elif args.semi_k and args.semi_k > 0:
-            # deterministic hash shard by global cell_id
-            cid = str(row.get("cell_id", ""))
-            shard = stable_hash_to_int(cid) % int(args.semi_k)
+            # simple per-perturbation round-robin sharding
+            k = int(args.semi_k)
+            base = (pert, strata)
+            idx = rr_next[base] % k
+            rr_next[base] = (rr_next[base] + 1) % k
+            shard = idx
 
         return (pert, shard, strata)
 
@@ -117,6 +124,7 @@ def main():
     for start in range(0, n_obs, args.chunk_rows):
         stop = min(start + args.chunk_rows, n_obs)
         sl = slice(start, stop)
+        print('Reading rows', start, 'to', stop, 'of', n_obs, file=sys.stderr)
 
         # Materialize and align this chunk to gene_list using your helper (handles obs from index)
         chunk = preprocess_chunk(
