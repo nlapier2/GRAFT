@@ -209,3 +209,70 @@ def prep_external_data(pb: ad.AnnData, target_label: str, control_label: str, ad
     # (rows with sum==0 remain zero; perfectly fine for Stage-1 since we mask missing genes)
     assert list(pb.var_names) == list(adata_train.var_names), "Pseudobulk genes/order must match target dataset."
     return pb
+
+def prep_pb_all(pb_target, adata_train, args):
+    pb_paths = []
+    pbs = []
+    pb_all = None
+    if pb_target is not None:
+        pbs.append(pb_target)
+    if args.pretrain_pseudobulk:
+        pb_paths.append(args.pretrain_pseudobulk)
+    if args.pretrain_pseudobulk_list:
+        with open(args.pretrain_pseudobulk_list, "r") as f:
+            for line in f:
+                s = line.strip()
+                if (not s) or s.startswith("#"):
+                    continue
+                pb_paths.append(s)
+
+    if len(pb_paths) > 0:
+        for p in pb_paths:
+            pb_i = ad.read_h5ad(p)
+            pb_i = prep_external_data(pb_i, args.target_label, args.control_label, adata_train)
+            pbs.append(pb_i)
+        # Concatenate all pseudobulk rows
+        pb_all = ad.concat(pbs, axis=0, join="outer", merge="same")
+        pb_all.obs = pb_all.obs.copy()  # ensure contiguous
+    return pb_all, len(pbs)
+
+def train_test_split(args, adata, pb_target):
+    # ---------------------------
+    # Train/Test setup
+    # If --test_h5ad is provided, use that file for evaluation and ignore --test_pct_perts.
+    # Otherwise, do the leave-perturbations-out split as before.
+    # ---------------------------
+    if args.test_h5ad:
+        print(f"=== Using external TEST set: {args.test_h5ad} (overrides --test_pct_perts) ===")
+        adata_train = adata
+        adata_test = ad.read_h5ad(args.test_h5ad)
+        # (Optional) apply the same pseudobulk collapse if requested
+        if args.use_pseudobulk:
+            adata_test = collapse_to_pseudobulk(adata_test, args.target_label)
+        sc.pp.normalize_total(adata_test, inplace=True)
+        sc.pp.log1p(adata_test)
+        if sparse.isspmatrix(adata_test.X) and not sparse.isspmatrix_csr(adata_test.X):
+            adata_test.X = adata_test.X.tocsr()  # nicer slicing, though we load to numpy anyway
+        # Sanity check: same genes / order (as guaranteed by user)
+        assert np.array_equal(adata_train.var_names.values, adata_test.var_names.values), \
+            "Train and test var_names differ or are out of order."
+        print(f"Train cells: {adata_train.n_obs}, Test cells: {adata_test.n_obs}")
+    else:
+        # Leave-perturbations-out split (previous behavior)
+        labels_all = adata.obs[args.target_label].astype(str).values
+        rng = np.random.default_rng(args.seed)
+        all_perts = sorted({lbl for lbl in labels_all if lbl != args.control_label})
+        n_test = int(round(args.test_pct_perts * len(all_perts)))
+        test_perts = set(rng.choice(np.array(all_perts), size=n_test, replace=False).tolist()) if n_test > 0 else set()
+        train_perts = [p for p in all_perts if p not in test_perts]
+        mask_train = adata.obs[args.target_label].isin([args.control_label] + train_perts)
+        adata_train = adata[mask_train].copy()
+        if pb_target is not None:  # also filter pseudobulk to training perts only
+            pb_target = pb_target[pb_target.obs[args.target_label].isin([args.control_label] + train_perts)].copy()
+        adata_test = adata[adata.obs[args.target_label].isin([args.control_label] + list(test_perts))].copy() if n_test > 0 else None
+        print("=== Split summary ===")
+        print(f"Total perts (excl. control): {len(all_perts)}  |  Held-out test perts: {len(test_perts)}")
+        if n_test > 0:
+            print(f"Test perts: {sorted(test_perts)[:10]}{' ...' if len(test_perts) > 10 else ''}")
+        print(f"Train cells: {adata_train.n_obs}, Test cells: {adata_test.n_obs if adata_test is not None else 0}")
+    return adata_train, adata_test, pb_target

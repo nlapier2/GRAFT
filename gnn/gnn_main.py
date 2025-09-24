@@ -13,8 +13,74 @@ from sklearn.metrics import pairwise_distances
 
 from models import GeneMPNN
 from losses import compute_distance_loss, mse_loss, target_efficacy_loss, locality_damping, prototype_loss, prior_loss
-from utils import to_numpy, build_target_to_gene_index, sample_minibatch, sample_minibatch_knn, make_base_adjacency, collapse_to_pseudobulk, make_pretrain_pseudobulk_from_adata, prep_external_data
+from utils import to_numpy, build_target_to_gene_index, sample_minibatch, sample_minibatch_knn, \
+                    make_base_adjacency, collapse_to_pseudobulk, make_pretrain_pseudobulk_from_adata, prep_external_data, \
+                    prep_pb_all, train_test_split
 
+
+def parse_arguments():
+    ap = argparse.ArgumentParser(description="Step0-aware MPNN to fit perturbed gene vectors on a small panel.")
+    ap.add_argument("--in_h5ad", required=True, help="Small input AnnData object.")
+    ap.add_argument("--out_pred_h5ad", type=str, default="",
+                    help="If set, write an AnnData with predictions for the evaluation split.")
+    ap.add_argument("--target_label", default="target_gene", help="obs column with perturbation labels.")
+    ap.add_argument("--control_label", default="non-targeting", help="label value for control cells.")
+    ap.add_argument("--hidden", type=int, default=128)
+    ap.add_argument("--T", type=int, default=2, help="Number of message-passing steps.")
+    ap.add_argument("--epochs", type=int, default=10)
+    ap.add_argument("--batch_size", type=int, default=64)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--weight_target", type=float, default=0.1)
+    ap.add_argument("--weight_local", type=float, default=0.0)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--tau", type=float, default=0.0, help="Step-0 anchor (e.g., 0.0 for CRISPRi).")
+    ap.add_argument("--use_pseudobulk", action="store_true",
+                    help="Collapse to one mean row per perturbation (incl. control).")
+    ap.add_argument("--match_controls", choices=["random", "knn"], default="knn",
+                    help="How to choose a control for each perturbed cell.")
+    ap.add_argument("--knn_k", type=int, default=32, help="Top-k controls to sample from.")
+    ap.add_argument("--knn_temp", type=float, default=0.1, help="Softmax temperature over distances.")
+    ap.add_argument("--knn_metric", choices=["l2", "cosine"], default="l2",
+                    help="Distance metric for kNN control matching.")
+    ap.add_argument("--test_pct_perts", type=float, default=0.0,
+                    help="Fraction of perturbation labels (excluding control) to hold out for testing. 0.0 = no holdout.")
+    ap.add_argument("--test_h5ad", type=str, default="",
+                    help="Optional path to a separate test AnnData. If set, overrides --test_pct_perts.")
+    ap.add_argument("--dist_loss", choices=["none","mmd","swd","energy"], default="mmd",
+                    help="Distribution loss between predicted and true deltas per perturbation.")
+    ap.add_argument("--weight_dist", type=float, default=1.0, help="Weight for distribution loss.")
+    ap.add_argument("--swd_projections", type=int, default=128, help="Num random projections for SWD.")
+    ap.add_argument("--single_pert_batches", action="store_true",
+                    help="If set, each batch contains cells from a single perturbation label.")
+    ap.add_argument("--meta_path", type=str, default="",
+                    help="Path to M_meta.npy produced by embed_pathways.py (shape R x G; columns aligned to var_names).")
+    ap.add_argument("--init_from_meta", action="store_true",
+                    help="If set, initialize node embeddings from the projected pathway prior.")
+    ap.add_argument("--weight_prior", type=float, default=0.0,
+                    help="L2 proximity loss weight to keep node embeddings near the projected pathway prior (Phase 1).")
+    ap.add_argument("--meta_topk", type=int, default=0,
+                    help="If >0, build a top-k cosine kNN adjacency from the pathway prior instead of dense A.")
+    ap.add_argument("--pretrain_pseudobulk", type=str, default="",
+                    help="Path to a pseudobulk .h5ad for Stage-1 pretraining; empty = skip Stage-1")
+    ap.add_argument("--pretrain_pseudobulk_list", type=str, default="",
+                        help="Text file with one pseudobulk .h5ad path per line; blank/comment lines ignored")
+    ap.add_argument("--include_target_pseudobulk", action="store_true",
+                        help="Also pseudobulk the target dataset and include it in Stage-1 pretraining")
+    ap.add_argument("--pretrain_epochs", type=int, default=10,
+                    help="Epochs to run Stage-1 pseudobulk pretraining")
+    ap.add_argument("--use_dset_embed", action="store_true",
+                    help="Enable dataset_id embeddings (used in FiLM/proto conditioning)")
+    ap.add_argument("--use_celltype_embed", action="store_true",
+                    help="Enable cell_type embeddings (used in FiLM/proto conditioning)")
+    ap.add_argument("--dset_embed_dim", type=int, default=16,
+                    help="Dimensionality of dataset embedding (if enabled)")
+    ap.add_argument("--ct_embed_dim", type=int, default=16,
+                    help="Dimensionality of cell_type embedding (if enabled)")
+    ap.add_argument("--missing_gene_fill", type=str, default="nan", choices=["nan", "-1"],
+                        help="Placeholder used in pseudobulk for missing genes; masked in Stage-1 losses")
+    ap.add_argument("--device", default="cuda")
+    args = ap.parse_args()
+    return args
 
 
 # ----------------------------
@@ -553,68 +619,11 @@ def evaluate_model(
 # CLI
 # ----------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Step0-aware MPNN to fit perturbed gene vectors on a small panel.")
-    ap.add_argument("--in_h5ad", required=True, help="Small input AnnData object.")
-    ap.add_argument("--out_pred_h5ad", type=str, default="",
-                    help="If set, write an AnnData with predictions for the evaluation split.")
-    ap.add_argument("--target_label", default="target_gene", help="obs column with perturbation labels.")
-    ap.add_argument("--control_label", default="non-targeting", help="label value for control cells.")
-    ap.add_argument("--hidden", type=int, default=128)
-    ap.add_argument("--T", type=int, default=2, help="Number of message-passing steps.")
-    ap.add_argument("--epochs", type=int, default=10)
-    ap.add_argument("--batch_size", type=int, default=64)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--weight_target", type=float, default=0.1)
-    ap.add_argument("--weight_local", type=float, default=0.0)
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--tau", type=float, default=0.0, help="Step-0 anchor (e.g., 0.0 for CRISPRi).")
-    ap.add_argument("--use_pseudobulk", action="store_true",
-                    help="Collapse to one mean row per perturbation (incl. control).")
-    ap.add_argument("--match_controls", choices=["random", "knn"], default="knn",
-                    help="How to choose a control for each perturbed cell.")
-    ap.add_argument("--knn_k", type=int, default=32, help="Top-k controls to sample from.")
-    ap.add_argument("--knn_temp", type=float, default=0.1, help="Softmax temperature over distances.")
-    ap.add_argument("--knn_metric", choices=["l2", "cosine"], default="l2",
-                    help="Distance metric for kNN control matching.")
-    ap.add_argument("--test_pct_perts", type=float, default=0.0,
-                    help="Fraction of perturbation labels (excluding control) to hold out for testing. 0.0 = no holdout.")
-    ap.add_argument("--test_h5ad", type=str, default="",
-                    help="Optional path to a separate test AnnData. If set, overrides --test_pct_perts.")
-    ap.add_argument("--dist_loss", choices=["none","mmd","swd","energy"], default="mmd",
-                    help="Distribution loss between predicted and true deltas per perturbation.")
-    ap.add_argument("--weight_dist", type=float, default=1.0, help="Weight for distribution loss.")
-    ap.add_argument("--swd_projections", type=int, default=128, help="Num random projections for SWD.")
-    ap.add_argument("--single_pert_batches", action="store_true",
-                    help="If set, each batch contains cells from a single perturbation label.")
-    ap.add_argument("--meta_path", type=str, default="",
-                    help="Path to M_meta.npy produced by embed_pathways.py (shape R x G; columns aligned to var_names).")
-    ap.add_argument("--init_from_meta", action="store_true",
-                    help="If set, initialize node embeddings from the projected pathway prior.")
-    ap.add_argument("--weight_prior", type=float, default=0.0,
-                    help="L2 proximity loss weight to keep node embeddings near the projected pathway prior (Phase 1).")
-    ap.add_argument("--meta_topk", type=int, default=0,
-                    help="If >0, build a top-k cosine kNN adjacency from the pathway prior instead of dense A.")
-    ap.add_argument("--pretrain_pseudobulk", type=str, default="",
-                    help="Path to a pseudobulk .h5ad for Stage-1 pretraining; empty = skip Stage-1")
-    ap.add_argument("--pretrain_pseudobulk_list", type=str, default="",
-                        help="Text file with one pseudobulk .h5ad path per line; blank/comment lines ignored")
-    ap.add_argument("--include_target_pseudobulk", action="store_true",
-                        help="Also pseudobulk the target dataset and include it in Stage-1 pretraining")
-    ap.add_argument("--pretrain_epochs", type=int, default=10,
-                    help="Epochs to run Stage-1 pseudobulk pretraining")
-    ap.add_argument("--use_dset_embed", action="store_true",
-                    help="Enable dataset_id embeddings (used in FiLM/proto conditioning)")
-    ap.add_argument("--use_celltype_embed", action="store_true",
-                    help="Enable cell_type embeddings (used in FiLM/proto conditioning)")
-    ap.add_argument("--dset_embed_dim", type=int, default=16,
-                    help="Dimensionality of dataset embedding (if enabled)")
-    ap.add_argument("--ct_embed_dim", type=int, default=16,
-                    help="Dimensionality of cell_type embedding (if enabled)")
-    ap.add_argument("--missing_gene_fill", type=str, default="nan", choices=["nan", "-1"],
-                        help="Placeholder used in pseudobulk for missing genes; masked in Stage-1 losses")
-    ap.add_argument("--device", default="cuda")
-    args = ap.parse_args()
+    args = parse_arguments()
 
+    # ---------------------------
+    # Read input data
+    # ---------------------------
     adata = ad.read_h5ad(args.in_h5ad)
     pb_target = None  # pseudobulked target data for Stage-1 pretraining
     if args.include_target_pseudobulk:
@@ -628,45 +637,8 @@ def main():
     sc.pp.log1p(adata)
     if sparse.isspmatrix(adata.X) and not sparse.isspmatrix_csr(adata.X):
         adata.X = adata.X.tocsr()  # nicer slicing, though we load to numpy anyway
-
-    # ---------------------------
-    # Train/Test setup
-    # If --test_h5ad is provided, use that file for evaluation and ignore --test_pct_perts.
-    # Otherwise, do the leave-perturbations-out split as before.
-    # ---------------------------
-    if args.test_h5ad:
-        print(f"=== Using external TEST set: {args.test_h5ad} (overrides --test_pct_perts) ===")
-        adata_train = adata
-        adata_test = ad.read_h5ad(args.test_h5ad)
-        # (Optional) apply the same pseudobulk collapse if requested
-        if args.use_pseudobulk:
-            adata_test = collapse_to_pseudobulk(adata_test, args.target_label)
-        sc.pp.normalize_total(adata_test, inplace=True)
-        sc.pp.log1p(adata_test)
-        if sparse.isspmatrix(adata_test.X) and not sparse.isspmatrix_csr(adata_test.X):
-            adata_test.X = adata_test.X.tocsr()  # nicer slicing, though we load to numpy anyway
-        # Sanity check: same genes / order (as guaranteed by user)
-        assert np.array_equal(adata_train.var_names.values, adata_test.var_names.values), \
-            "Train and test var_names differ or are out of order."
-        print(f"Train cells: {adata_train.n_obs}, Test cells: {adata_test.n_obs}")
-    else:
-        # Leave-perturbations-out split (previous behavior)
-        labels_all = adata.obs[args.target_label].astype(str).values
-        rng = np.random.default_rng(args.seed)
-        all_perts = sorted({lbl for lbl in labels_all if lbl != args.control_label})
-        n_test = int(round(args.test_pct_perts * len(all_perts)))
-        test_perts = set(rng.choice(np.array(all_perts), size=n_test, replace=False).tolist()) if n_test > 0 else set()
-        train_perts = [p for p in all_perts if p not in test_perts]
-        mask_train = adata.obs[args.target_label].isin([args.control_label] + train_perts)
-        adata_train = adata[mask_train].copy()
-        if pb_target is not None:  # also filter pseudobulk to training perts only
-            pb_target = pb_target[pb_target.obs[args.target_label].isin([args.control_label] + train_perts)].copy()
-        adata_test = adata[adata.obs[args.target_label].isin([args.control_label] + list(test_perts))].copy() if n_test > 0 else None
-        print("=== Split summary ===")
-        print(f"Total perts (excl. control): {len(all_perts)}  |  Held-out test perts: {len(test_perts)}")
-        if n_test > 0:
-            print(f"Test perts: {sorted(test_perts)[:10]}{' ...' if len(test_perts) > 10 else ''}")
-        print(f"Train cells: {adata_train.n_obs}, Test cells: {adata_test.n_obs if adata_test is not None else 0}")
+    # train/test split
+    adata_train, adata_test, pb_target = train_test_split(args, adata, pb_target)
 
     # ----- Optional: load pathway prior M_meta.npy (R x G) -----
     W_meta = None
@@ -676,32 +648,14 @@ def main():
         assert W_meta.ndim == 2 and W_meta.shape[1] == adata_train.n_vars, \
             f"M_meta shape mismatch: got {W_meta.shape}, expected (R,{adata_train.n_vars}) aligned to var_names."
         
+    # ---------------------------
     # Optional Stage-1: pseudobulk pretraining (reuses the same train() loop)
+    # ---------------------------
     model = None
-    pb_paths = []
-    pbs = []
-    if pb_target is not None:
-        pbs.append(pb_target)
-    if args.pretrain_pseudobulk:
-        pb_paths.append(args.pretrain_pseudobulk)
-    if args.pretrain_pseudobulk_list:
-        with open(args.pretrain_pseudobulk_list, "r") as f:
-            for line in f:
-                s = line.strip()
-                if (not s) or s.startswith("#"):
-                    continue
-                pb_paths.append(s)
+    pb_all, pb_len = prep_pb_all(pb_target, adata_train, args)
 
-    if len(pb_paths) > 0:
-        for p in pb_paths:
-            pb_i = ad.read_h5ad(p)
-            pb_i = prep_external_data(pb_i, args.target_label, args.control_label, adata_train)
-            pbs.append(pb_i)
-        # Concatenate all pseudobulk rows
-        pb_all = ad.concat(pbs, axis=0, join="outer", merge="same")
-        pb_all.obs = pb_all.obs.copy()  # ensure contiguous
-        print(f"=== Stage-1: pretraining on {len(pbs)} pseudobulk sources; total rows: {pb_all.n_obs} ===")
-
+    if pb_all is not None:
+        print(f"=== Stage-1: pretraining on {pb_len} pseudobulk sources; total rows: {pb_all.n_obs} ===")
         model = train(
             adata=pb_all,
             target_label=args.target_label,
@@ -732,6 +686,9 @@ def main():
             pretrain_mode=True,
         )
 
+    # ---------------------------
+    # Stage-2: train on target dataset (with or without held-out perts)
+    # ---------------------------
     print(f"=== Stage-2: training on {'train+test' if adata_test is not None else 'train'} set ===")
     model = train(
         adata=adata_train,
@@ -763,7 +720,9 @@ def main():
         pretrain_mode=False,
     )
 
+    # ---------------------------
     # Evaluate: external test if provided, else held-out split, else train split
+    # ---------------------------
     eval_adata = adata_test if adata_test is not None else adata_train
     print("\n=== Evaluation on {} set ===".format("TEST (held-out perts)" if adata_test is not None else "TRAIN (no holdout)"))
     eval_metrics = evaluate_model(
@@ -776,7 +735,7 @@ def main():
         seed=args.seed,
     )
 
-    # Optional: save weights
+    # Optional: save model weights
     out_path = os.path.splitext(args.in_h5ad)[0] + f".mpnn_hidden{args.hidden}_T{args.T}.pt"
     torch.save({"state_dict": model.state_dict(),
                 "G": model.G,
