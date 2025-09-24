@@ -1178,11 +1178,31 @@ def main():
     if args.pretrain_pseudobulk:
         print(f"=== Stage-1: pretraining on pseudobulk {args.pretrain_pseudobulk} ===")
         pb = ad.read_h5ad(args.pretrain_pseudobulk)
-        sc.pp.normalize_total(pb, inplace=True)
-        sc.pp.log1p(pb)
+        if 'target_present' in pb.obs.columns:
+            pb = pb[pb.obs["target_present"] | (pb.obs[args.target_label] == args.control_label), :].copy()
+        # Clean placeholders before normalization
+        X = pb.X
+        if hasattr(X, "toarray"):
+            X = X.toarray()
+        X = np.asarray(X, dtype=np.float32)
+        # Replace NaN / -1 placeholders with 0 counts
+        if np.isnan(X).any():
+            np.nan_to_num(X, copy=False, nan=0.0)
+        if (X == -1).any():
+            X[X == -1] = 0.0
+        pb.X = X
+        # Normalize only rows with positive sums; leave zero-sum rows as zeros
+        row_sums = X.sum(axis=1)
+        if (row_sums > 0).any():
+            mask = row_sums > 0
+            # normalize a temporary AnnData view to avoid Scanpy warnings on zero-sum rows
+            tmp = pb[mask].copy()
+            sc.pp.normalize_total(tmp, target_sum=None, inplace=True)
+            sc.pp.log1p(tmp)
+            pb.X[mask] = tmp.X
+        # (rows with sum==0 remain zero; perfectly fine for Stage-1 since we mask missing genes)
         assert list(pb.var_names) == list(adata_train.var_names), "Pseudobulk genes/order must match target dataset."
-        # (optional) light normalization if needed; skip if your pseudobulk is already normalized/log1p
-        # sc.pp.normalize_total(pb, inplace=True); sc.pp.log1p(pb)
+
         model = train(
             adata=pb,
             target_label=args.target_label,
