@@ -383,3 +383,98 @@ def train_test_split(args, adata, pb_target):
             print(f"Test perts: {sorted(test_perts)[:10]}{' ...' if len(test_perts) > 10 else ''}")
         print(f"Train cells: {adata_train.n_obs}, Test cells: {adata_test.n_obs if adata_test is not None else 0}")
     return adata_train, adata_test, pb_target
+
+@torch.no_grad()
+def precompute_hop_shells(A_base: torch.Tensor, max_hops: int = 4) -> Dict[int, List[torch.Tensor]]:
+    """
+    Precompute hop 'shells' S_h(t) around each node t:
+      S_0(t)={t}, S_1(t)=neighbors(t), S_2(t)=nodes at 2 hops excluding S_0,S_1, ...
+    Args:
+      A_base: (G,G) adjacency (float or bool); nonzero = edge
+      max_hops: compute up to this hop (inclusive if reachable)
+    Returns:
+      shells: dict t -> list[Tensor], where list[h] are node indices at hop h
+    """
+    G = A_base.shape[0]
+    # treat any nonzero as an edge
+    A_bool = (A_base > 0)
+    shells: Dict[int, List[torch.Tensor]] = {}
+    device = A_base.device
+    all_idx = torch.arange(G, device=device)
+    for t in range(G):
+        S = []
+        visited = torch.zeros(G, dtype=torch.bool, device=device)
+        # S0
+        S0 = torch.tensor([t], device=device, dtype=torch.long)
+        S.append(S0)
+        visited[t] = True
+        frontier = S0
+        for _ in range(1, max_hops + 1):
+            # neighbors of frontier
+            neigh_mask = A_bool[frontier].any(dim=0)
+            # remove visited
+            new_mask = neigh_mask & (~visited)
+            if not new_mask.any():
+                break
+            Sh = all_idx[new_mask]
+            S.append(Sh)
+            visited[Sh] = True
+            frontier = Sh
+        shells[t] = S
+    return shells
+
+@torch.no_grad()
+def compute_locality_metrics(
+    delta: torch.Tensor,
+    target_idx: torch.Tensor,
+    shells: Dict[int, List[torch.Tensor]],
+    ks: List[int] = [1, 2],
+) -> Dict[str, float]:
+    """
+    Compute Expected Hop Distance (EHD) and Loc@K over the batch.
+    Args:
+      delta: (B,G) predicted delta = yhat - x0
+      target_idx: (B,) target indices (>=0 for gene-target perts)
+      shells: dict from precompute_hop_shells
+      ks: which K to report for Loc@K
+    Returns:
+      Dict with 'ehd' and 'loc@{K}' averaged over rows with valid targets.
+    """
+    device = delta.device
+    B, G = delta.shape
+    abs_delta = delta.abs()
+    eps = 1e-12
+    ehd_sum = 0.0
+    loc_sums = {k: 0.0 for k in ks}
+    n = 0
+    for i in range(B):
+        t = int(target_idx[i].item())
+        if t < 0:  # skip non-gene perts
+            continue
+        S = shells.get(t, None)
+        if not S:
+            continue
+        denom = float(abs_delta[i].sum().item() + eps)
+        # mass per hop
+        p_h = []
+        for h, Sh in enumerate(S):
+            if Sh.numel() == 0:
+                p_h.append(0.0)
+            else:
+                p_h.append(float(abs_delta[i, Sh].sum().item() / denom))
+        # EHD
+        ehd_i = sum(h * ph for h, ph in enumerate(p_h))
+        ehd_sum += ehd_i
+        # Loc@K
+        for k in ks:
+            # cap k if shells shorter
+            k_eff = min(k, len(S) - 1)
+            loc = sum(p_h[: k_eff + 1])
+            loc_sums[k] += loc
+        n += 1
+    if n == 0:
+        return {"ehd": 0.0, **{f"loc@{k}": 0.0 for k in ks}}
+    out = {"ehd": ehd_sum / n}
+    for k in ks:
+        out[f"loc@{k}"] = loc_sums[k] / n
+    return out
