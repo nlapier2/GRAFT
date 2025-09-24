@@ -53,6 +53,8 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+import numpy as np
+from collections import defaultdict
 
 
 def _match_sizes(X: torch.Tensor, Y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -247,6 +249,19 @@ def target_consistency_loss(yhat, x_ctrl, target_idx, mode="knockdown", margin=0
     # default knockdown
     return F.relu(y_t - (x_t - margin)).mean()
 
+def target_efficacy_loss(yhat, bx_ctrl, bx_pert, target_idx, alpha_vec):
+    loss_t = yhat.new_tensor(0.0)
+    if (target_idx >= 0).any():
+        mask = (target_idx >= 0)
+        rows = torch.arange(target_idx.numel(), device=yhat.device)[mask]
+        cols = target_idx[mask]
+        # counts for target gene in matched control vs perturbed cell
+        ctrl_cnt = torch.expm1(bx_ctrl[rows, cols].clamp_min(0.0))
+        pert_cnt = torch.expm1(bx_pert[rows, cols].clamp_min(0.0))
+        true_alpha = (1.0 - pert_cnt / (ctrl_cnt + 1e-8)).clamp(0.0, 1.0)
+        loss_t = F.mse_loss(alpha_vec[mask], true_alpha)
+    return loss_t
+
 def locality_damping(yhat, x0, target_idx, k_mask=None, weight=1.0):
     """
     Penalize changes far from target. Simplest form: L1 over all non-target genes.
@@ -262,3 +277,79 @@ def locality_damping(yhat, x0, target_idx, k_mask=None, weight=1.0):
             mask[t] = False
             loss = loss + (yhat[b, mask] - x0[b, mask]).abs().mean()
     return (loss / max((target_idx >= 0).sum().item(), 1)) * weight
+
+def prototype_loss(yhat, x0, bx_pert, bx_ctrl, by_lbl, t2gi, pretrain_mode=False):
+    loss_proto = yhat.new_tensor(0.0)
+    groups = 0
+    for lbl, idxs in by_lbl.items():
+        if len(idxs) < 1:
+            continue
+        idx = torch.tensor(idxs, device=yhat.device, dtype=torch.long)
+        # predicted / true deltas relative to the model's own baseline x0
+        d_pred = (yhat[idx] - x0[idx]).mean(dim=0)      # (G,)
+        d_true = (bx_pert[idx] - x0[idx]).mean(dim=0)   # (G,)
+        # optional: exclude this perturbation's target gene from the loss
+        # (only if label matches a gene in the panel)
+        t = t2gi.get(lbl, -1) if 't2gi' in locals() else -1
+        if t >= 0:
+            mask = torch.ones_like(d_pred, dtype=torch.bool)
+            mask[t] = False
+        # Use the group's own control mean for this batch (crucial in Stage-1)
+        ctrl_mean_grp = bx_ctrl[idx].mean(dim=0)        # (G,)
+        d_pred = (yhat[idx].mean(dim=0) - ctrl_mean_grp)
+        d_true = (bx_pert[idx].mean(dim=0) - ctrl_mean_grp)
+        if pretrain_mode:
+            # mask missing genes from external pseudobulk: NaN or -1 placeholders
+            mnan = torch.isnan(d_true)
+            mneg1 = (d_true == -1)
+            mask_cols = ~(mnan | mneg1)
+            if mask_cols.any():
+                loss_proto = loss_proto + torch.mean(torch.abs(d_pred[mask_cols] - d_true[mask_cols]))
+        else:
+            loss_proto = loss_proto + torch.mean(torch.abs(d_pred - d_true))
+        groups += 1
+    if groups > 0:
+        loss_proto = loss_proto / groups
+    return loss_proto
+
+def prior_loss(yhat, model, W_meta, weight_prior):
+    # Optional proximity loss: keep node_E near projected prior
+    loss_prior = yhat.new_tensor(0.0)
+    if (weight_prior > 0.0) and (W_meta is not None) and (model.prior_proj is not None):
+        # compute current projected prior: (G,node_dim)
+        with torch.no_grad():
+            Wm_torch = torch.from_numpy(W_meta.astype(np.float32)).to(yhat.device)
+        E_prior = model.prior_proj(Wm_torch.T)  # (G,node_dim)
+        loss_prior = F.mse_loss(model.node_E.weight, E_prior)
+    return loss_prior
+
+def compute_distance_loss(yhat, x0, bx_pert, btargets, by_lbl, t2gi, dist_loss, pretrain_mode=False, swd_projections=64):
+    loss_dist = yhat.new_tensor(0.0)
+    if (not pretrain_mode) and (dist_loss != "none"):
+        by_lbl = defaultdict(list)
+        for i, lbl in enumerate(btargets):
+            by_lbl[lbl].append(i)
+        for lbl, idxs in by_lbl.items():
+            if len(idxs) < 2:
+                continue
+            idx = torch.tensor(idxs, device=yhat.device, dtype=torch.long)
+            # deltas vs per-sample Step-0 baseline (robust to control matching)
+            d_pred = (yhat[idx] - x0[idx])         # (n_p, G)
+            d_true = (bx_pert[idx] - x0[idx])      # (n_p, G)
+            # mask target gene column
+            t = t2gi.get(lbl, -1)
+            if t >= 0:
+                d_pred = torch.cat([d_pred[:, :t], d_pred[:, t+1:]], dim=1)
+                d_true = torch.cat([d_true[:, :t], d_true[:, t+1:]], dim=1)
+            # choose loss
+            if dist_loss == "mmd":
+                loss_dist = loss_dist + mmd_rbf(d_pred, d_true)
+            elif dist_loss == "swd":
+                loss_dist = loss_dist + sliced_wasserstein(d_pred, d_true, num_proj=swd_projections)
+            elif dist_loss == "energy":
+                loss_dist = loss_dist + energy_distance(d_pred, d_true)
+        # average across present perts
+        n_groups = sum(1 for v in by_lbl.values() if len(v) >= 2)
+        if n_groups > 0:
+            loss_dist = loss_dist / n_groups
+    return loss_dist
