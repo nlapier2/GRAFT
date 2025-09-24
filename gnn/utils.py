@@ -125,6 +125,93 @@ def sample_minibatch_knn(
     btargets = labels[sel_pert].tolist()
     return bx_ctrl, bx_pert, btargets
 
+def sample_batch_by_mode(single_pert_batches: bool, pretrain_mode: bool, rng: np.random.Generator, pert_unique: List[str],
+                         X: np.ndarray, labels: np.ndarray, control_label: str, ctrl_by_dset: dict | None,
+                         ctrl_mean_np: np.ndarray, match_controls: str, knn_k: int, knn_temp: float, knn_metric: str,
+                         X_ctrl: np.ndarray, X_pert: np.ndarray, pert_labels: np.ndarray, batch_size: int, adata: ad.AnnData,
+                         pre_norm_ctrl: np.ndarray | None = None, pre_norm_pert: np.ndarray | None = None):
+    """
+    Sample a minibatch of (control, perturbed) pairs according to the specified mode.
+    """
+    sel_pert = None
+    # if requested, choose a single perturbation label for this batch
+    fixed_label = None
+    if single_pert_batches:
+        fixed_label = rng.choice(np.array(pert_unique)) if len(pert_unique) > 0 else None
+
+    if pretrain_mode and (ctrl_by_dset is not None):
+        # --- Stage-1 pseudobulk controls: match control by dataset_id, not by sampling ---
+        # choose perturbed rows for this batch
+        if fixed_label is None:
+            pert_idx = np.where(labels != control_label)[0]
+        else:
+            pert_idx = np.where(labels == fixed_label)[0]
+        if len(pert_idx) < batch_size:
+            sel_pert = rng.choice(pert_idx, size=batch_size, replace=True)
+        else:
+            sel_pert = rng.choice(pert_idx, size=batch_size, replace=False)
+        bx_pert = torch.from_numpy(X[sel_pert]).float()
+        # build per-row control vector from the SAME dataset; fallback to global control mean
+        dsets = adata.obs["dataset_id"].astype(str).values
+        bx_ctrl_rows = []
+        for j in sel_pert:
+            dj = dsets[j]
+            if (dj in ctrl_by_dset):
+                bx_ctrl_rows.append(ctrl_by_dset[dj])
+            else:
+                bx_ctrl_rows.append(ctrl_mean_np)
+        bx_ctrl = torch.from_numpy(np.stack(bx_ctrl_rows, axis=0)).float()
+        btargets = labels[sel_pert].tolist()
+    elif match_controls == "knn":
+        # lazily build cosine norms if requested
+        if knn_metric == "cosine":
+            if pre_norm_ctrl is None:
+                ctrl_idx_all = np.where(labels == control_label)[0]
+                pre_norm_ctrl = X[ctrl_idx_all] / (np.linalg.norm(X[ctrl_idx_all], axis=1, keepdims=True) + 1e-8)
+                pre_norm_pert = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-8)
+        bx_ctrl, bx_pert, btargets = sample_minibatch_knn(
+            X=X, labels=labels, control_label=control_label,
+            batch_size=batch_size, rng=rng,
+            knn_k=knn_k, knn_temp=knn_temp, metric=knn_metric,
+            pre_norm_ctrl=pre_norm_ctrl, pre_norm_pert=pre_norm_pert,
+            fixed_label=fixed_label
+        )
+    else:
+        bx_ctrl, bx_pert, btargets = sample_minibatch(
+            X_ctrl=X_ctrl, X_pert=X_pert, pert_labels=pert_labels,
+            control_label=control_label, batch_size=batch_size, rng=rng,
+            fixed_label=fixed_label
+        )
+    return bx_ctrl, bx_pert, btargets, sel_pert
+
+def get_dset_indices(sel_pert, pert_rowidx, adata: ad.AnnData, device: str) -> Tuple[torch.Tensor | None, torch.Tensor | None]:
+    z_d, z_ct = None, None
+    # identify the row indices that produced bx_pert
+    if 'sel_pert' in locals() and sel_pert is not None:           # pretrain_mode branch (or random sampler)
+        idx_rows = np.asarray(sel_pert, dtype=int)
+    elif 'pert_rowidx' in locals() and pert_rowidx is not None:
+        # KNN sampler should provide these indices (may be a CUDA tensor)
+        if torch.is_tensor(pert_rowidx):
+            idx_rows = pert_rowidx.detach().cpu().numpy().astype(int)
+        else:
+            idx_rows = np.asarray(pert_rowidx, dtype=int)
+    else:
+        idx_rows = None
+    if idx_rows is not None:
+        if "dataset_id" in adata.obs.columns:
+            z_d = torch.tensor(pd.Categorical(adata.obs.iloc[idx_rows]["dataset_id"]).codes,
+                                device=device)
+        if "cell_type" in adata.obs.columns:
+            ct_slice = adata.obs.iloc[idx_rows]["cell_type"]
+            # Cast to str before fill/replace to avoid Categorical category errors
+            if isinstance(ct_slice.dtype, pd.CategoricalDtype):
+                ct_slice = ct_slice.astype(str)
+            else:
+                ct_slice = ct_slice.astype(str)
+            ct_slice = ct_slice.replace({"<NA>": "UNK", "mixed": "UNK"}).fillna("UNK")
+            z_ct = torch.tensor(pd.Categorical(ct_slice).codes, device=device)
+    return z_d, z_ct
+
 def make_base_adjacency(G: int, self_loops: bool = True) -> torch.Tensor:
     """
     Dense fully-connected adjacency (uniform), normalized row-wise.
@@ -136,6 +223,26 @@ def make_base_adjacency(G: int, self_loops: bool = True) -> torch.Tensor:
     # row-normalize so each node aggregates an average of neighbors
     A = A / (A.sum(dim=1, keepdim=True) + 1e-8)
     return A
+
+def make_adjacency_prior(W_meta: np.ndarray, meta_topk: int, G: int, device: str) -> torch.Tensor:
+    # build kNN in prior space (cosine), symmetric, row-normalized
+    Wm = W_meta.astype(np.float32)  # (R,G)
+    # cosine over columns
+    V = Wm.T  # (G,R)
+    Vn = V / (np.linalg.norm(V, axis=1, keepdims=True) + 1e-8)
+    S = Vn @ Vn.T  # (G,G) cosine similarity
+    # for each row, keep top-k (including self), set others to 0
+    k = min(meta_topk, G)
+    A = np.zeros_like(S, dtype=np.float32)
+    idx = np.argpartition(-S, kth=k-1, axis=1)[:, :k]
+    rows = np.repeat(np.arange(G)[:, None], k, axis=1)
+    A[rows, idx] = S[rows, idx]
+    # symmetrize by max
+    A = np.maximum(A, A.T)
+    # row-normalize
+    A = A / (A.sum(axis=1, keepdims=True) + 1e-8)
+    A_base = torch.from_numpy(A).to(device)
+    return A_base, k
 
 def collapse_to_pseudobulk(adata, target_label: str):
     """Return a new AnnData with one row per label (perturbation + control)."""
