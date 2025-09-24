@@ -144,7 +144,6 @@ def make_base_adjacency(G: int, self_loops: bool = True) -> torch.Tensor:
     A = A / (A.sum(dim=1, keepdim=True) + 1e-8)
     return A
 
-# Add near your utilities
 def collapse_to_pseudobulk(adata, target_label: str):
     """Return a new AnnData with one row per label (perturbation + control)."""
     import pandas as pd
@@ -156,6 +155,70 @@ def collapse_to_pseudobulk(adata, target_label: str):
     ad_bulk.var_names = adata.var_names.copy()
     ad_bulk.obs[target_label] = df.index.astype(str)
     return ad_bulk
+
+def make_pretrain_pseudobulk_from_adata(adata: ad.AnnData, target_label: str, control_label: str, dataset_id: str) -> ad.AnnData:
+    """One-row-per-pert pseudobulk of the provided AnnData (already normalized/log1p).
+    Keeps columns: dataset_id, is_control, target_idx, target_present, cell_type (UNK), tech_batch_id (UNK), lab_id (UNK)."""
+    groups = adata.obs[target_label].astype(str).values
+    uniq = np.unique(groups)
+    X_rows = []
+    obs_rows = []
+    # map gene -> index once
+    gene_to_pos = {g: i for i, g in enumerate(adata.var_names)}
+    for p in uniq:
+        m = (groups == p)
+        X_rows.append(np.asarray(adata[m].X.mean(axis=0)).squeeze())
+        if p == control_label:
+            pert_type = "control"; t_idx = -1; t_present = False
+        else:
+            pos = gene_to_pos.get(p, None)
+            if pos is None:
+                pert_type = "non_gene"; t_idx = -1; t_present = False
+            else:
+                pert_type = "gene"; t_idx = int(pos); t_present = True
+        obs_rows.append({
+            "dataset_id": dataset_id,
+            "is_control": (p == control_label),
+            target_label: p,
+            "pert_type": pert_type,
+            "target_idx": t_idx,
+            "target_present": t_present,
+            "cell_type": "UNK",
+            "tech_batch_id": "UNK",
+            "lab_id": "UNK",
+        })
+    X_bulk = np.stack(X_rows, axis=0)
+    obs = pd.DataFrame(obs_rows)
+    obs.index = [f"{dataset_id}::{r[target_label]}" for _, r in obs.iterrows()]
+    return ad.AnnData(X=X_bulk, obs=obs, var=adata.var.copy())
+
+def prep_external_data(pb: ad.AnnData, target_label: str, control_label: str, adata_train: ad.AnnData) -> ad.AnnData:
+    if 'target_present' in pb.obs.columns:
+        pb = pb[pb.obs["target_present"] | (pb.obs[target_label] == control_label), :].copy()
+    # Clean placeholders before normalization
+    X = pb.X
+    if hasattr(X, "toarray"):
+        X = X.toarray()
+    X = np.asarray(X, dtype=np.float32)
+    # Replace NaN / -1 placeholders with 0 counts
+    if np.isnan(X).any():
+        np.nan_to_num(X, copy=False, nan=0.0)
+    if (X == -1).any():
+        X[X == -1] = 0.0
+    pb.X = X
+    # Normalize only rows with positive sums; leave zero-sum rows as zeros
+    row_sums = X.sum(axis=1)
+    if (row_sums > 0).any():
+        mask = row_sums > 0
+        # normalize a temporary AnnData view to avoid Scanpy warnings on zero-sum rows
+        tmp = pb[mask].copy()
+        sc.pp.normalize_total(tmp, target_sum=None, inplace=True)
+        sc.pp.log1p(tmp)
+        pb.X[mask] = tmp.X
+    # (rows with sum==0 remain zero; perfectly fine for Stage-1 since we mask missing genes)
+    assert list(pb.var_names) == list(adata_train.var_names), "Pseudobulk genes/order must match target dataset."
+    return pb
+
 
 # ----------------------------
 # Model: Step0 + MPNN + Readout
@@ -1104,6 +1167,10 @@ def main():
                     help="If >0, build a top-k cosine kNN adjacency from the pathway prior instead of dense A.")
     ap.add_argument("--pretrain_pseudobulk", type=str, default="",
                     help="Path to a pseudobulk .h5ad for Stage-1 pretraining; empty = skip Stage-1")
+    ap.add_argument("--pretrain_pseudobulk_list", type=str, default="",
+                        help="Text file with one pseudobulk .h5ad path per line; blank/comment lines ignored")
+    ap.add_argument("--include_target_pseudobulk", action="store_true",
+                        help="Also pseudobulk the target dataset and include it in Stage-1 pretraining")
     ap.add_argument("--pretrain_epochs", type=int, default=10,
                     help="Epochs to run Stage-1 pseudobulk pretraining")
     ap.add_argument("--use_dset_embed", action="store_true",
@@ -1120,7 +1187,12 @@ def main():
     args = ap.parse_args()
 
     adata = ad.read_h5ad(args.in_h5ad)
-    if args.use_pseudobulk:
+    pb_target = None  # pseudobulked target data for Stage-1 pretraining
+    if args.include_target_pseudobulk:
+        pb_target = make_pretrain_pseudobulk_from_adata(adata, args.target_label, args.control_label, dataset_id="target_all")
+        sc.pp.normalize_total(pb_target, inplace=True)
+        sc.pp.log1p(pb_target)
+    if args.use_pseudobulk:  # stage 2 pseudobulk
         args.batch_size = 1  # enforce single-row batches
         adata = collapse_to_pseudobulk(adata, args.target_label)
     sc.pp.normalize_total(adata, inplace=True)
@@ -1158,6 +1230,8 @@ def main():
         train_perts = [p for p in all_perts if p not in test_perts]
         mask_train = adata.obs[args.target_label].isin([args.control_label] + train_perts)
         adata_train = adata[mask_train].copy()
+        if pb_target is not None:  # also filter pseudobulk to training perts only
+            pb_target = pb_target[pb_target.obs[args.target_label].isin([args.control_label] + train_perts)].copy()
         adata_test = adata[adata.obs[args.target_label].isin([args.control_label] + list(test_perts))].copy() if n_test > 0 else None
         print("=== Split summary ===")
         print(f"Total perts (excl. control): {len(all_perts)}  |  Held-out test perts: {len(test_perts)}")
@@ -1175,36 +1249,32 @@ def main():
         
     # Optional Stage-1: pseudobulk pretraining (reuses the same train() loop)
     model = None
+    pb_paths = []
+    pbs = []
+    if pb_target is not None:
+        pbs.append(pb_target)
     if args.pretrain_pseudobulk:
-        print(f"=== Stage-1: pretraining on pseudobulk {args.pretrain_pseudobulk} ===")
-        pb = ad.read_h5ad(args.pretrain_pseudobulk)
-        if 'target_present' in pb.obs.columns:
-            pb = pb[pb.obs["target_present"] | (pb.obs[args.target_label] == args.control_label), :].copy()
-        # Clean placeholders before normalization
-        X = pb.X
-        if hasattr(X, "toarray"):
-            X = X.toarray()
-        X = np.asarray(X, dtype=np.float32)
-        # Replace NaN / -1 placeholders with 0 counts
-        if np.isnan(X).any():
-            np.nan_to_num(X, copy=False, nan=0.0)
-        if (X == -1).any():
-            X[X == -1] = 0.0
-        pb.X = X
-        # Normalize only rows with positive sums; leave zero-sum rows as zeros
-        row_sums = X.sum(axis=1)
-        if (row_sums > 0).any():
-            mask = row_sums > 0
-            # normalize a temporary AnnData view to avoid Scanpy warnings on zero-sum rows
-            tmp = pb[mask].copy()
-            sc.pp.normalize_total(tmp, target_sum=None, inplace=True)
-            sc.pp.log1p(tmp)
-            pb.X[mask] = tmp.X
-        # (rows with sum==0 remain zero; perfectly fine for Stage-1 since we mask missing genes)
-        assert list(pb.var_names) == list(adata_train.var_names), "Pseudobulk genes/order must match target dataset."
+        pb_paths.append(args.pretrain_pseudobulk)
+    if args.pretrain_pseudobulk_list:
+        with open(args.pretrain_pseudobulk_list, "r") as f:
+            for line in f:
+                s = line.strip()
+                if (not s) or s.startswith("#"):
+                    continue
+                pb_paths.append(s)
+
+    if len(pb_paths) > 0:
+        for p in pb_paths:
+            pb_i = ad.read_h5ad(p)
+            pb_i = prep_external_data(pb_i, args.target_label, args.control_label, adata_train)
+            pbs.append(pb_i)
+        # Concatenate all pseudobulk rows
+        pb_all = ad.concat(pbs, axis=0, join="outer", merge="same")
+        pb_all.obs = pb_all.obs.copy()  # ensure contiguous
+        print(f"=== Stage-1: pretraining on {len(pbs)} pseudobulk sources; total rows: {pb_all.n_obs} ===")
 
         model = train(
-            adata=pb,
+            adata=pb_all,
             target_label=args.target_label,
             control_label=args.control_label,
             hidden=args.hidden,
