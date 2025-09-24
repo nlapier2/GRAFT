@@ -250,6 +250,7 @@ def target_consistency_loss(yhat, x_ctrl, target_idx, mode="knockdown", margin=0
     return F.relu(y_t - (x_t - margin)).mean()
 
 def target_efficacy_loss(yhat, bx_ctrl, bx_pert, target_idx, alpha_vec):
+    # per-cell target MSE loss vs true efficacy
     loss_t = yhat.new_tensor(0.0)
     if (target_idx >= 0).any():
         mask = (target_idx >= 0)
@@ -261,6 +262,44 @@ def target_efficacy_loss(yhat, bx_ctrl, bx_pert, target_idx, alpha_vec):
         true_alpha = (1.0 - pert_cnt / (ctrl_cnt + 1e-8)).clamp(0.0, 1.0)
         loss_t = F.mse_loss(alpha_vec[mask], true_alpha)
     return loss_t
+
+def target_efficacy_batch_loss(bx_ctrl, bx_pert, target_idx, alpha_vec, batch_labels):
+    """
+    Batch-level target loss (pseudobulk α):
+      For each perturbation label present in the batch, compute the target-gene
+      counts from the batch mean control vs batch mean perturbed, derive a
+      pseudobulk true_alpha, and compare to the MEAN predicted alpha over rows
+      of that label. Averaged across labels present.
+    Args:
+      alpha_vec: (B,) predicted per-row alphas
+      bx_ctrl, bx_pert: (B,G) log1p controls/perturbed
+      target_idx: (B,) target gene indices (-1 if unknown)
+      batch_labels: list[str] length B with the perturbation labels
+    """
+    device = bx_ctrl.device
+    B = alpha_vec.shape[0]
+    # group row indices by label
+    by_lbl = defaultdict(list)
+    for i, lbl in enumerate(batch_labels):
+        by_lbl[lbl].append(i)
+    eps = 1e-8
+    losses = []
+    for lbl, idxs in by_lbl.items():
+        idx = torch.tensor(idxs, device=device, dtype=torch.long)
+        # choose the (majority) target index among rows; require at least one known target
+        t_rows = target_idx[idx]
+        if (t_rows >= 0).any():
+            # take the first known target index (they should be identical within a label)
+            t = int(t_rows[t_rows >= 0][0].item())
+            # pseudobulk counts at target gene
+            ctrl_cnt = torch.expm1(bx_ctrl[idx, t].clamp_min(0.0)).mean()
+            pert_cnt = torch.expm1(bx_pert[idx, t].clamp_min(0.0)).mean()
+            true_alpha = (1.0 - pert_cnt / (ctrl_cnt + eps)).clamp(0.0, 1.0)
+            pred_alpha = alpha_vec[idx].mean()
+            losses.append((pred_alpha - true_alpha).pow(2))
+    if len(losses) == 0:
+        return alpha_vec.new_tensor(0.0)
+    return torch.stack(losses).mean()
 
 def locality_damping(yhat, x0, target_idx, k_mask=None, weight=1.0):
     """

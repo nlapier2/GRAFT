@@ -12,7 +12,7 @@ from collections import defaultdict
 from sklearn.metrics import pairwise_distances
 
 from models import GeneMPNN
-from losses import compute_distance_loss, mse_loss, target_efficacy_loss, locality_damping, prototype_loss, prior_loss
+from losses import compute_distance_loss, mse_loss, target_efficacy_loss, locality_damping, prototype_loss, prior_loss, target_efficacy_batch_loss
 from utils import to_numpy, build_target_to_gene_index, sample_minibatch, sample_minibatch_knn, \
                     make_base_adjacency, collapse_to_pseudobulk, make_pretrain_pseudobulk_from_adata, prep_external_data, \
                     prep_pb_all, train_test_split, make_adjacency_prior, sample_batch_by_mode, get_dset_indices
@@ -218,7 +218,8 @@ def train(
             loss_mse = (yhat - x0).new_tensor(0.0) if pretrain_mode else mse_loss(yhat - x0, bx_pert - x0)
             loss_loc = locality_damping(yhat, x0, tidx, weight=1.0) if weight_local > 0 else yhat.new_tensor(0.0)
             loss_proto = prototype_loss(yhat, x0, bx_pert, bx_ctrl, by_lbl, t2gi, pretrain_mode=pretrain_mode)
-            loss_t = target_efficacy_loss(yhat, bx_ctrl, bx_pert, tidx, alpha_vec)
+            # loss_t = target_efficacy_loss(yhat, bx_ctrl, bx_pert, tidx, alpha_vec)
+            loss_t = target_efficacy_batch_loss(bx_ctrl, bx_pert, tidx, alpha_vec, btargets)
             loss_dist = compute_distance_loss(yhat, x0, bx_pert, btargets, by_lbl, t2gi, dist_loss, pretrain_mode, swd_projections)
             loss_prior = prior_loss(yhat, model, W_meta, weight_prior)
 
