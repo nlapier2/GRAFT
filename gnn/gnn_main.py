@@ -12,7 +12,8 @@ from collections import defaultdict
 from sklearn.metrics import pairwise_distances
 
 from models import GeneMPNN
-from losses import compute_distance_loss, mse_loss, target_efficacy_loss, locality_damping, prototype_loss, prior_loss, target_efficacy_batch_loss
+from losses import compute_distance_loss, mse_loss, target_efficacy_loss, locality_damping, prototype_loss, prior_loss, \
+                    target_efficacy_batch_loss, info_nce_loss
 from utils import to_numpy, build_target_to_gene_index, sample_minibatch, sample_minibatch_knn, \
                     make_base_adjacency, collapse_to_pseudobulk, make_pretrain_pseudobulk_from_adata, prep_external_data, \
                     prep_pb_all, train_test_split, make_adjacency_prior, sample_batch_by_mode, get_dset_indices
@@ -78,6 +79,14 @@ def parse_arguments():
                     help="Dimensionality of cell_type embedding (if enabled)")
     ap.add_argument("--missing_gene_fill", type=str, default="nan", choices=["nan", "-1"],
                         help="Placeholder used in pseudobulk for missing genes; masked in Stage-1 losses")
+    ap.add_argument("--weight_contrast", type=float, default=0.0,
+                    help="Weight of InfoNCE contrastive loss (pred-bulk vs obs-bulk).")
+    ap.add_argument("--proj_dim", type=int, default=128,
+                    help="Projection dim for contrastive embeddings.")
+    ap.add_argument("--contrast_tau", type=float, default=0.1,
+                    help="InfoNCE temperature.")
+    ap.add_argument("--queue_size", type=int, default=2048,
+                    help="Number of negative keys to keep in memory queue.")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     return args
@@ -116,6 +125,10 @@ def train(
     meta_topk: int = 0,
     model: nn.Module | None = None,
     pretrain_mode: bool = False,
+    weight_contrast: float = 0.0,
+    proj_dim: int = 128,
+    contrast_tau: float = 0.1,
+    queue_size: int = 2048,
 ):
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
@@ -156,7 +169,7 @@ def train(
     # Create Model (reuse if provided)
     if model is None:
         prior_dim = W_meta.shape[0] if W_meta is not None else None
-        model = GeneMPNN(G=G, hidden=hidden, T=T, tau=tau, prior_dim=prior_dim).to(device)
+        model = GeneMPNN(G=G, hidden=hidden, T=T, tau=tau, prior_dim=prior_dim, proj_dim=proj_dim).to(device)
         # Optionally initialize node embeddings from prior
         if (W_meta is not None) and init_from_meta:
             Wm_torch = torch.from_numpy(W_meta.astype(np.float32)).to(device)  # (R,G)
@@ -170,6 +183,25 @@ def train(
     else:
         # dense fully-connected adjacency (previous behavior)
         A_base = make_base_adjacency(G, self_loops=True).to(device)
+
+    # --- simple FIFO queue for contrastive loss negative keys (L2-normalized embeddings) ---
+    neg_bank = torch.empty((0, proj_dim), device=device)
+    neg_labels = []  # list[str] same length as neg_bank rows
+    def _enqueue(k: torch.Tensor, lbl: str):
+        nonlocal neg_bank, neg_labels
+        # k: (1,D) or (B,D) -> ensure 2D
+        if k.ndim == 1:
+            k = k.unsqueeze(0)
+        if k.size(0) > 1:
+            # take first row (we use one pseudobulk per batch)
+            k = k[:1]
+        neg_bank = torch.cat([neg_bank, k.detach()], dim=0)
+        neg_labels.append(lbl)
+        # trim
+        if neg_bank.size(0) > queue_size:
+            cut = neg_bank.size(0) - queue_size
+            neg_bank = neg_bank[cut:]
+            del neg_labels[:cut]
 
     # Simple schedule
     steps_per_epoch = math.ceil(pert_mask.sum() / batch_size)
@@ -186,7 +218,7 @@ def train(
 
     for epoch in range(1, epochs + 1):
         model.train()
-        running = {"mse": 0.0, "targ": 0.0, "loc": 0.0, "proto": 0.0, "dist": 0.0, "prior": 0.0, "tot": 0.0}
+        running = {"mse": 0.0, "targ": 0.0, "loc": 0.0, "proto": 0.0, "dist": 0.0, "prior": 0.0, "contrast": 0.0, "tot": 0.0}
         for step in range(steps_per_epoch):
             bx_ctrl, bx_pert, btargets, sel_pert = sample_batch_by_mode(
                 single_pert_batches, pretrain_mode, rng, pert_unique,
@@ -223,6 +255,25 @@ def train(
             loss_dist = compute_distance_loss(yhat, x0, bx_pert, btargets, by_lbl, t2gi, dist_loss, pretrain_mode, swd_projections)
             loss_prior = prior_loss(yhat, model, W_meta, weight_prior)
 
+            # === Contrastive retrieval on pseudobulk deltas (single-pert batches) ===
+            if weight_contrast > 0.0:
+                # observed batch pseudobulk delta (log1p space)
+                delta_obs = (bx_pert - bx_ctrl).mean(dim=0, keepdim=True)      # (1,G)
+                # predicted batch pseudobulk delta
+                delta_pred = (yhat - x0).mean(dim=0, keepdim=True)             # (1,G)
+                # embeddings
+                k_pos = model.project_key(delta_obs)        # (1,D), no grad
+                q     = model.project_query(delta_pred)     # (1,D), with grad
+                # mask out negatives with same pert label (avoid trivial collisions)
+                cur_lbl = str(btargets[0])
+                if len(neg_labels) > 0:
+                    keep = torch.tensor([lbl != cur_lbl for lbl in neg_labels], device=device, dtype=torch.bool)
+                else:
+                    keep = None
+                loss_contrast = info_nce_loss(q, k_pos, neg_bank, tau=contrast_tau, neg_mask=keep)
+            else:
+                loss_contrast = torch.tensor(0.0, device=device)
+
             if weight_mse == 0.0:
                 loss_mse = loss_mse * 0.0
             if weight_target == 0.0:
@@ -235,18 +286,25 @@ def train(
                 loss_dist = loss_dist * 0.0
             if weight_prior == 0.0:
                 loss_prior = loss_prior * 0.0
+            if weight_contrast == 0.0:
+                loss_contrast = loss_contrast * 0.0
 
             loss = weight_mse * loss_mse \
                  + weight_target * loss_t \
                  + weight_local * loss_loc \
                  + weight_proto * loss_proto \
                  + weight_dist * loss_dist \
-                 + weight_prior * loss_prior
+                 + weight_prior * loss_prior \
+                 + weight_contrast * loss_contrast
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
+
+            # enqueue current positive key for future negatives
+            if weight_contrast > 0.0:
+                _enqueue(k_pos, cur_lbl)
 
             running["mse"]  += float(loss_mse.item())
             running["targ"] += float(loss_t.item())
@@ -254,6 +312,7 @@ def train(
             running["proto"] += float(loss_proto.item())
             running["dist"] += float(loss_dist.item())
             running["prior"] += float(loss_prior.item())
+            running["contrast"] += float(loss_contrast.item())
             running["tot"]  += float(loss.item())
 
         denom = max(steps_per_epoch, 1)
@@ -268,6 +327,7 @@ def train(
                 f"proto={running['proto']/denom:.5f}  "
                 f"dist={running['dist']/denom:.5f}  "
                 f"prior={running['prior']/denom:.5f}  "
+                f"contrast={running['contrast']/denom:.5f}  "
                 f"total={running['tot']/denom:.5f}")
 
     # estimate mean alpha on training targets (linear KD from pseudobulk)
@@ -581,6 +641,10 @@ def main():
             meta_topk=args.meta_topk,
             model=None,
             pretrain_mode=True,
+            weight_contrast=args.weight_contrast,
+            proj_dim=args.proj_dim,
+            contrast_tau=args.contrast_tau,
+            queue_size=args.queue_size,
         )
 
     # ---------------------------
@@ -615,6 +679,10 @@ def main():
         meta_topk=args.meta_topk,
         model=model,  # continue from Stage-1 if done
         pretrain_mode=False,
+        weight_contrast=args.weight_contrast,
+        proj_dim=args.proj_dim,
+        contrast_tau=args.contrast_tau,
+        queue_size=args.queue_size,
     )
 
     # ---------------------------

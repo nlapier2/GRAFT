@@ -392,3 +392,35 @@ def compute_distance_loss(yhat, x0, bx_pert, btargets, by_lbl, t2gi, dist_loss, 
         if n_groups > 0:
             loss_dist = loss_dist / n_groups
     return loss_dist
+
+def info_nce_loss(q: torch.Tensor,
+                  k_pos: torch.Tensor,
+                  neg_bank: torch.Tensor,
+                  tau: float = 0.1,
+                  neg_mask: torch.Tensor = None) -> torch.Tensor:
+    """
+    InfoNCE over cosine similarities.
+    Args:
+      q:      (B,D) queries (L2-normalized)
+      k_pos:  (B,D) positives (L2-normalized)   -- we use B=1 for single-pert batches
+      neg_bank: (N,D) negatives (L2-normalized)
+      tau: temperature
+      neg_mask: (N,) bool mask; True=keep as negative, False=drop
+    """
+    assert q.ndim == 2 and k_pos.ndim == 2
+    B, D = q.shape
+    if neg_bank is None or neg_bank.numel() == 0:
+        # fall back to just positive (avoid NaN early in training)
+        # loss = -log(exp(sim_pos/tau)/exp(sim_pos/tau)) = 0
+        return q.new_tensor(0.0)
+    if neg_mask is not None:
+        neg_bank = neg_bank[neg_mask]
+        if neg_bank.numel() == 0:
+            return q.new_tensor(0.0)
+    # cos sims
+    sim_pos = (q * k_pos).sum(dim=-1, keepdim=True)              # (B,1)
+    sim_neg = q @ neg_bank.t()                                    # (B,N)
+    logits = torch.cat([sim_pos, sim_neg], dim=1) / max(tau, 1e-8)
+    labels = q.new_zeros(B, dtype=torch.long)  # positives at index 0
+    loss = F.cross_entropy(logits, labels, reduction="mean")
+    return loss

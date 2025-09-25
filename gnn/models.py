@@ -133,12 +133,13 @@ class MPNNLayer(nn.Module):
 
 class GeneMPNN(nn.Module):
     def __init__(self, G: int, hidden: int = 128, T: int = 2, tau: float = 0.0, alpha_cap: float = 1.0, prior_dim: int | None = None,
-                 dset_vocab: int = 0, dset_dim: int = 0, ct_vocab: int = 0, ct_dim: int = 0):
+                 dset_vocab: int = 0, dset_dim: int = 0, ct_vocab: int = 0, ct_dim: int = 0, proj_dim: int = 128):
         super().__init__()
         self.G = G
         self.hidden = hidden
         self.T = T
         self.alpha_cap = alpha_cap
+        self.proj_dim = proj_dim
         # per-gene node embeddings (used by all nodes, every batch)
         self.node_dim = 64
         self.node_E = nn.Embedding(G, self.node_dim)
@@ -162,6 +163,12 @@ class GeneMPNN(nn.Module):
         self.proto = PrototypeGenerator(G=G, d=self.node_dim, extra_cond_dim=extra_cond_dim)
         # Tie prototype embedding to the node embedding so both share the same e_t
         self.proto.E = self.node_E
+        # --- contrastive projection head: R^G -> R^{proj_dim} ---
+        self.delta_proj = nn.Sequential(
+            nn.Linear(self.G, self.proj_dim),
+            nn.GELU(),
+            nn.Linear(self.proj_dim, self.proj_dim),
+        )
 
     @torch.no_grad()
     def init_from_prior(self, W_meta: torch.Tensor):
@@ -254,3 +261,22 @@ class GeneMPNN(nn.Module):
             cols = target_idx[freeze_mask]
             y[rows, cols] = x0[rows, cols]
         return y, x0, alpha_t
+
+    # --- helper to project deltas and L2-normalize for cosine similarity ---
+    @torch.no_grad()
+    def project_key(self, delta_vec: torch.Tensor) -> torch.Tensor:
+        """
+        Args: delta_vec: (..., G)
+        Returns: (..., D) L2-normalized key embedding (no grad)
+        """
+        k = self.delta_proj(delta_vec)
+        k = torch.nn.functional.normalize(k, dim=-1, eps=1e-8)
+        return k
+
+    def project_query(self, delta_vec: torch.Tensor) -> torch.Tensor:
+        """
+        Same as project_key but with grad (for queries from predicted deltas).
+        """
+        q = self.delta_proj(delta_vec)
+        q = torch.nn.functional.normalize(q, dim=-1, eps=1e-8)
+        return q
