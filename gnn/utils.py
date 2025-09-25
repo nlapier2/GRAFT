@@ -1,5 +1,5 @@
-from email import parser
-import argparse, math, os, sys, random
+# --- utility functions for GNN training and evaluation ---
+import os
 from typing import Tuple, Dict, List
 import numpy as np
 import pandas as pd
@@ -9,8 +9,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from scipy import sparse
-from collections import defaultdict
-from sklearn.metrics import pairwise_distances
+
+from models import GeneMPNN
 
 def to_numpy(X):
     if sparse.issparse(X):
@@ -478,3 +478,49 @@ def compute_locality_metrics(
     for k in ks:
         out[f"loc@{k}"] = loc_sums[k] / n
     return out
+
+# --- helpers for (re)building and (re)loading ---
+def build_model_for_dataset(adata_like, args, load_weights_from: str = ""):
+    G = adata_like.n_vars
+    model = GeneMPNN(
+        G=G,
+        hidden=args.hidden,
+        T=args.T,
+        tau=args.tau,
+        node_dim=args.node_dim,
+        proj_dim=args.proj_dim,
+    ).to(args.device)
+    if load_weights_from:
+        ckpt = torch.load(load_weights_from, map_location=args.device)
+        state = ckpt.get("state_dict", ckpt)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print(f"[load-weights] {load_weights_from} | missing={len(missing)} unexpected={len(unexpected)}")
+    return model
+
+def load_full_checkpoint(load_path: str, device: str) -> Tuple[Dict, Dict | None, int, dict]:
+    """
+    Returns: (state_dict, optimizer_state_dict, start_epoch:int, meta:dict)
+    """
+    ckpt = torch.load(load_path, map_location=device)
+    state = ckpt.get("state_dict", ckpt)
+    opt_state = ckpt.get("optimizer_state_dict", None)
+    start_epoch = int(ckpt.get("epoch", 0))
+    meta = ckpt.get("meta", {})
+    print(f"[load-ckpt] {load_path} | epoch={start_epoch}")
+    return state, opt_state, start_epoch, meta
+
+def save_full_checkpoint(path: str, model, optimizer,  extra_meta: dict = None):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    payload = {
+        "state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "meta": {
+            "G": getattr(model, "G", None),
+            "hidden": getattr(model, "hidden", None),
+            "T": getattr(model, "T", None),
+            "proj_dim": getattr(model, "proj_dim", None),
+        },
+    }
+    if extra_meta:
+        payload["meta"].update(extra_meta)
+    torch.save(payload, path)

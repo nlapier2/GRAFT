@@ -12,11 +12,8 @@ from collections import defaultdict
 from sklearn.metrics import pairwise_distances
 
 from models import GeneMPNN
-from losses import compute_distance_loss, mse_loss, target_efficacy_loss, locality_damping, prototype_loss, prior_loss, \
-                    target_efficacy_batch_loss, info_nce_loss
-from utils import to_numpy, build_target_to_gene_index, sample_minibatch, sample_minibatch_knn, \
-                    make_base_adjacency, collapse_to_pseudobulk, make_pretrain_pseudobulk_from_adata, prep_external_data, \
-                    prep_pb_all, train_test_split, make_adjacency_prior, sample_batch_by_mode, get_dset_indices
+from losses import *
+from utils import *
 
 
 def parse_arguments():
@@ -94,6 +91,10 @@ def parse_arguments():
                     help="Sample at most K negatives per step for InfoNCE.")
     ap.add_argument("--neg_cap_per_label", type=int, default=4,
                     help="Keep at most this many keys per pert label in the queue.")
+    ap.add_argument("--load_model_path", type=str, default="",
+                    help="Path to a saved checkpoint (.pt). If set, training will start from these weights.")
+    ap.add_argument("--save_model_path", type=str, default="",
+                    help="Where to save the trained model (.pt). If empty, an auto name based on --in_h5ad is used.")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     return args
@@ -139,6 +140,7 @@ def train(
     queue_size: int = 64,
     neg_k: int = 16,
     neg_cap_per_label: int = 4,
+    optimizer_state: Dict | None = None,    
 ):
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
@@ -185,6 +187,12 @@ def train(
             Wm_torch = torch.from_numpy(W_meta.astype(np.float32)).to(device)  # (R,G)
             model.init_from_prior(Wm_torch)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    if optimizer_state is not None:
+        try:
+            opt.load_state_dict(optimizer_state)
+            print("[train] optimizer state loaded")
+        except Exception as e:
+            print(f"[train] optimizer state load failed: {e}")
 
     # Base adjacency: either dense (as before) or prior-based top-k cosine graph
     if (W_meta is not None) and (meta_topk > 0):
@@ -401,7 +409,7 @@ def train(
             alphas.append(a)
         model.register_buffer("alpha_mean_train", torch.tensor(float(np.mean(alphas) if alphas else 0.8)))
 
-    return model
+    return model, opt
 
 
 @torch.no_grad()
@@ -660,11 +668,20 @@ def main():
     # Optional Stage-1: pseudobulk pretraining (reuses the same train() loop)
     # ---------------------------
     model = None
+    resume_model = None
+    resume_opt_state = None
     pb_all, pb_len = prep_pb_all(pb_target, adata_train, args)
 
     if pb_all is not None:
         print(f"=== Stage-1: pretraining on {pb_len} pseudobulk sources; total rows: {pb_all.n_obs} ===")
-        model = train(
+        # Optionally resume Stage-1 from a full checkpoint
+        if args.load_model_path:
+            resume_model = build_model_for_dataset(pb_all, args, load_weights_from=args.load_model_path)
+            state, opt_state, start_ep, _ = load_full_checkpoint(args.load_model_path, device=args.device)
+            missing, unexpected = resume_model.load_state_dict(state, strict=False)
+            print(f"[stage1] load ckpt | missing={len(missing)} unexpected={len(unexpected)}")
+            resume_opt_state = opt_state
+        model, opt = train(
             adata=pb_all,
             target_label=args.target_label,
             control_label=args.control_label,
@@ -693,7 +710,7 @@ def main():
             init_from_meta=args.init_from_meta,
             weight_prior=args.weight_prior,
             meta_topk=args.meta_topk,
-            model=None,
+            model=resume_model,  # continue from checkpoint if given
             pretrain_mode=True,
             weight_contrast=args.weight_contrast,
             proj_dim=args.proj_dim,
@@ -701,13 +718,24 @@ def main():
             queue_size=args.queue_size,
             neg_k=args.neg_k,
             neg_cap_per_label=args.neg_cap_per_label,
+            optimizer_state=resume_opt_state,
         )
 
     # ---------------------------
     # Stage-2: train on target dataset (with or without held-out perts)
     # ---------------------------
     print(f"=== Stage-2: training on {'train+test' if adata_test is not None else 'train'} set ===")
-    model = train(
+    # If resuming Stage-2
+    if (model is None) and args.load_model_path:
+        model = build_model_for_dataset(adata_train, args, load_weights_from=args.load_model_path)  # fresh instance
+        state, opt_state, start_ep, _ = load_full_checkpoint(args.load_model_path, device=args.device)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print(f"[stage2] load ckpt | missing={len(missing)} unexpected={len(unexpected)}")
+        resume_opt_state = opt_state
+    elif (model is None) and args.load_model_path:
+        model = build_model_for_dataset(adata_train, args, load_weights_from=args.load_model_path)
+        resume_opt_state = None
+    model, opt = train(
         adata=adata_train,
         target_label=args.target_label,
         control_label=args.control_label,
@@ -744,6 +772,7 @@ def main():
         queue_size=args.queue_size,
         neg_k=args.neg_k,
         neg_cap_per_label=args.neg_cap_per_label,
+        optimizer_state=resume_opt_state,
     )
 
     # ---------------------------
@@ -761,12 +790,11 @@ def main():
         seed=args.seed,
     )
 
-    # Optional: save model weights
-    out_path = os.path.splitext(args.in_h5ad)[0] + f".mpnn_hidden{args.hidden}_T{args.T}.pt"
-    torch.save({"state_dict": model.state_dict(),
-                "G": model.G,
-                "hidden": model.hidden,
-                "T": model.T}, out_path)
+    # Save model weights (user-specified path if provided)
+    if args.save_model_path:
+        save_full_checkpoint(args.save_model_path, model, opt, extra_meta=None)
+        print(f"[done] saved model to {args.save_model_path}")
+
 
     # ---------------------------
     # Optional: write predictions AnnData for the evaluation split
@@ -786,7 +814,6 @@ def main():
         eval_adata.write_h5ad(os.path.splitext(args.out_pred_h5ad)[0] + ".true.h5ad", compression="lzf")
         print(f"[done] Wrote {args.out_pred_h5ad} (cells={ad_pred.n_obs}, genes={ad_pred.n_vars})")
 
-    print(f"[done] saved model to {out_path}")
 
 if __name__ == "__main__":
     main()
