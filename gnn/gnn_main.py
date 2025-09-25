@@ -839,7 +839,10 @@ def main():
 
     # Save model weights (user-specified path if provided)
     if args.save_model_path:
-        save_full_checkpoint(args.save_model_path, model, opt, extra_meta=None)
+        save_full_checkpoint(args.save_model_path, model, opt, extra_meta={
+            "dset_id2row": getattr(model, "dset_id2row", None),
+            "ct_id2row": getattr(model, "ct_id2row", None),
+        })
         print(f"[done] saved model to {args.save_model_path}")
 
 

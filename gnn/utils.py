@@ -515,6 +515,37 @@ def compute_locality_metrics(
 # --- helpers for (re)building and (re)loading ---
 def build_model_for_dataset(adata_like, args, load_weights_from: str = ""):
     G = adata_like.n_vars
+    # --- default dims from args ---
+    dset_dim = int(getattr(args, "dset_embed_dim", 0) or 0)
+    ct_dim   = int(getattr(args, "ct_embed_dim",   0) or 0)
+    dset_vocab = 0
+    ct_vocab   = 0
+
+    # Infer vocab sizes from the current AnnData when dims > 0
+    if ("dataset_id" in adata_like.obs.columns) and (dset_dim > 0):
+        dset_vocab = int(pd.Categorical(adata_like.obs["dataset_id"].astype(str)).categories.size)
+    if ("cell_type" in adata_like.obs.columns) and (ct_dim > 0):
+        ct_vocab   = int(pd.Categorical(adata_like.obs["cell_type"].astype(str)).categories.size)
+
+    ckpt = None
+    state = None
+    # If loading weights, override shapes to exactly match the checkpoint
+    if load_weights_from:
+        ckpt = torch.load(load_weights_from, map_location=args.device)
+        state = ckpt.get("state_dict", ckpt)
+        if "dset_E.weight" in state:
+            w = state["dset_E.weight"]
+            dset_vocab, dset_dim = int(w.size(0)), int(w.size(1))
+        else:
+            # ensure we don't create dset_E if ckpt didn't have it
+            dset_vocab, dset_dim = 0, 0
+        if "ct_E.weight" in state:
+            w = state["ct_E.weight"]
+            ct_vocab, ct_dim = int(w.size(0)), int(w.size(1))
+        else:
+            ct_vocab, ct_dim = 0, 0
+
+    # Build the model with the resolved shapes
     model = GeneMPNN(
         G=G,
         hidden=args.hidden,
@@ -522,12 +553,30 @@ def build_model_for_dataset(adata_like, args, load_weights_from: str = ""):
         tau=args.tau,
         node_dim=args.node_dim,
         proj_dim=args.proj_dim,
+        dset_vocab=dset_vocab, 
+        dset_dim=dset_dim,
+        ct_vocab=ct_vocab,     
+        ct_dim=ct_dim,
     ).to(args.device)
+
+    # Load weights if provided (now shapes match)
     if load_weights_from:
-        ckpt = torch.load(load_weights_from, map_location=args.device)
-        state = ckpt.get("state_dict", ckpt)
         missing, unexpected = model.load_state_dict(state, strict=False)
-        print(f"[load-weights] {load_weights_from} | missing={missing} unexpected={unexpected}")
+        print(f"[load-weights] {load_weights_from} | missing={len(missing)} unexpected={len(unexpected)}")
+        # Restore mapping dicts if present (used by get_dset_indices)
+        meta = ckpt.get("meta", {}) if isinstance(ckpt, dict) else {}
+        if meta:
+            model.dset_id2row = meta.get("dset_id2row", None)
+            model.ct_id2row   = meta.get("ct_id2row", None)
+
+    # If maps weren’t in the checkpoint, derive from this adata (best effort)
+    if (getattr(model, "dset_E", None) is not None) and (model.dset_id2row is None) and ("dataset_id" in adata_like.obs.columns):
+        dcat = pd.Categorical(adata_like.obs["dataset_id"].astype(str))
+        model.dset_id2row = {cat: i for i, cat in enumerate(dcat.categories)}
+    if (getattr(model, "ct_E", None) is not None) and (model.ct_id2row is None) and ("cell_type" in adata_like.obs.columns):
+        ccat = pd.Categorical(adata_like.obs["cell_type"].astype(str))
+        model.ct_id2row   = {cat: i for i, cat in enumerate(ccat.categories)}
+
     return model
 
 def load_full_checkpoint(load_path: str, device: str) -> Tuple[Dict, Dict | None, int, dict]:
