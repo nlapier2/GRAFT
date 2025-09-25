@@ -169,6 +169,22 @@ class GeneMPNN(nn.Module):
             nn.GELU(),
             nn.Linear(self.proj_dim, self.proj_dim),
         )
+        # --- NEW: context→query head (used as QUERIES for contrast) ---
+        # Reuse existing embeddings if present; else make a tiny target embedding.
+        if not hasattr(self, "node_E"):
+            # Fallback target embedding (one row per gene/target)
+            self.target_E = nn.Embedding(self.G, self.hidden)
+            target_dim = self.hidden
+        else:
+            target_dim = self.node_E.embedding_dim
+        dset_dim = getattr(getattr(self, "dset_E", None), "embedding_dim", 0)
+        ct_dim   = getattr(getattr(self, "ct_E",   None), "embedding_dim", 0)
+        ctx_dim  = target_dim + dset_dim + ct_dim + 1  # +1 for alpha scalar
+        self.query_mlp = nn.Sequential(
+            nn.Linear(ctx_dim, self.proj_dim),
+            nn.GELU(),
+            nn.Linear(self.proj_dim, self.proj_dim),
+        )
 
     @torch.no_grad()
     def init_from_prior(self, W_meta: torch.Tensor):
@@ -280,3 +296,46 @@ class GeneMPNN(nn.Module):
         q = self.delta_proj(delta_vec)
         q = torch.nn.functional.normalize(q, dim=-1, eps=1e-8)
         return q
+
+    # === Contrastive KEY projection (delta → emb) ===
+    @torch.no_grad()
+    def project_key(self, delta_vec: torch.Tensor) -> torch.Tensor:
+        k = self.delta_proj(delta_vec)
+        return torch.nn.functional.normalize(k, dim=-1, eps=1e-8)
+
+    # === Contrastive QUERY from CONTEXT (target/dset/ct + alpha) ===
+    def project_query_from_context(self,
+                                   target_idx: torch.Tensor,
+                                   alpha: torch.Tensor,
+                                   dset_idx: torch.Tensor | None = None,
+                                   ct_idx: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Args:
+          target_idx: (B,) long
+          alpha:      (B,) float
+          dset_idx:   (B,) long or None
+          ct_idx:     (B,) long or None
+        Returns:
+          q: (B, proj_dim) L2-normalized
+        """
+        parts = []
+        # target (prefer node_E if it's a real embedding; else fallback)
+        node_emb = getattr(self, "node_E", None)
+        if isinstance(node_emb, torch.nn.Embedding):
+            parts.append(node_emb(target_idx))          # (B, target_dim)
+        else:
+            parts.append(self.target_E(target_idx))     # fallback created in __init__
+
+        # dataset embedding (optional)
+        dset_emb = getattr(self, "dset_E", None)
+        if (dset_idx is not None) and isinstance(dset_emb, torch.nn.Embedding):
+            parts.append(dset_emb(dset_idx))
+
+        # cell-type embedding (optional)
+        ct_emb = getattr(self, "ct_E", None)
+        if (ct_idx is not None) and isinstance(ct_emb, torch.nn.Embedding):
+            parts.append(ct_emb(ct_idx))
+        parts.append(alpha.unsqueeze(-1))  # (B,1)
+        ctx = torch.cat(parts, dim=-1)
+        q = self.query_mlp(ctx)
+        return torch.nn.functional.normalize(q, dim=-1, eps=1e-8)

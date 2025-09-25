@@ -91,6 +91,9 @@ def parse_arguments():
                     help="Sample at most K negatives per step for InfoNCE.")
     ap.add_argument("--neg_cap_per_label", type=int, default=4,
                     help="Keep at most this many keys per pert label in the queue.")
+    ap.add_argument("--contrast_query_type", type=str, default="context",
+                    choices=["context", "delta"],
+                    help="Use 'context' (target+dset+ct+alpha) or 'delta' (predicted pseudobulk)")
     ap.add_argument("--load_model_path", type=str, default="",
                     help="Path to a saved checkpoint (.pt). If set, training will start from these weights.")
     ap.add_argument("--save_model_path", type=str, default="",
@@ -141,6 +144,7 @@ def train(
     neg_k: int = 16,
     neg_cap_per_label: int = 4,
     optimizer_state: Dict | None = None,    
+    contrast_query_type: str = "context",
 ):
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
@@ -312,8 +316,19 @@ def train(
                     else:
                         ema_centroid[key_id] = delta_obs
                     key_vec = ema_centroid[key_id]
-                k_pos = model.project_key(key_vec)
-                q     = model.project_query(delta_pred)     # (1,D), with grad
+                k_pos = model.project_key(delta_obs)        # (1,D), no grad
+                # === NEW: decoupled query from CONTEXT (default) ===
+                if contrast_query_type == "context":
+                    # Use the *same batch* context: target index, alpha from forward, and optional dataset/celltype ids
+                    q = model.project_query_from_context(
+                        target_idx=tidx,                 # (B,)
+                        alpha=alpha_vec.detach(),        # (B,) use grad if you want InfoNCE to shape alpha; detach to keep alpha head independent
+                        dset_idx=z_d if z_d is not None else None,
+                        ct_idx=z_ct if z_ct is not None else None
+                    ).mean(dim=0, keepdim=True)          # (1,D) use batch-mean context query (stable)
+                else:
+                    # Old behavior: query from predicted pseudobulk delta
+                    q = model.project_query(delta_pred)   # (1,D)
                 # mask out negatives with same pert label (avoid trivial collisions)
                 cur_lbl = str(btargets[0])
                 # mask out same-label negatives
@@ -719,6 +734,7 @@ def main():
             neg_k=args.neg_k,
             neg_cap_per_label=args.neg_cap_per_label,
             optimizer_state=resume_opt_state,
+            contrast_query_type=args.contrast_query_type
         )
 
     # ---------------------------
@@ -773,6 +789,7 @@ def main():
         neg_k=args.neg_k,
         neg_cap_per_label=args.neg_cap_per_label,
         optimizer_state=resume_opt_state,
+        contrast_query_type=args.contrast_query_type
     )
 
     # ---------------------------

@@ -494,7 +494,7 @@ def build_model_for_dataset(adata_like, args, load_weights_from: str = ""):
         ckpt = torch.load(load_weights_from, map_location=args.device)
         state = ckpt.get("state_dict", ckpt)
         missing, unexpected = model.load_state_dict(state, strict=False)
-        print(f"[load-weights] {load_weights_from} | missing={len(missing)} unexpected={len(unexpected)}")
+        print(f"[load-weights] {load_weights_from} | missing={missing} unexpected={unexpected}")
     return model
 
 def load_full_checkpoint(load_path: str, device: str) -> Tuple[Dict, Dict | None, int, dict]:
