@@ -85,8 +85,12 @@ def parse_arguments():
                     help="Projection dim for contrastive embeddings.")
     ap.add_argument("--contrast_tau", type=float, default=0.1,
                     help="InfoNCE temperature.")
-    ap.add_argument("--queue_size", type=int, default=2048,
+    ap.add_argument("--queue_size", type=int, default=64,
                     help="Number of negative keys to keep in memory queue.")
+    ap.add_argument("--neg_k", type=int, default=16,
+                    help="Sample at most K negatives per step for InfoNCE.")
+    ap.add_argument("--neg_cap_per_label", type=int, default=4,
+                    help="Keep at most this many keys per pert label in the queue.")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     return args
@@ -128,7 +132,9 @@ def train(
     weight_contrast: float = 0.0,
     proj_dim: int = 128,
     contrast_tau: float = 0.1,
-    queue_size: int = 2048,
+    queue_size: int = 64,
+    neg_k: int = 16,
+    neg_cap_per_label: int = 4,
 ):
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
@@ -186,7 +192,7 @@ def train(
 
     # --- simple FIFO queue for contrastive loss negative keys (L2-normalized embeddings) ---
     neg_bank = torch.empty((0, proj_dim), device=device)
-    neg_labels = []  # list[str] same length as neg_bank rows
+    neg_labels: list[str] = []  # list[str] same length as neg_bank rows
     def _enqueue(k: torch.Tensor, lbl: str):
         nonlocal neg_bank, neg_labels
         # k: (1,D) or (B,D) -> ensure 2D
@@ -195,6 +201,15 @@ def train(
         if k.size(0) > 1:
             # take first row (we use one pseudobulk per batch)
             k = k[:1]
+        # enforce per-label cap
+        if neg_labels.count(lbl) >= neg_cap_per_label:
+            # find first index for this label, drop it
+            idx = next(i for i, L in enumerate(neg_labels) if L == lbl)
+            keep_mask = torch.ones(len(neg_labels), dtype=torch.bool, device=neg_bank.device)
+            keep_mask[idx] = False
+            neg_bank = neg_bank[keep_mask]
+            del neg_labels[idx]
+        # append
         neg_bank = torch.cat([neg_bank, k.detach()], dim=0)
         neg_labels.append(lbl)
         # trim
@@ -202,6 +217,10 @@ def train(
             cut = neg_bank.size(0) - queue_size
             neg_bank = neg_bank[cut:]
             del neg_labels[:cut]
+
+    # EMA centroids for observed pseudobulk deltas per (pert,dset)
+    ema_centroid = {}   # dict[(label, dset_id)] -> torch.Tensor (1, G)
+    ema_beta = 0.9
 
     # Simple schedule
     steps_per_epoch = math.ceil(pert_mask.sum() / batch_size)
@@ -261,16 +280,44 @@ def train(
                 delta_obs = (bx_pert - bx_ctrl).mean(dim=0, keepdim=True)      # (1,G)
                 # predicted batch pseudobulk delta
                 delta_pred = (yhat - x0).mean(dim=0, keepdim=True)             # (1,G)
+                # IMPORTANT: drop the target gene column from both deltas to match
+                # the model's constraint y[:, t] := x0[:, t] (predicted delta at t is 0).
+                t = int(tidx[0].item()) if tidx.numel() > 0 else -1
+                if t >= 0:
+                    # clone to avoid modifying upstream tensors
+                    delta_obs  = delta_obs.clone()
+                    delta_pred = delta_pred.clone()
+                    delta_obs[0, t]  = 0.0
+                    delta_pred[0, t] = 0.0
                 # embeddings
-                k_pos = model.project_key(delta_obs)        # (1,D), no grad
+                # === EMA centroid key ===
+                cur_lbl = str(btargets[0])
+                dset_id = int(z_d[0].item()) if z_d is not None else -1
+                key_id = (cur_lbl, dset_id)
+                with torch.no_grad():
+                    if key_id in ema_centroid:
+                        ema_centroid[key_id] = ema_beta * ema_centroid[key_id] + (1 - ema_beta) * delta_obs
+                    else:
+                        ema_centroid[key_id] = delta_obs
+                    key_vec = ema_centroid[key_id]
+                k_pos = model.project_key(key_vec)
                 q     = model.project_query(delta_pred)     # (1,D), with grad
                 # mask out negatives with same pert label (avoid trivial collisions)
                 cur_lbl = str(btargets[0])
+                # mask out same-label negatives
                 if len(neg_labels) > 0:
-                    keep = torch.tensor([lbl != cur_lbl for lbl in neg_labels], device=device, dtype=torch.bool)
+                    keep_mask = torch.tensor([lbl != cur_lbl for lbl in neg_labels],
+                                             device=device, dtype=torch.bool)
+                    bank = neg_bank[keep_mask]
+                    labels_kept = [L for L, m in zip(neg_labels, keep_mask.tolist()) if m]
+                    # subsample up to K negatives
+                    if bank.size(0) > neg_k:
+                        idx = torch.randperm(bank.size(0), device=device)[:neg_k]
+                        bank = bank[idx]
+                        # labels_kept becomes subset only for logging; not needed below
                 else:
-                    keep = None
-                loss_contrast = info_nce_loss(q, k_pos, neg_bank, tau=contrast_tau, neg_mask=keep)
+                    bank = neg_bank
+                loss_contrast = info_nce_loss(q, k_pos, bank, tau=contrast_tau)
             else:
                 loss_contrast = torch.tensor(0.0, device=device)
 
@@ -645,6 +692,8 @@ def main():
             proj_dim=args.proj_dim,
             contrast_tau=args.contrast_tau,
             queue_size=args.queue_size,
+            neg_k=args.neg_k,
+            neg_cap_per_label=args.neg_cap_per_label,
         )
 
     # ---------------------------
@@ -683,6 +732,8 @@ def main():
         proj_dim=args.proj_dim,
         contrast_tau=args.contrast_tau,
         queue_size=args.queue_size,
+        neg_k=args.neg_k,
+        neg_cap_per_label=args.neg_cap_per_label,
     )
 
     # ---------------------------
