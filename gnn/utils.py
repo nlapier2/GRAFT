@@ -1,6 +1,6 @@
 # --- utility functions for GNN training and evaluation ---
 import os
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Optional
 import numpy as np
 import pandas as pd
 import anndata as ad
@@ -184,7 +184,13 @@ def sample_batch_by_mode(single_pert_batches: bool, pretrain_mode: bool, rng: np
         )
     return bx_ctrl, bx_pert, btargets, sel_pert
 
-def get_dset_indices(sel_pert, pert_rowidx, adata: ad.AnnData, device: str) -> Tuple[torch.Tensor | None, torch.Tensor | None]:
+def get_dset_indices(sel_pert, pert_rowidx, adata: ad.AnnData, device: str, model: Optional[nn.Module] = None) -> Tuple[torch.Tensor | None, torch.Tensor | None]:
+    """
+    Prefer model's Stage-1 category->row maps (dset_id2row / ct_id2row) so Stage-2
+    indices line up with learned embedding rows. If any row is unmapped, return None
+    for that embedding so the forward() zeros-fallback is used. Otherwise, fall back
+    to per-batch Categorical codes. Always return torch.long when not None.
+    """
     z_d, z_ct = None, None
     # identify the row indices that produced bx_pert
     if 'sel_pert' in locals() and sel_pert is not None:           # pretrain_mode branch (or random sampler)
@@ -197,19 +203,46 @@ def get_dset_indices(sel_pert, pert_rowidx, adata: ad.AnnData, device: str) -> T
             idx_rows = np.asarray(pert_rowidx, dtype=int)
     else:
         idx_rows = None
+
     if idx_rows is not None:
-        if "dataset_id" in adata.obs.columns:
-            z_d = torch.tensor(pd.Categorical(adata.obs.iloc[idx_rows]["dataset_id"]).codes,
-                                device=device)
-        if "cell_type" in adata.obs.columns:
+        # --- DATASET indices ---
+        if "dataset_id" in adata.obs.columns and \
+           (getattr(model, "dset_E", None) is not None) and \
+           isinstance(getattr(model, "dset_E", None), nn.Embedding) and \
+           (getattr(model, "dset_id2row", None) is not None):
+            vals = adata.obs["dataset_id"].astype(str).values[idx_rows]
+            idxs = [model.dset_id2row.get(v, -1) for v in vals]
+            if all(i >= 0 for i in idxs):
+                z_d = torch.tensor(idxs, device=device, dtype=torch.long)
+            else:
+                z_d = None  # triggers zeros-fallback in forward()
+        elif "dataset_id" in adata.obs.columns:
+            # fallback: per-batch categoricals (may not align with Stage-1 ordering)
+            z_d = torch.tensor(
+                pd.Categorical(adata.obs.iloc[idx_rows]["dataset_id"]).codes,
+                device=device, dtype=torch.long
+            )
+
+        # --- CELL-TYPE indices ---
+        if "cell_type" in adata.obs.columns and \
+           (getattr(model, "ct_E", None) is not None) and \
+           isinstance(getattr(model, "ct_E", None), nn.Embedding) and \
+           (getattr(model, "ct_id2row", None) is not None):
+            vals = adata.obs["cell_type"].astype(str).values[idx_rows]
+            idxs = [model.ct_id2row.get(v, -1) for v in vals]
+            if all(i >= 0 for i in idxs):
+                z_ct = torch.tensor(idxs, device=device, dtype=torch.long)
+            else:
+                z_ct = None
+        elif "cell_type" in adata.obs.columns:
             ct_slice = adata.obs.iloc[idx_rows]["cell_type"]
-            # Cast to str before fill/replace to avoid Categorical category errors
+            # robust cast to str then sanitize UNK-like values
             if isinstance(ct_slice.dtype, pd.CategoricalDtype):
                 ct_slice = ct_slice.astype(str)
             else:
                 ct_slice = ct_slice.astype(str)
             ct_slice = ct_slice.replace({"<NA>": "UNK", "mixed": "UNK"}).fillna("UNK")
-            z_ct = torch.tensor(pd.Categorical(ct_slice).codes, device=device)
+            z_ct = torch.tensor(pd.Categorical(ct_slice).codes, device=device, dtype=torch.long)
     return z_d, z_ct
 
 def make_base_adjacency(G: int, self_loops: bool = True) -> torch.Tensor:

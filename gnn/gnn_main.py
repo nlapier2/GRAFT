@@ -69,13 +69,9 @@ def parse_arguments():
                         help="Also pseudobulk the target dataset and include it in Stage-1 pretraining")
     ap.add_argument("--pretrain_epochs", type=int, default=10,
                     help="Epochs to run Stage-1 pseudobulk pretraining")
-    ap.add_argument("--use_dset_embed", action="store_true",
-                    help="Enable dataset_id embeddings (used in FiLM/proto conditioning)")
-    ap.add_argument("--use_celltype_embed", action="store_true",
-                    help="Enable cell_type embeddings (used in FiLM/proto conditioning)")
-    ap.add_argument("--dset_embed_dim", type=int, default=16,
+    ap.add_argument("--dset_embed_dim", type=int, default=0,
                     help="Dimensionality of dataset embedding (if enabled)")
-    ap.add_argument("--ct_embed_dim", type=int, default=16,
+    ap.add_argument("--ct_embed_dim", type=int, default=0,
                     help="Dimensionality of cell_type embedding (if enabled)")
     ap.add_argument("--missing_gene_fill", type=str, default="nan", choices=["nan", "-1"],
                         help="Placeholder used in pseudobulk for missing genes; masked in Stage-1 losses")
@@ -145,6 +141,8 @@ def train(
     neg_cap_per_label: int = 4,
     optimizer_state: Dict | None = None,    
     contrast_query_type: str = "context",
+    dset_embed_dim: int = 0,
+    ct_embed_dim: int = 0
 ):
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
@@ -185,7 +183,33 @@ def train(
     # Create Model (reuse if provided)
     if model is None:
         prior_dim = W_meta.shape[0] if W_meta is not None else None
-        model = GeneMPNN(G=G, hidden=hidden, T=T, tau=tau, node_dim=node_dim, prior_dim=prior_dim, proj_dim=proj_dim).to(device)
+
+        # --- infer dataset / cell-type vocab sizes from this adata ---
+        # Use embeddings only if columns exist and dims are >0
+        dset_vocab = 0
+        ct_vocab   = 0
+        dset_dim_  = 0
+        ct_dim_    = 0
+        if ("dataset_id" in adata.obs.columns) and (dset_embed_dim > 0):
+            # stable category list (works for strings)
+            dset_vocab = int(pd.Categorical(adata.obs["dataset_id"].astype(str)).categories.size)
+            dset_dim_  = dset_embed_dim
+        if ("cell_type" in adata.obs.columns) and (ct_embed_dim > 0):
+            ct_vocab = int(pd.Categorical(adata.obs["cell_type"].astype(str)).categories.size)
+            ct_dim_  = ct_embed_dim
+
+        model = GeneMPNN(
+            G=G, hidden=hidden, T=T, tau=tau, node_dim=node_dim, prior_dim=prior_dim,
+            dset_vocab=dset_vocab, dset_dim=dset_dim_, ct_vocab=ct_vocab, ct_dim=ct_dim_,
+            proj_dim=proj_dim
+        ).to(device)
+        # --- store category→row maps for reuse in later stages ---
+        if ("dataset_id" in adata.obs.columns) and (getattr(model, "dset_E", None) is not None):
+            dcat = pd.Categorical(adata.obs["dataset_id"].astype(str))
+            model.dset_id2row = {cat: i for i, cat in enumerate(dcat.categories)}
+        if ("cell_type" in adata.obs.columns) and (getattr(model, "ct_E", None) is not None):
+            ccat = pd.Categorical(adata.obs["cell_type"].astype(str))
+            model.ct_id2row   = {cat: i for i, cat in enumerate(ccat.categories)}
         # Optionally initialize node embeddings from prior
         if (W_meta is not None) and init_from_meta:
             Wm_torch = torch.from_numpy(W_meta.astype(np.float32)).to(device)  # (R,G)
@@ -268,11 +292,10 @@ def train(
             bx_pert = bx_pert.to(device)
             tidx = tidx.to(device)
 
-            # dataset / cell-type indices pulled from the SAME rows as bx_pert
-            z_d, z_ct = get_dset_indices(sel_pert, pert_rowidx, adata, device)
-
             # per-sample perturbation row indices for embedding / FiLM
             pert_rowidx = torch.tensor([pert2row[t] for t in btargets], dtype=torch.long, device=device)
+            # dataset / cell-type indices pulled from the SAME rows as bx_pert
+            z_d, z_ct = get_dset_indices(sel_pert, pert_rowidx, adata, device, model=model)
             yhat, x0, alpha_vec = model(bx_ctrl, tidx, A_base, pert_rowidx=pert_rowidx, dset_idx=z_d, ct_idx=z_ct)
 
             # --- Prototype / bulk-delta loss (aligns to PDS) ---
@@ -486,8 +509,9 @@ def predict_all_perturbations(
         bx_ctrl = torch.from_numpy(X[rand_ctrl]).float().to(device)
         tidx = torch.tensor([t2gi.get(p, -1) for p in pert_names[start:end]], dtype=torch.long, device=device)
         pert_rowidx = torch.tensor([pert2row[p] for p in pert_names[start:end]], dtype=torch.long, device=device)
+        z_d, z_ct = get_dset_indices(None, pert_rowidx, adata, device, model=model)
 
-        yhat, _, _ = model(bx_ctrl, tidx, A_base, pert_rowidx=pert_rowidx)
+        yhat, _, _ = model(bx_ctrl, tidx, A_base, pert_rowidx=pert_rowidx, dset_idx=z_d, ct_idx=z_ct)
         pred_mat[b_idx] = yhat.detach().cpu().numpy()
 
     return pred_mat, true_mat, pert_names, ctrl_mean, pert_idx
@@ -656,6 +680,8 @@ def main():
     # Read input data
     # ---------------------------
     adata = ad.read_h5ad(args.in_h5ad)
+    adata.obs['dataset_id'] = "target_all"
+    adata.obs['cell_type'] = "UNK"
     pb_target = None  # pseudobulked target data for Stage-1 pretraining
     if args.include_target_pseudobulk:
         pb_target = make_pretrain_pseudobulk_from_adata(adata, args.target_label, args.control_label, dataset_id="target_all")
@@ -734,7 +760,9 @@ def main():
             neg_k=args.neg_k,
             neg_cap_per_label=args.neg_cap_per_label,
             optimizer_state=resume_opt_state,
-            contrast_query_type=args.contrast_query_type
+            contrast_query_type=args.contrast_query_type,
+            dset_embed_dim=args.dset_embed_dim,
+            ct_embed_dim=args.ct_embed_dim
         )
 
     # ---------------------------
@@ -789,7 +817,9 @@ def main():
         neg_k=args.neg_k,
         neg_cap_per_label=args.neg_cap_per_label,
         optimizer_state=resume_opt_state,
-        contrast_query_type=args.contrast_query_type
+        contrast_query_type=args.contrast_query_type,
+        dset_embed_dim=args.dset_embed_dim,
+        ct_embed_dim=args.ct_embed_dim
     )
 
     # ---------------------------
