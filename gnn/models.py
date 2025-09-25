@@ -132,8 +132,8 @@ class MPNNLayer(nn.Module):
         return h_out
 
 class GeneMPNN(nn.Module):
-    def __init__(self, G: int, hidden: int = 128, T: int = 2, tau: float = 0.0, alpha_cap: float = 1.0, prior_dim: int | None = None,
-                 dset_vocab: int = 0, dset_dim: int = 0, ct_vocab: int = 0, ct_dim: int = 0, proj_dim: int = 128):
+    def __init__(self, G: int, hidden: int = 128, T: int = 2, tau: float = 0.0, alpha_cap: float = 1.0, node_dim: int = 128,
+                 prior_dim: int | None = None, dset_vocab: int = 0, dset_dim: int = 0, ct_vocab: int = 0, ct_dim: int = 0, proj_dim: int = 128):
         super().__init__()
         self.G = G
         self.hidden = hidden
@@ -141,7 +141,7 @@ class GeneMPNN(nn.Module):
         self.alpha_cap = alpha_cap
         self.proj_dim = proj_dim
         # per-gene node embeddings (used by all nodes, every batch)
-        self.node_dim = 64
+        self.node_dim = node_dim
         self.node_E = nn.Embedding(G, self.node_dim)
         nn.init.normal_(self.node_E.weight, std=0.02)
         # Optional small projector: prior (R) -> node_dim

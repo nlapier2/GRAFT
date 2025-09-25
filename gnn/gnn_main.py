@@ -47,6 +47,9 @@ def parse_arguments():
                     help="Fraction of perturbation labels (excluding control) to hold out for testing. 0.0 = no holdout.")
     ap.add_argument("--test_h5ad", type=str, default="",
                     help="Optional path to a separate test AnnData. If set, overrides --test_pct_perts.")
+    ap.add_argument("--weight_mse", type=float, default=0.0, help="Weight for per-cell MSE loss.")
+    ap.add_argument("--weight_proto", type=float, default=0.2, help="Weight for prototype loss.")
+    ap.add_argument("--node_dim", type=int, default=128, help="Dimensionality of gene node embeddings.")
     ap.add_argument("--dist_loss", choices=["none","mmd","swd","energy"], default="mmd",
                     help="Distribution loss between predicted and true deltas per perturbation.")
     ap.add_argument("--weight_dist", type=float, default=1.0, help="Weight for distribution loss.")
@@ -112,6 +115,7 @@ def train(
     weight_local: float = 0.0,
     weight_mse: float = 0.0,
     weight_proto: float = 0.2,
+    node_dim: int = 128,
     seed: int = 0,
     tau: float = 0.0,
     device: str = "cuda",
@@ -175,7 +179,7 @@ def train(
     # Create Model (reuse if provided)
     if model is None:
         prior_dim = W_meta.shape[0] if W_meta is not None else None
-        model = GeneMPNN(G=G, hidden=hidden, T=T, tau=tau, prior_dim=prior_dim, proj_dim=proj_dim).to(device)
+        model = GeneMPNN(G=G, hidden=hidden, T=T, tau=tau, node_dim=node_dim, prior_dim=prior_dim, proj_dim=proj_dim).to(device)
         # Optionally initialize node embeddings from prior
         if (W_meta is not None) and init_from_meta:
             Wm_torch = torch.from_numpy(W_meta.astype(np.float32)).to(device)  # (R,G)
@@ -671,6 +675,9 @@ def main():
             lr=args.lr,
             weight_target=args.weight_target,     # keep α supervision for gene perts
             weight_local=0.0,
+            weight_mse=0.0,                       # no MSE loss in Stage-1
+            weight_proto=args.weight_proto,
+            node_dim=args.node_dim,
             seed=args.seed,
             tau=args.tau,
             device=args.device,
@@ -711,6 +718,9 @@ def main():
         lr=args.lr,
         weight_target=args.weight_target,
         weight_local=args.weight_local,
+        weight_mse=args.weight_mse,
+        weight_proto=args.weight_proto,
+        node_dim=args.node_dim,
         seed=args.seed,
         tau=args.tau,
         device=args.device,
