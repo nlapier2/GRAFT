@@ -218,6 +218,7 @@ def train(
     if optimizer_state is not None:
         try:
             opt.load_state_dict(optimizer_state)
+            expand_adam_states_for_embeddings(opt)
             print("[train] optimizer state loaded")
         except Exception as e:
             print(f"[train] optimizer state load failed: {e}")
@@ -717,10 +718,10 @@ def main():
         print(f"=== Stage-1: pretraining on {pb_len} pseudobulk sources; total rows: {pb_all.n_obs} ===")
         # Optionally resume Stage-1 from a full checkpoint
         if args.load_model_path:
+            # Model & weights are already loaded (with embedding expansion) by the builder:
             resume_model = build_model_for_dataset(pb_all, args, load_weights_from=args.load_model_path)
-            state, opt_state, start_ep, _ = load_full_checkpoint(args.load_model_path, device=args.device)
-            missing, unexpected = resume_model.load_state_dict(state, strict=False)
-            print(f"[stage1] load ckpt | missing={len(missing)} unexpected={len(unexpected)}")
+            # Only take optimizer state from the checkpoint; do NOT reload model weights again.
+            _, opt_state, _, _ = load_full_checkpoint(args.load_model_path, device=args.device)
             resume_opt_state = opt_state
         model, opt = train(
             adata=pb_all,
@@ -771,10 +772,10 @@ def main():
     print(f"=== Stage-2: training on {'train+test' if adata_test is not None else 'train'} set ===")
     # If resuming Stage-2
     if (model is None) and args.load_model_path:
-        model = build_model_for_dataset(adata_train, args, load_weights_from=args.load_model_path)  # fresh instance
-        state, opt_state, start_ep, _ = load_full_checkpoint(args.load_model_path, device=args.device)
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        print(f"[stage2] load ckpt | missing={len(missing)} unexpected={len(unexpected)}")
+        # Model & weights are already loaded (with embedding expansion) by the builder:
+        model = build_model_for_dataset(adata_train, args, load_weights_from=args.load_model_path)
+        # Only take optimizer state from the checkpoint; do NOT reload model weights again.
+        _, opt_state, _, _ = load_full_checkpoint(args.load_model_path, device=args.device)
         resume_opt_state = opt_state
     elif (model is None) and args.load_model_path:
         model = build_model_for_dataset(adata_train, args, load_weights_from=args.load_model_path)

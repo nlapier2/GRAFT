@@ -512,38 +512,135 @@ def compute_locality_metrics(
         out[f"loc@{k}"] = loc_sums[k] / n
     return out
 
+
+def _merge_id_maps(old_map: dict | None, new_cats: list[str]) -> dict:
+    """
+    Keep previous indices for known categories; append new ones at the end.
+    """
+    old_map = old_map or {}
+    merged = dict(old_map)  # copy
+    next_idx = 0 if not old_map else (max(old_map.values()) + 1)
+    for c in new_cats:
+        if c not in merged:
+            merged[c] = next_idx
+            next_idx += 1
+    return merged
+
+def _load_state_with_embedding_expansion(
+    model,
+    state: dict,
+    expand_keys=("dset_E.weight", "ct_E.weight", "cond_E.weight"),
+):
+    """
+    Expand checkpoint embedding matrices to the model's size (row-wise), copy
+    overlapping rows, and then load once. Leaves new rows randomly initialized.
+    Returns (missing, unexpected) like load_state_dict.
+    """
+    model_state = model.state_dict()
+    # Make a shallow copy so we can edit tensors in-place for load
+    state_expanded = dict(state)
+    for k in expand_keys:
+        if (k in state_expanded) and (k in model_state):
+            W_old = state_expanded[k]
+            W_new = model_state[k]
+            if (
+                W_old.dim() == 2
+                and W_new.dim() == 2
+                and W_old.size(1) == W_new.size(1)   # same embed dim
+                and W_old.size(0) <= W_new.size(0)   # old rows ≤ new rows
+            ):
+                # Build an expanded tensor initialized as current model param,
+                # then copy old rows into the front slice.
+                W_exp = W_new.clone()
+                W_exp[: W_old.size(0), :] = W_old.to(W_new.device, dtype=W_new.dtype)
+                state_expanded[k] = W_exp
+            # else: shapes incompatible → let load_state_dict report it
+    missing, unexpected = model.load_state_dict(state_expanded, strict=False)
+    return missing, unexpected
+
+def expand_adam_states_for_embeddings(optimizer: torch.optim.Optimizer):
+    """
+    If an embedding param grew rows (e.g., [2, D] -> [3, D]), expand Adam buffers
+    (exp_avg, exp_avg_sq) to match the new shape by zero-padding the extra rows.
+    Safe no-op for non-Adam or already-matching shapes.
+    """
+    for p, st in optimizer.state.items():
+        if not st:
+            continue
+        exp_avg = st.get("exp_avg", None)
+        exp_var = st.get("exp_avg_sq", None)
+        if exp_avg is None or exp_var is None:
+            continue
+        # Only handle 2D (embedding-like) tensors where only row count changed
+        if p.data.dim() == 2 and exp_avg.dim() == 2 and exp_var.dim() == 2:
+            rows_new, dim_new = p.data.size(0), p.data.size(1)
+            rows_old, dim_old = exp_avg.size(0), exp_avg.size(1)
+            if dim_new == dim_old and rows_old < rows_new:
+                dev = p.data.device
+                dt  = exp_avg.dtype
+                ea  = torch.zeros((rows_new, dim_new), device=dev, dtype=dt)
+                ev  = torch.zeros((rows_new, dim_new), device=dev, dtype=dt)
+                ea[:rows_old, :] = exp_avg.to(dev)
+                ev[:rows_old, :] = exp_var.to(dev)
+                st["exp_avg"]    = ea
+                st["exp_avg_sq"] = ev
+
 # --- helpers for (re)building and (re)loading ---
 def build_model_for_dataset(adata_like, args, load_weights_from: str = ""):
     G = adata_like.n_vars
-    # --- default dims from args ---
+
+    # Defaults from args
     dset_dim = int(getattr(args, "dset_embed_dim", 0) or 0)
     ct_dim   = int(getattr(args, "ct_embed_dim",   0) or 0)
     dset_vocab = 0
     ct_vocab   = 0
 
-    # Infer vocab sizes from the current AnnData when dims > 0
+    # Categories present in *this* adata
+    dset_cats = []
+    ct_cats   = []
     if ("dataset_id" in adata_like.obs.columns) and (dset_dim > 0):
-        dset_vocab = int(pd.Categorical(adata_like.obs["dataset_id"].astype(str)).categories.size)
+        dset_cats = list(pd.Categorical(adata_like.obs["dataset_id"].astype(str)).categories)
+        dset_vocab = len(dset_cats)
     if ("cell_type" in adata_like.obs.columns) and (ct_dim > 0):
-        ct_vocab   = int(pd.Categorical(adata_like.obs["cell_type"].astype(str)).categories.size)
+        ct_cats = list(pd.Categorical(adata_like.obs["cell_type"].astype(str)).categories)
+        ct_vocab = len(ct_cats)
 
     ckpt = None
     state = None
-    # If loading weights, override shapes to exactly match the checkpoint
+    # If loading weights, union vocab with checkpoint (allow expansion)
     if load_weights_from:
         ckpt = torch.load(load_weights_from, map_location=args.device)
         state = ckpt.get("state_dict", ckpt)
+        # Embed dims from checkpoint if present
         if "dset_E.weight" in state:
-            w = state["dset_E.weight"]
-            dset_vocab, dset_dim = int(w.size(0)), int(w.size(1))
-        else:
-            # ensure we don't create dset_E if ckpt didn't have it
-            dset_vocab, dset_dim = 0, 0
+            w = state["dset_E.weight"]; dset_dim_ck, dset_vocab_ck = int(w.size(1)), int(w.size(0))
+            dset_dim = dset_dim_ck
+            dset_vocab = max(dset_vocab, dset_vocab_ck)
         if "ct_E.weight" in state:
-            w = state["ct_E.weight"]
-            ct_vocab, ct_dim = int(w.size(0)), int(w.size(1))
-        else:
-            ct_vocab, ct_dim = 0, 0
+            w = state["ct_E.weight"]; ct_dim_ck, ct_vocab_ck = int(w.size(1)), int(w.size(0))
+            ct_dim = ct_dim_ck
+            ct_vocab = max(ct_vocab, ct_vocab_ck)
+        # Also match node embedding dim if present
+        if "node_E.weight" in state:
+            args.node_dim = int(state["node_E.weight"].size(1))
+
+    # ---- decide final vocab sizes from *merged maps* (old maps + new categories) ----
+    old_dmap = None
+    old_ctmap = None
+    if isinstance(ckpt, dict):
+        meta = ckpt.get("meta", {})
+        old_dmap = meta.get("dset_id2row", None)
+        old_ctmap = meta.get("ct_id2row", None)
+
+    # Merge id maps: keep existing indices; append new categories at the end
+    merged_dmap = _merge_id_maps(old_dmap, dset_cats) if dset_dim > 0 else None
+    merged_ctmap = _merge_id_maps(old_ctmap, ct_cats) if ct_dim > 0 else None
+
+    # Final vocabs MUST be at least the size of merged maps (prevents out-of-range indices)
+    if merged_dmap is not None:
+        dset_vocab = max(dset_vocab, len(merged_dmap))
+    if merged_ctmap is not None:
+        ct_vocab = max(ct_vocab, len(merged_ctmap))
 
     # Build the model with the resolved shapes
     model = GeneMPNN(
@@ -559,23 +656,19 @@ def build_model_for_dataset(adata_like, args, load_weights_from: str = ""):
         ct_dim=ct_dim,
     ).to(args.device)
 
-    # Load weights if provided (now shapes match)
+    # Load weights, allowing embedding expansion
     if load_weights_from:
-        missing, unexpected = model.load_state_dict(state, strict=False)
+        missing, unexpected = _load_state_with_embedding_expansion(model, state)
         print(f"[load-weights] {load_weights_from} | missing={len(missing)} unexpected={len(unexpected)}")
-        # Restore mapping dicts if present (used by get_dset_indices)
-        meta = ckpt.get("meta", {}) if isinstance(ckpt, dict) else {}
-        if meta:
-            model.dset_id2row = meta.get("dset_id2row", None)
-            model.ct_id2row   = meta.get("ct_id2row", None)
+        # Set merged maps on the model (so get_dset_indices uses the expanded namespace)
+        model.dset_id2row = merged_dmap
+        model.ct_id2row   = merged_ctmap
 
-    # If maps weren’t in the checkpoint, derive from this adata (best effort)
-    if (getattr(model, "dset_E", None) is not None) and (model.dset_id2row is None) and ("dataset_id" in adata_like.obs.columns):
-        dcat = pd.Categorical(adata_like.obs["dataset_id"].astype(str))
-        model.dset_id2row = {cat: i for i, cat in enumerate(dcat.categories)}
-    if (getattr(model, "ct_E", None) is not None) and (model.ct_id2row is None) and ("cell_type" in adata_like.obs.columns):
-        ccat = pd.Categorical(adata_like.obs["cell_type"].astype(str))
-        model.ct_id2row   = {cat: i for i, cat in enumerate(ccat.categories)}
+    # If no checkpoint: derive maps from this adata
+    if (getattr(model, "dset_E", None) is not None) and (model.dset_id2row is None) and dset_cats:
+        model.dset_id2row = {cat: i for i, cat in enumerate(dset_cats)}
+    if (getattr(model, "ct_E", None) is not None) and (model.ct_id2row is None) and ct_cats:
+        model.ct_id2row   = {cat: i for i, cat in enumerate(ct_cats)}
 
     return model
 
@@ -601,6 +694,8 @@ def save_full_checkpoint(path: str, model, optimizer,  extra_meta: dict = None):
             "hidden": getattr(model, "hidden", None),
             "T": getattr(model, "T", None),
             "proj_dim": getattr(model, "proj_dim", None),
+            "dset_id2row": model.dset_id2row,
+            "ct_id2row": model.ct_id2row
         },
     }
     if extra_meta:
