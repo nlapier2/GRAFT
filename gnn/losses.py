@@ -384,7 +384,7 @@ def compute_distance_loss(yhat, x0, bx_pert, btargets, by_lbl, t2gi, dist_loss, 
             if dist_loss == "mmd":
                 loss_dist = loss_dist + mmd_rbf(d_pred, d_true)
             elif dist_loss == "swd":
-                loss_dist = loss_dist + sliced_wasserstein(d_pred, d_true, num_proj=swd_projections)
+                loss_dist = loss_dist + sliced_wasserstein(d_pred, d_true, n_proj=swd_projections)
             elif dist_loss == "energy":
                 loss_dist = loss_dist + energy_distance(d_pred, d_true)
         # average across present perts

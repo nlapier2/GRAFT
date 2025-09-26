@@ -119,7 +119,11 @@ class MPNNLayer(nn.Module):
         h_t_frozen: (B,1,C) the clamped target embedding to re-impose after update
         """
         # messages
-        m = self.beta * torch.matmul(A_batch, self.msg(h))  # (B,G,C)
+        M = self.msg(h)                                     # (B,G,C)
+        B, G, C = M.shape
+        Agg = torch.mm(A_batch, M.permute(1,0,2).reshape(G, B*C)) \
+                .reshape(G, B, C).permute(1,0,2).contiguous()     # (B,G,C)
+        m = self.beta * Agg
         h_new = self.act(self.upd(torch.cat([h, m], dim=-1)))  # (B,G,C)
         # residual
         h_out = self.norm(h + h_new)
@@ -240,7 +244,8 @@ class GeneMPNN(nn.Module):
         e_aug = torch.cat([e_t, alpha_t.unsqueeze(-1)], dim=-1) if z_extra is None else torch.cat([e_t, alpha_t.unsqueeze(-1), z_extra], dim=-1)
         gamma = torch.tanh(self.film_gamma(e_aug)).unsqueeze(1)       # (B,1,H)
         beta  = self.film_beta(e_aug).unsqueeze(1)                    # (B,1,H)
-        h = h * (1 + gamma) + beta
+        g1 = gamma.add(1)          # (B,1,H)  small; avoids building (B,G,H)
+        h.mul_(g1).add_(beta)      # in-place on h; uses broadcast, no extra buffers
 
         # Use a single shared adjacency (G,G) for the whole batch.
         A_batch = A_base.to(device)  # (G,G), requires_grad=False
