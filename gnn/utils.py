@@ -1,6 +1,6 @@
 # --- utility functions for GNN training and evaluation ---
 import os
-from typing import Tuple, Dict, List, Optional
+from typing import Tuple, Dict, List, Optional, Sequence
 import numpy as np
 import pandas as pd
 import anndata as ad
@@ -701,3 +701,77 @@ def save_full_checkpoint(path: str, model, optimizer,  extra_meta: dict = None):
     if extra_meta:
         payload["meta"].update(extra_meta)
     torch.save(payload, path)
+
+def load_similarity_npz(
+    npz_path: str,
+    genes_wanted: Sequence[str],
+    device: Optional[str] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Load saved CSR similarity and subset/reorder to 'genes_wanted'.
+
+    Returns:
+      rowptr:(G'+1,) int64, colind:(E',) int64, values:(E',) float32
+      where rows are in the exact order of 'genes_wanted', and columns follow that same order.
+
+    Notes:
+      - Edges pointing to genes not in 'genes_wanted' are dropped.
+      - Rows with zero remaining neighbors are allowed (degree 0); the GNN layer handles it.
+    """
+    z = np.load(npz_path, allow_pickle=True)
+    indptr = z["indptr"]     # (G+1,)
+    indices = z["indices"]   # (E,)
+    data = z["data"]         # (E,)
+    saved_genes = z["genes"].tolist()  # list[str]
+    shape = tuple(z["shape"].tolist())
+    assert len(saved_genes) == shape[0] == shape[1], "Saved CSR must be square & gene-aligned."
+
+    # Map requested genes into saved index space
+    pos = {g: i for i, g in enumerate(saved_genes)}
+    wanted = [g for g in genes_wanted if g in pos]
+    Gp = len(wanted)
+    if Gp == 0:
+        raise ValueError("None of the requested genes are present in the saved similarity.")
+
+    # New order mapping: saved_idx -> new_idx (or -1 if not present)
+    saved_to_new = np.full(len(saved_genes), -1, dtype=np.int64)
+    for new_i, g in enumerate(wanted):
+        saved_to_new[pos[g]] = new_i
+
+    # Build new CSR by scanning each kept row
+    new_indptr = np.zeros(Gp + 1, dtype=np.int64)
+    new_indices = []
+    new_values = []
+
+    edge_count = 0
+    for new_i, g in enumerate(wanted):
+        old_i = pos[g]
+        s, e = indptr[old_i], indptr[old_i + 1]
+        cols = indices[s:e]
+        vals = data[s:e]
+        # keep only columns that are also wanted
+        mask = saved_to_new[cols] >= 0
+        cols_new = saved_to_new[cols[mask]]
+        vals_new = vals[mask]
+        new_indices.append(cols_new)
+        new_values.append(vals_new)
+        edge_count += cols_new.size
+        new_indptr[new_i + 1] = edge_count
+
+    # Concatenate
+    if edge_count == 0:
+        new_indices_arr = np.zeros((0,), dtype=np.int64)
+        new_values_arr = np.zeros((0,), dtype=np.float32)
+    else:
+        new_indices_arr = np.concatenate(new_indices).astype(np.int64, copy=False)
+        new_values_arr = np.concatenate(new_values).astype(np.float32, copy=False)
+
+    # → torch (optionally to device)
+    rowptr_t = torch.from_numpy(new_indptr)
+    colind_t = torch.from_numpy(new_indices_arr)
+    values_t = torch.from_numpy(new_values_arr)
+    if device:
+        rowptr_t = rowptr_t.to(device, non_blocking=True)
+        colind_t = colind_t.to(device, non_blocking=True)
+        values_t = values_t.to(device, non_blocking=True)
+    return rowptr_t, colind_t, values_t

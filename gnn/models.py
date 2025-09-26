@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-import argparse, math, os
+import math
 import numpy as np
 import pandas as pd
 import anndata as ad
+from pyparsing import Optional
 import scanpy as sc
 import torch
 import torch.nn as nn
@@ -137,14 +138,25 @@ class MPNNLayer(nn.Module):
 
 class GeneMPNN(nn.Module):
     def __init__(self, G: int, A_base: torch.Tensor, device: str = "cuda", hidden: int = 128, T: int = 2, tau: float = 0.0, alpha_cap: float = 1.0, node_dim: int = 128,
-                 prior_dim: int | None = None, dset_vocab: int = 0, dset_dim: int = 0, ct_vocab: int = 0, ct_dim: int = 0, proj_dim: int = 128):
+                 prior_dim: int | None = None, dset_vocab: int = 0, dset_dim: int = 0, ct_vocab: int = 0, ct_dim: int = 0, proj_dim: int = 128,
+                 use_sparse_topk: bool = False, topk_keep: int = 12, num_tokens: int = 0, token_dim: int = 0):
         super().__init__()
         self.G = G
         self.register_buffer('A_base', A_base.to(device), persistent=False)
+        # Candidate CSR buffers for sparse path (filled later)
+        self.register_buffer('csr_rowptr', None, persistent=False)
+        self.register_buffer('csr_colind', None, persistent=False)
+        self.register_buffer('csr_values', None, persistent=False)
         self.hidden = hidden
         self.T = T
         self.alpha_cap = alpha_cap
         self.proj_dim = proj_dim
+
+        # variables for sparse message passing layers
+        self.use_sparse_topk = use_sparse_topk
+        self.topk_keep = topk_keep
+        self.num_tokens = num_tokens
+        self.token_dim = token_dim
         # per-gene node embeddings (used by all nodes, every batch)
         self.node_dim = node_dim
         self.node_E = nn.Embedding(G, self.node_dim)
@@ -153,7 +165,21 @@ class GeneMPNN(nn.Module):
         self.prior_proj = nn.Linear(prior_dim, self.node_dim, bias=False) if prior_dim is not None else None
         # input becomes [log1p expression, node embedding] per gene
         self.embed = nn.Linear(1 + self.node_dim, hidden)
-        self.layers = nn.ModuleList([MPNNLayer(hidden) for _ in range(T)])
+
+        # set layers
+        self.layers = nn.ModuleList()
+        for _ in range(T):
+            if self.use_sparse_topk:
+                self.layers.append(SparseTopKAttentionLayer(
+                    in_dim=hidden, out_dim=hidden,
+                    topk_keep=self.topk_keep,
+                    num_tokens=self.num_tokens,
+                    token_dim=self.token_dim,
+                    dropout=0.0
+                ))
+            else:
+                self.layers.append(MPNNLayer(hidden, hidden))
+
         self.readout = nn.Linear(hidden, 1)
         # Optional dataset/cell-type embeddings
         self.dset_E = nn.Embedding(dset_vocab, dset_dim) if dset_vocab > 0 and dset_dim > 0 else None
@@ -202,6 +228,12 @@ class GeneMPNN(nn.Module):
         # W_meta.T: (G, R) -> (G, node_dim)
         E0 = self.prior_proj(W_meta.T)  # (G, node_dim)
         self.node_E.weight.copy_(E0)
+
+    def set_candidate_csr(self, rowptr: torch.Tensor, colind: torch.Tensor, values: Optional[torch.Tensor] = None):
+        # rowptr: (G+1,), colind: (E,), values: (E,) or None
+        self.csr_rowptr = rowptr
+        self.csr_colind = colind
+        self.csr_values = values
 
     def forward(self, x_ctrl: torch.Tensor, target_idx: torch.Tensor, A_base: torch.Tensor, pert_rowidx: torch.Tensor = None,
                 dset_idx: torch.Tensor | None = None, ct_idx: torch.Tensor | None = None) -> torch.Tensor:
@@ -266,8 +298,18 @@ class GeneMPNN(nn.Module):
         for layer in self.layers:
             if freeze_mask.any():
                 h_t_prev = h[rows, cols].clone()     # snapshot target rows BEFORE this layer
-            
-            h = layer(h, A_batch, h_t0)
+
+            if self.use_sparse_topk:
+                # Sparse path: candidate CSR + learned Top-K attention
+                h = layer(
+                    h,
+                    self.csr_rowptr, self.csr_colind, self.csr_values,
+                    tokens_enabled=(self.num_tokens > 0)
+                )
+            else:
+                # Legacy dense path
+                h = layer(h, A_batch, h_t0)
+
             if freeze_mask.any():
                 # put frozen target embedding back
                 h[rows, cols] = h_t_prev    # h_t0[freeze_mask, 0]
@@ -346,3 +388,155 @@ class GeneMPNN(nn.Module):
         ctx = torch.cat(parts, dim=-1)
         q = self.query_mlp(ctx)
         return torch.nn.functional.normalize(q, dim=-1, eps=1e-8)
+    
+class SparseTopKAttentionLayer(nn.Module):
+    """
+    Message passing over a candidate CSR graph with learned attention and hard Top-K per node.
+    Optional low-rank global mixer via R global tokens (genes <-> tokens).
+    Memory-lean: no (B,G,G) tensors; no expansion of FiLM-like broadcasts.
+    """
+    def __init__(self, in_dim, out_dim, topk_keep=12, token_dim=0, num_tokens=0, dropout=0.0):
+        super().__init__()
+        self.topk_keep = topk_keep
+        self.num_tokens = num_tokens
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        # Node projections for attention & messages
+        self.q = nn.Linear(in_dim, out_dim, bias=False)
+        self.k = nn.Linear(in_dim, out_dim, bias=False)
+        self.v = nn.Linear(in_dim, out_dim, bias=False)
+        self.out = nn.Linear(out_dim, out_dim, bias=True)
+        self.norm = nn.LayerNorm(out_dim)
+
+        # Optional global tokens (low-rank mixer)
+        if num_tokens > 0:
+            self.token_dim = token_dim if token_dim > 0 else out_dim
+            self.tokens = nn.Parameter(torch.randn(num_tokens, self.token_dim) / math.sqrt(self.token_dim))
+            self.t_read_q = nn.Linear(out_dim, self.token_dim, bias=False)   # genes -> tokens (Q)
+            self.t_read_k = nn.Linear(out_dim, self.token_dim, bias=False)   # genes -> tokens (K)
+            self.t_write_k = nn.Linear(self.token_dim, out_dim, bias=False)  # tokens -> genes (K)
+            self.t_write_v = nn.Linear(self.token_dim, out_dim, bias=False)  # tokens -> genes (V)
+            self.lambda_tokens = nn.Parameter(torch.tensor(0.2))             # mixing strength
+        else:
+            self.token_dim = 0
+
+        self.act = nn.GELU()
+
+    @torch.no_grad()
+    def _topk_mask(self, row_ptr, col_idx, scores, k):
+        """
+        Given edge scores per row (flattened in CSR order), select Top-K edges per row.
+        Returns a boolean mask over edges (same shape as col_idx) indicating which to keep.
+        """
+        device = scores.device
+        E = col_idx.numel()
+        G = row_ptr.numel() - 1
+        keep_mask = torch.zeros(E, dtype=torch.bool, device=device)
+
+        # We do a simple loop over rows (G) — works fine on GPU at 18k with k<<G.
+        # Each row r: edges in [row_ptr[r]:row_ptr[r+1])
+        for r in range(G):
+            s = row_ptr[r].item()
+            e = row_ptr[r + 1].item()
+            if e <= s:
+                continue
+            kk = min(k, e - s)
+            vals = scores[s:e]
+            top_idx = torch.topk(vals, kk, largest=True, sorted=False).indices + s
+            keep_mask[top_idx] = True
+        return keep_mask
+
+    def forward(self, h, csr_rowptr, csr_colind, csr_values=None, tokens_enabled=True):
+        """
+        h: (B,G,D)
+        CSR graph defined by:
+          csr_rowptr: (G+1,)
+          csr_colind: (E,)
+          csr_values: (E,) or None  (if None, treat all candidate edges as 1.0)
+        """
+        B, G, D = h.shape
+        device = h.device
+
+        # Linear projections
+        Q = self.q(h)                              # (B,G,D)
+        K = self.k(h)                              # (B,G,D)
+        V = self.v(h)                              # (B,G,D)
+
+        # Gather neighbor keys/values per edge in CSR order
+        # Build an index tensor for col nodes per edge and expand batch
+        col = csr_colind                           # (E,)
+        # For batched gather: (B,E,D)
+        K_neighbors = K[:, col, :]                 # (B,E,D)
+        V_neighbors = V[:, col, :]                 # (B,E,D)
+
+        # For each row r, we need Q[r] compared to K_neighbors edges that land in row r.
+        # We broadcast row-wise Q into the CSR edge segments.
+        # Build a (E,) row id per edge:
+        #   row_ids[e] = r  s.t. r is the row that owns edge e
+        row_ids = torch.repeat_interleave(torch.arange(G, device=device), (csr_rowptr[1:] - csr_rowptr[:-1]))
+        Q_rows = Q[:, row_ids, :]                 # (B,E,D)
+
+        # Edge attention scores (scaled dot)
+        att_logits = (Q_rows * K_neighbors).sum(dim=-1) / math.sqrt(D)  # (B,E)
+
+        # If values are provided, you can add them as bias
+        if csr_values is not None:
+            att_logits = att_logits + csr_values[None, :]
+
+        # Hard Top-K per row (no gradient through selection)
+        with torch.no_grad():
+            # Average scores across batch just to pick structure once per step; cheaper & stable
+            scores_mean = att_logits.mean(dim=0)   # (E,)
+            keep = self._topk_mask(csr_rowptr, csr_colind, scores_mean, self.topk_keep)
+
+        # Mask dropped edges to -inf so softmax ignores them
+        neg_inf = torch.finfo(att_logits.dtype).min
+        masked_logits = torch.where(keep[None, :], att_logits, torch.full_like(att_logits, neg_inf))
+
+        # Softmax within each row segment
+        # We do this by subtracting max per row segment for stability, then exp & normalize per row.
+        out = torch.zeros(B, G, D, device=device, dtype=h.dtype)
+        for r in range(G):
+            s = csr_rowptr[r].item()
+            e = csr_rowptr[r + 1].item()
+            if e <= s:
+                continue
+            logits_r = masked_logits[:, s:e]                      # (B, Er)
+            logits_r = logits_r - logits_r.max(dim=1, keepdim=True).values
+            w = torch.softmax(logits_r, dim=1)                   # (B, Er)
+            Vr = V_neighbors[:, s:e, :]                          # (B, Er, D)
+            # Weighted sum: (B, D)
+            out[:, r, :] = torch.bmm(w.unsqueeze(1), Vr).squeeze(1)
+
+        # Optional global-token mixer (low-rank, fast)
+        if tokens_enabled and self.num_tokens > 0:
+            T = self.num_tokens
+            # Read: genes -> tokens
+            Qg = self.t_read_q(h)          # (B,G,Td)
+            Kg = self.t_read_k(h)          # (B,G,Td)
+            # Compute token states: attention over genes per token (shared across batch)
+            # We’ll do a light-weight “mean + attention” read:
+            att_t = torch.softmax((Qg * Kg).sum(-1), dim=1)      # (B,G)
+            # tokens: (B,T,Td)
+            tokens = self.tokens[None, :, :].expand(B, T, -1)    # (B,T,Td)
+            # Aggregate gene info into tokens (outer product via bmm)
+            # (B,T,Td) += (B,T,G) x (B,G,Td)
+            # Build (B,T,G) by projecting Qg to T heads via a learned read over columns:
+            # Simple trick: share the same att_t for all tokens (fast & acceptable)
+            tokens = tokens + torch.bmm(att_t.unsqueeze(1).repeat(1, T, 1), Qg)  # (B,T,Td)
+
+            # Write: tokens -> genes
+            Kt = self.t_write_k(tokens)    # (B,T,D)
+            Vt = self.t_write_v(tokens)    # (B,T,D)
+            # Content-based routing: softmax over tokens per gene
+            logits_gt = torch.einsum('bgd,btd->bgt', h, Kt) / math.sqrt(D)  # (B,G,T)
+            att_gt = torch.softmax(logits_gt, dim=-1)                       # (B,G,T)
+            glob = torch.einsum('bgt,btd->bgd', att_gt, Vt)                 # (B,G,D)
+
+            out = out + torch.tanh(self.lambda_tokens) * glob
+
+        # Residual & norm
+        out = self.out(out)
+        out = self.dropout(out)
+        out = self.norm(h + out)
+        return out

@@ -94,6 +94,11 @@ def parse_arguments():
                     help="Path to a saved checkpoint (.pt). If set, training will start from these weights.")
     ap.add_argument("--save_model_path", type=str, default="",
                     help="Where to save the trained model (.pt). If empty, an auto name based on --in_h5ad is used.")
+    ap.add_argument('--use_sparse_topk', action='store_true', help='Use candidate CSR + Top-K attention')
+    ap.add_argument('--topk_keep', type=int, default=12, help='Neighbors kept per node after attention')
+    ap.add_argument('--num_tokens', type=int, default=0, help='Global tokens R (0=off)')
+    ap.add_argument('--token_dim', type=int, default=0, help='Token dim (0 => hidden)')
+    ap.add_argument("--similarity_npz", type=str, required=args.use_sparse_topk, default="", help="Precomputed gene-gene similarity CSR .npz")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     return args
@@ -142,7 +147,12 @@ def train(
     optimizer_state: Dict | None = None,    
     contrast_query_type: str = "context",
     dset_embed_dim: int = 0,
-    ct_embed_dim: int = 0
+    ct_embed_dim: int = 0,
+    use_sparse_topk: bool = False,
+    topk_keep: int = 12,
+    num_tokens: int = 0,
+    token_dim: int = 0,
+    similarity_npz: str = "",
 ):
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
@@ -209,8 +219,15 @@ def train(
         model = GeneMPNN(
             G=G, A_base=A_base, device=device, hidden=hidden, T=T, tau=tau, node_dim=node_dim, prior_dim=prior_dim,
             dset_vocab=dset_vocab, dset_dim=dset_dim_, ct_vocab=ct_vocab, ct_dim=ct_dim_,
-            proj_dim=proj_dim
+            proj_dim=proj_dim, use_sparse_topk=use_sparse_topk, topk_keep=topk_keep,
+            num_tokens=num_tokens, token_dim=token_dim
         ).to(device)
+
+    if use_sparse_topk:
+        genes_order = list(map(str, adata.var_names))
+        rowptr, colind, values = load_similarity_npz(similarity_npz, genes_order, device=device)
+        model.set_candidate_csr(rowptr, colind, values)
+
         # --- store category→row maps for reuse in later stages ---
         if ("dataset_id" in adata.obs.columns) and (getattr(model, "dset_E", None) is not None):
             dcat = pd.Categorical(adata.obs["dataset_id"].astype(str))
@@ -764,7 +781,12 @@ def main():
             optimizer_state=resume_opt_state,
             contrast_query_type=args.contrast_query_type,
             dset_embed_dim=args.dset_embed_dim,
-            ct_embed_dim=args.ct_embed_dim
+            ct_embed_dim=args.ct_embed_dim,
+            use_sparse_topk=args.use_sparse_topk,
+            topk_keep=args.topk_keep,
+            num_tokens=args.num_tokens,
+            token_dim=args.token_dim,
+            similarity_npz=args.similarity_npz
         )
 
     # ---------------------------
@@ -821,7 +843,12 @@ def main():
         optimizer_state=resume_opt_state,
         contrast_query_type=args.contrast_query_type,
         dset_embed_dim=args.dset_embed_dim,
-        ct_embed_dim=args.ct_embed_dim
+        ct_embed_dim=args.ct_embed_dim,
+        use_sparse_topk=args.use_sparse_topk,
+        topk_keep=args.topk_keep,
+        num_tokens=args.num_tokens,
+        token_dim=args.token_dim,
+        similarity_npz=args.similarity_npz
     )
 
     # ---------------------------
