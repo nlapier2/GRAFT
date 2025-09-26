@@ -180,6 +180,14 @@ def train(
     ctrl_mean_np = X[ctrl_mask].mean(axis=0).astype(np.float32)
     ctrl_mean = torch.from_numpy(ctrl_mean_np).to(device)
 
+    # Base adjacency: either dense (as before) or prior-based top-k cosine graph
+    if (W_meta is not None) and (meta_topk > 0):
+        A_base, k = make_adjacency_prior(W_meta, meta_topk, G, device)
+        print(f"[graph] Using prior kNN graph (top-k={k}) from M_meta.")
+    else:
+        # dense fully-connected adjacency (previous behavior)
+        A_base = make_base_adjacency(G, self_loops=True).to(device)
+
     # Create Model (reuse if provided)
     if model is None:
         prior_dim = W_meta.shape[0] if W_meta is not None else None
@@ -199,7 +207,7 @@ def train(
             ct_dim_  = ct_embed_dim
 
         model = GeneMPNN(
-            G=G, hidden=hidden, T=T, tau=tau, node_dim=node_dim, prior_dim=prior_dim,
+            G=G, A_base=A_base, device=device, hidden=hidden, T=T, tau=tau, node_dim=node_dim, prior_dim=prior_dim,
             dset_vocab=dset_vocab, dset_dim=dset_dim_, ct_vocab=ct_vocab, ct_dim=ct_dim_,
             proj_dim=proj_dim
         ).to(device)
@@ -222,14 +230,6 @@ def train(
             print("[train] optimizer state loaded")
         except Exception as e:
             print(f"[train] optimizer state load failed: {e}")
-
-    # Base adjacency: either dense (as before) or prior-based top-k cosine graph
-    if (W_meta is not None) and (meta_topk > 0):
-        A_base, k = make_adjacency_prior(W_meta, meta_topk, G, device)
-        print(f"[graph] Using prior kNN graph (top-k={k}) from M_meta.")
-    else:
-        # dense fully-connected adjacency (previous behavior)
-        A_base = make_base_adjacency(G, self_loops=True).to(device)
 
     # --- simple FIFO queue for contrastive loss negative keys (L2-normalized embeddings) ---
     neg_bank = torch.empty((0, proj_dim), device=device)
@@ -265,6 +265,7 @@ def train(
 
     # Simple schedule
     steps_per_epoch = math.ceil(pert_mask.sum() / batch_size)
+    print('Steps per epoch:', steps_per_epoch)
 
     # Stage-1: build per-dataset control pseudobulks (if available)
     ctrl_by_dset = None
@@ -834,7 +835,7 @@ def main():
         target_label=args.target_label,
         control_label=args.control_label,
         device=args.device,
-        batch_size=512,
+        batch_size=args.batch_size,
         seed=args.seed,
     )
 
@@ -855,7 +856,7 @@ def main():
         # run the same batched predictor to get per-pert predictions + their row indices
         pred_mat, _, pert_names_eval, _, pert_idx = predict_all_perturbations(
             eval_adata, model, args.target_label, args.control_label,
-            device=args.device, batch_size=512, seed=args.seed
+            device=args.device, batch_size=args.batch_size, seed=args.seed
         )
         # start from a copy of eval_adata.X and replace perturbed rows with predictions
         X_eval = to_numpy(eval_adata.X).astype(np.float32, copy=True)

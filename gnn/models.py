@@ -132,10 +132,11 @@ class MPNNLayer(nn.Module):
         return h_out
 
 class GeneMPNN(nn.Module):
-    def __init__(self, G: int, hidden: int = 128, T: int = 2, tau: float = 0.0, alpha_cap: float = 1.0, node_dim: int = 128,
+    def __init__(self, G: int, A_base: torch.Tensor, device: str = "cuda", hidden: int = 128, T: int = 2, tau: float = 0.0, alpha_cap: float = 1.0, node_dim: int = 128,
                  prior_dim: int | None = None, dset_vocab: int = 0, dset_dim: int = 0, ct_vocab: int = 0, ct_dim: int = 0, proj_dim: int = 128):
         super().__init__()
         self.G = G
+        self.register_buffer('A_base', A_base.to(device), persistent=False)
         self.hidden = hidden
         self.T = T
         self.alpha_cap = alpha_cap
@@ -241,16 +242,14 @@ class GeneMPNN(nn.Module):
         beta  = self.film_beta(e_aug).unsqueeze(1)                    # (B,1,H)
         h = h * (1 + gamma) + beta
 
-        # Prepare per-sample adjacency (block inbound to target)
-        # Start from base A, then zero the row 't' per sample.
-        A_batch = A_base.unsqueeze(0).repeat(B, 1, 1).to(device)  # (B,G,G)
-        # keep a copy of target embeddings to re-impose after each layer
-        # If target_idx == -1, we won’t freeze anything; we’ll handle with a mask.
+        # Use a single shared adjacency (G,G) for the whole batch.
+        A_batch = A_base.to(device)  # (G,G), requires_grad=False
+
+        # Prepare to re-impose the frozen target state after each layer.
         freeze_mask = (target_idx >= 0)
         if freeze_mask.any():
             rows = torch.arange(B, device=device)[freeze_mask]
             cols = target_idx[freeze_mask]
-            A_batch[rows, cols, :] = 0.0  # zero inbound to target (row=t)
 
         # Save the frozen target embedding (after Step-0 embed)
         # If some samples lack known target, we’ll just skip the replacement.
@@ -260,10 +259,13 @@ class GeneMPNN(nn.Module):
 
         # Run T layers with reimposition of target state
         for layer in self.layers:
+            if freeze_mask.any():
+                h_t_prev = h[rows, cols].clone()     # snapshot target rows BEFORE this layer
+            
             h = layer(h, A_batch, h_t0)
             if freeze_mask.any():
                 # put frozen target embedding back
-                h[rows, cols] = h_t0[freeze_mask, 0]
+                h[rows, cols] = h_t_prev    # h_t0[freeze_mask, 0]
 
         # Readout back to expression space
         y = self.readout(h).squeeze(-1)  # (B,G)
