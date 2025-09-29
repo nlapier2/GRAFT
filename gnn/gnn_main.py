@@ -98,7 +98,7 @@ def parse_arguments():
     ap.add_argument('--topk_keep', type=int, default=12, help='Neighbors kept per node after attention')
     ap.add_argument('--num_tokens', type=int, default=0, help='Global tokens R (0=off)')
     ap.add_argument('--token_dim', type=int, default=0, help='Token dim (0 => hidden)')
-    ap.add_argument("--similarity_npz", type=str, required=args.use_sparse_topk, default="", help="Precomputed gene-gene similarity CSR .npz")
+    ap.add_argument("--similarity_npz", type=str, default="", help="Precomputed gene-gene similarity CSR .npz")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     return args
@@ -694,6 +694,8 @@ def evaluate_model(
 # ----------------------------
 def main():
     args = parse_arguments()
+    if args.use_sparse_topk and not args.similarity_npz:
+        raise ValueError("When --use_sparse_topk is set, --similarity_npz must be provided.")
 
     # ---------------------------
     # Read input data

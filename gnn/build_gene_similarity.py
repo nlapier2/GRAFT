@@ -7,7 +7,7 @@ Usage:
     --pathway-cfg configs/pathways.yaml \
     --genes-csv data/genes.csv \
     --out-npz artifacts/gene_similarity_topk128.npz \
-    --topk 128 --row-chunk 1024 --no-tfidf
+    --topk 128 --no-tfidf
 
 Inputs:
   --pathway-cfg  YAML consumed by your load_pathways.py helpers.
@@ -21,7 +21,9 @@ Output (.npz):
 import argparse, math, os, sys
 from typing import List
 import numpy as np
+import pandas as pd
 import torch
+import anndata as ad
 
 # ---- import your existing loader utilities ----
 # Expecting these in your repo; adjust import path if needed.
@@ -73,6 +75,8 @@ def _build_csr_from_pathways(
         format=meta["format"],
         var_names=genes,  # ensures rows follow 'genes' order
     )
+    pm = pm.reindex(index=pd.Index(genes, name=pm.index.name), fill_value=0.0)
+    assert pm.shape[0] == len(genes), "Gene reindexing failed"
     # pm is (genes x pathways) (per your helper); convert to torch
     X = torch.tensor(pm.values, dtype=torch.float32, device=device)  # (G,P)
     G, P = X.shape
@@ -128,24 +132,18 @@ def _build_csr_from_pathways(
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pathway-cfg", required=True, help="YAML for pathway sources (load_pathways.py schema)")
-    grp = ap.add_mutually_exclusive_group(required=True)
-    grp.add_argument("--genes-csv", help="CSV/TXT of genes (one per line or column 'gene')")
-    grp.add_argument("--genes-from-h5ad", help=".h5ad to read var_names as genes")
+    ap.add_argument("--genes-from-h5ad", required=True, help=".h5ad to read var_names as genes")
     ap.add_argument("--out-npz", required=True, help="Output .npz file (CSR)")
     ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     ap.add_argument("--topk", type=int, default=128)
-    ap.add_argument("--row-chunk", type=int, default=1024)
+    ap.add_argument("--row-chunk", type=int, default=999999)
     ap.add_argument("--no-tfidf", action="store_true", help="Disable TF-IDF reweighting")
     ap.add_argument("--no-dummy", action="store_true", help="Disable dummy pathway for empty genes")
     args = ap.parse_args()
 
     # Resolve gene list
-    if args.genes_from_h5ad:
-        import anndata as ad
-        adata = ad.read_h5ad(args.genes_from_h5ad)
-        genes = list(map(str, adata.var_names))
-    else:
-        genes = _read_genes(args.genes_csv)
+    adata = ad.read_h5ad(args.genes_from_h5ad, backed='r')
+    genes = list(map(str, adata.var_names))
 
     indptr, indices, data = _build_csr_from_pathways(
         genes=genes,
@@ -156,6 +154,10 @@ def main():
         row_chunk=args.row_chunk,
         add_dummy_for_empty=(not args.no_dummy),
     )
+
+    # After constructing indptr/indices/data:
+    assert indptr.shape[0] == len(genes) + 1
+    assert int(indptr[-1]) == int(indices.shape[0]) == int(data.shape[0])
 
     # Save as a single npz with metadata
     np.savez_compressed(

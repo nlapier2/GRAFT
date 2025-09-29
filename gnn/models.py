@@ -1,16 +1,8 @@
 #!/usr/bin/env python3
 import math
-import numpy as np
-import pandas as pd
-import anndata as ad
-from pyparsing import Optional
-import scanpy as sc
+from typing import Optional
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from scipy import sparse
-from collections import defaultdict
-from sklearn.metrics import pairwise_distances
 
 
 # ----------------------------
@@ -178,7 +170,7 @@ class GeneMPNN(nn.Module):
                     dropout=0.0
                 ))
             else:
-                self.layers.append(MPNNLayer(hidden, hidden))
+                self.layers.append(MPNNLayer(hidden))
 
         self.readout = nn.Linear(hidden, 1)
         # Optional dataset/cell-type embeddings
@@ -449,94 +441,86 @@ class SparseTopKAttentionLayer(nn.Module):
     def forward(self, h, csr_rowptr, csr_colind, csr_values=None, tokens_enabled=True):
         """
         h: (B,G,D)
-        CSR graph defined by:
-          csr_rowptr: (G+1,)
-          csr_colind: (E,)
-          csr_values: (E,) or None  (if None, treat all candidate edges as 1.0)
+        csr_rowptr: (G+1,)
+        csr_colind: (E,)
+        csr_values: (E,) or None
         """
         B, G, D = h.shape
         device = h.device
 
-        # Linear projections
-        Q = self.q(h)                              # (B,G,D)
-        K = self.k(h)                              # (B,G,D)
-        V = self.v(h)                              # (B,G,D)
+        Q = self.q(h)             # (B,G,D)
+        K = self.k(h)             # (B,G,D)
+        V = self.v(h)             # (B,G,D)
 
-        # Gather neighbor keys/values per edge in CSR order
-        # Build an index tensor for col nodes per edge and expand batch
-        col = csr_colind                           # (E,)
-        # For batched gather: (B,E,D)
-        K_neighbors = K[:, col, :]                 # (B,E,D)
-        V_neighbors = V[:, col, :]                 # (B,E,D)
-
-        # For each row r, we need Q[r] compared to K_neighbors edges that land in row r.
-        # We broadcast row-wise Q into the CSR edge segments.
-        # Build a (E,) row id per edge:
-        #   row_ids[e] = r  s.t. r is the row that owns edge e
-        row_ids = torch.repeat_interleave(torch.arange(G, device=device), (csr_rowptr[1:] - csr_rowptr[:-1]))
-        Q_rows = Q[:, row_ids, :]                 # (B,E,D)
-
-        # Edge attention scores (scaled dot)
-        att_logits = (Q_rows * K_neighbors).sum(dim=-1) / math.sqrt(D)  # (B,E)
-
-        # If values are provided, you can add them as bias
-        if csr_values is not None:
-            att_logits = att_logits + csr_values[None, :]
-
-        # Hard Top-K per row (no gradient through selection)
-        with torch.no_grad():
-            # Average scores across batch just to pick structure once per step; cheaper & stable
-            scores_mean = att_logits.mean(dim=0)   # (E,)
-            keep = self._topk_mask(csr_rowptr, csr_colind, scores_mean, self.topk_keep)
-
-        # Mask dropped edges to -inf so softmax ignores them
-        neg_inf = torch.finfo(att_logits.dtype).min
-        masked_logits = torch.where(keep[None, :], att_logits, torch.full_like(att_logits, neg_inf))
-
-        # Softmax within each row segment
-        # We do this by subtracting max per row segment for stability, then exp & normalize per row.
         out = torch.zeros(B, G, D, device=device, dtype=h.dtype)
+
+        # ---- streaming per row; no (B,E,*) allocations ----
+        sqrtD = math.sqrt(D)
+        k_keep = self.topk_keep
+
         for r in range(G):
-            s = csr_rowptr[r].item()
-            e = csr_rowptr[r + 1].item()
+            s = int(csr_rowptr[r])
+            e = int(csr_rowptr[r + 1])
             if e <= s:
                 continue
-            logits_r = masked_logits[:, s:e]                      # (B, Er)
-            logits_r = logits_r - logits_r.max(dim=1, keepdim=True).values
-            w = torch.softmax(logits_r, dim=1)                   # (B, Er)
-            Vr = V_neighbors[:, s:e, :]                          # (B, Er, D)
-            # Weighted sum: (B, D)
-            out[:, r, :] = torch.bmm(w.unsqueeze(1), Vr).squeeze(1)
 
-        # Optional global-token mixer (low-rank, fast)
+            cols = csr_colind[s:e]            # (Er,)
+            # gather just for this row's edges
+            Kr = K[:, cols, :]                # (B,Er,D)
+            Vr = V[:, cols, :]                # (B,Er,D)
+            Qr = Q[:, r, :].unsqueeze(1)      # (B,1,D)
+
+            # attention logits: (B,Er)
+            att = (Qr * Kr).sum(-1) / sqrtD
+
+            # optional prior bias
+            if csr_values is not None:
+                att = att + csr_values[s:e].unsqueeze(0)
+
+            # select Top-K per row, using batch-mean scores to avoid storing (B,Er) twice
+            scores_mean = att.mean(dim=0)     # (Er,)
+            kk = min(k_keep, e - s)
+            top_idx = torch.topk(scores_mean, kk, largest=True, sorted=False).indices  # (kk,)
+            att_k = att[:, top_idx]           # (B,kk)
+            Vr_k  = Vr[:, top_idx, :]         # (B,kk,D)
+
+            # softmax weights within the kept set
+            att_k = att_k - att_k.max(dim=1, keepdim=True).values
+            w = torch.softmax(att_k, dim=1)   # (B,kk)
+
+            # weighted sum -> (B,1,D) -> (B,D)
+            out[:, r, :] = torch.bmm(w.unsqueeze(1), Vr_k).squeeze(1)
+
+        # ---- optional global tokens (see memory-lean tweaks below) ----
         if tokens_enabled and self.num_tokens > 0:
             T = self.num_tokens
-            # Read: genes -> tokens
-            Qg = self.t_read_q(h)          # (B,G,Td)
-            Kg = self.t_read_k(h)          # (B,G,Td)
-            # Compute token states: attention over genes per token (shared across batch)
-            # We’ll do a light-weight “mean + attention” read:
-            att_t = torch.softmax((Qg * Kg).sum(-1), dim=1)      # (B,G)
-            # tokens: (B,T,Td)
-            tokens = self.tokens[None, :, :].expand(B, T, -1)    # (B,T,Td)
-            # Aggregate gene info into tokens (outer product via bmm)
-            # (B,T,Td) += (B,T,G) x (B,G,Td)
-            # Build (B,T,G) by projecting Qg to T heads via a learned read over columns:
-            # Simple trick: share the same att_t for all tokens (fast & acceptable)
-            tokens = tokens + torch.bmm(att_t.unsqueeze(1).repeat(1, T, 1), Qg)  # (B,T,Td)
+            Td = self.token_dim if self.token_dim > 0 else D
+
+            Qg = self.t_read_q(h)            # (B,G,Td)
+            Kg = self.t_read_k(h)            # (B,G,Td)
+
+            # Shared read attention over genes per batch: (B,G)
+            att_t = torch.softmax((Qg * Kg).sum(-1), dim=1)  # (B,G)
+
+            # tokens param: (T,Td) -> (B,T,Td) view
+            tokens = self.tokens.unsqueeze(0).expand(B, T, -1)  # (B,T,Td)
+
+            # Memory-lean read: use einsum to avoid building (B,T,G)
+            # agg = (B,Td) summary from genes, then broadcast to T tokens
+            agg = torch.einsum('bg,bgd->bd', att_t, Qg)        # (B,Td)
+            tokens = tokens + agg.unsqueeze(1)                 # (B,T,Td)
 
             # Write: tokens -> genes
-            Kt = self.t_write_k(tokens)    # (B,T,D)
-            Vt = self.t_write_v(tokens)    # (B,T,D)
-            # Content-based routing: softmax over tokens per gene
+            Kt = self.t_write_k(tokens)          # (B,T,D)
+            Vt = self.t_write_v(tokens)          # (B,T,D)
             logits_gt = torch.einsum('bgd,btd->bgt', h, Kt) / math.sqrt(D)  # (B,G,T)
-            att_gt = torch.softmax(logits_gt, dim=-1)                       # (B,G,T)
-            glob = torch.einsum('bgt,btd->bgd', att_gt, Vt)                 # (B,G,D)
+            att_gt = torch.softmax(logits_gt, dim=-1)                        # (B,G,T)
+            glob = torch.einsum('bgt,btd->bgd', att_gt, Vt)                  # (B,G,D)
 
             out = out + torch.tanh(self.lambda_tokens) * glob
 
-        # Residual & norm
         out = self.out(out)
         out = self.dropout(out)
         out = self.norm(h + out)
         return out
+

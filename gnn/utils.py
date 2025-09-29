@@ -686,6 +686,8 @@ def load_full_checkpoint(load_path: str, device: str) -> Tuple[Dict, Dict | None
 
 def save_full_checkpoint(path: str, model, optimizer,  extra_meta: dict = None):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    dset_id2row = getattr(model, "dset_id2row", None)
+    ct_id2row = getattr(model, "ct_id2row", None)
     payload = {
         "state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -694,8 +696,8 @@ def save_full_checkpoint(path: str, model, optimizer,  extra_meta: dict = None):
             "hidden": getattr(model, "hidden", None),
             "T": getattr(model, "T", None),
             "proj_dim": getattr(model, "proj_dim", None),
-            "dset_id2row": model.dset_id2row,
-            "ct_id2row": model.ct_id2row
+            "dset_id2row": dset_id2row,
+            "ct_id2row": ct_id2row
         },
     }
     if extra_meta:
