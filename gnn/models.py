@@ -127,11 +127,58 @@ class MPNNLayer(nn.Module):
         # Concatenate by slicing to avoid scatter for speed on small G
         # (But we need indices; we’ll do it in the caller for clarity.)
         return h_out
+    
+class SparseSpMPLayer(nn.Module):
+    """
+    Sparse MPNN: messages = SpMM(A, msg(h)); update = GELU(upd([h, beta*messages])); residual+norm.
+    Uses learnable per-edge logits (passed in) and row-normalizes weights each forward.
+    """
+    def __init__(self, in_dim: int, out_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.msg = nn.Linear(in_dim, out_dim, bias=False)       # like dense.msg
+        self.upd = nn.Linear(2 * out_dim, out_dim, bias=True)   # like dense.upd
+        self.act = nn.GELU()
+        self.norm = nn.LayerNorm(out_dim)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.beta = nn.Parameter(torch.tensor(0.5))             # gate like dense.beta
+
+    def forward(self, h: torch.Tensor,
+                rowptr: torch.Tensor, colind: torch.Tensor, rows: torch.Tensor,
+                edge_logit: torch.Tensor) -> torch.Tensor:
+        """
+        h: (B,G,D)
+        rowptr:(G+1,), colind:(E,), rows:(E,), edge_logit:(E,)
+        """
+        B, G, D = h.shape
+
+        # 1) Per-node message transform
+        M = self.msg(h)                                         # (B,G,D)
+
+        # 2) Build row-normalized edge weights from logits
+        w = torch.sigmoid(edge_logit)                           # (E,)
+        row_sums = torch.zeros(G, dtype=w.dtype, device=w.device)
+        row_sums.index_add_(0, rows, w)
+        w = w / row_sums[rows].clamp_min(1e-8)
+
+        # 3) SpMM in fp32 for cuSPARSE compatibility: Agg = A @ M
+        M2 = M.permute(1, 0, 2).reshape(G, B * D)               # (G, B*D)
+        A32 = torch.sparse_csr_tensor(rowptr, colind, w.to(torch.float32),
+                                      size=(G, G), device=h.device, dtype=torch.float32)
+        Agg2 = torch.sparse.mm(A32, M2.to(torch.float32))       # (G, B*D)
+        Agg = Agg2.reshape(G, B, D).permute(1, 0, 2)            # (B,G,D)
+
+        # 4) Gate + update on concat([h, m])
+        m = self.beta * Agg
+        h_new = self.act(self.upd(torch.cat([h, m], dim=-1)))   # (B,G,D)
+
+        # 5) Residual + norm (dropout like dense)
+        out = self.dropout(h_new)
+        return self.norm(h + out)
 
 class GeneMPNN(nn.Module):
     def __init__(self, G: int, A_base: torch.Tensor, device: str = "cuda", hidden: int = 128, T: int = 2, tau: float = 0.0, alpha_cap: float = 1.0, node_dim: int = 128,
                  prior_dim: int | None = None, dset_vocab: int = 0, dset_dim: int = 0, ct_vocab: int = 0, ct_dim: int = 0, proj_dim: int = 128,
-                 use_sparse_topk: bool = False, topk_keep: int = 12, num_tokens: int = 0, token_dim: int = 0):
+                 use_sparse_topk: bool = False, topk_keep: int = 12, num_tokens: int = 0, token_dim: int = 0, learn_dense_edges: bool = False):
         super().__init__()
         self.G = G
         self.register_buffer('A_base', A_base.to(device), persistent=False)
@@ -149,6 +196,7 @@ class GeneMPNN(nn.Module):
 
         # variables for sparse message passing layers
         self.use_sparse_topk = use_sparse_topk
+        self.learn_dense_edges = learn_dense_edges
         self.topk_keep = topk_keep
         self.num_tokens = num_tokens
         self.token_dim = token_dim
@@ -206,6 +254,15 @@ class GeneMPNN(nn.Module):
             nn.Linear(self.proj_dim, self.proj_dim),
         )
 
+        self.dense_edge_logit = None
+        if self.learn_dense_edges:
+            G = self.A_base.shape[0]
+            # initialize from A_base (clipped to (0,1) then inverse-sigmoid)
+            with torch.no_grad():
+                prior = self.A_base.clamp(1e-6, 1.0 - 1e-6).float()
+                init = torch.log(prior / (1.0 - prior))
+            self.dense_edge_logit = nn.Parameter(init)  # (G, G)
+
     @torch.no_grad()
     def init_from_prior(self, W_meta: torch.Tensor):
         """
@@ -223,6 +280,15 @@ class GeneMPNN(nn.Module):
         self.csr_rowptr = rowptr
         self.csr_colind = colind
         self.csr_values = values
+
+    def dense_edge_l1(self) -> torch.Tensor:
+        """Mean L1 of row-normalized dense edge weights σ(logit)."""
+        if self.dense_edge_logit is None:
+            return torch.tensor(0.0, device=self.A_base.device)
+        w = torch.sigmoid(self.dense_edge_logit)             # (G,G)
+        row_sums = w.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        w_norm = w / row_sums
+        return w_norm.abs().mean()
 
     def set_sparse_A(self, rowptr: torch.Tensor, colind: torch.Tensor, values: torch.Tensor):
         """
@@ -319,8 +385,13 @@ class GeneMPNN(nn.Module):
                     "Sparse SpMM active but CSR or edge weights are not set. Call set_sparse_A()."
                 h = layer(h, self.csr_rowptr, self.csr_colind, self.csr_rows, self.edge_logit)
             else:
-                # Legacy dense path
-                h = layer(h, A_batch, h_t0)
+                if self.learn_dense_edges:
+                    # Build row-normalized per-edge weights W (G,G), then apply to all items in the batch
+                    W = torch.softmax(self.dense_edge_logit, dim=1)  # (G,G)
+                    A_eff = (A_batch * W).to(A_batch.dtype)              # (G,G), keep 2-D
+                    h = layer(h, A_eff, h_t0)
+                else:
+                    h = layer(h, A_batch, h_t0)
 
             if freeze_mask.any():
                 # put frozen target embedding back
@@ -543,50 +614,3 @@ class SparseTopKAttentionLayer(nn.Module):
         out = self.dropout(out)
         out = self.norm(h + out)
         return out
-
-class SparseSpMPLayer(nn.Module):
-    """
-    Sparse MPNN: messages = SpMM(A, msg(h)); update = GELU(upd([h, beta*messages])); residual+norm.
-    Uses learnable per-edge logits (passed in) and row-normalizes weights each forward.
-    """
-    def __init__(self, in_dim: int, out_dim: int, dropout: float = 0.0):
-        super().__init__()
-        self.msg = nn.Linear(in_dim, out_dim, bias=False)       # like dense.msg
-        self.upd = nn.Linear(2 * out_dim, out_dim, bias=True)   # like dense.upd
-        self.act = nn.GELU()
-        self.norm = nn.LayerNorm(out_dim)
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        self.beta = nn.Parameter(torch.tensor(0.5))             # gate like dense.beta
-
-    def forward(self, h: torch.Tensor,
-                rowptr: torch.Tensor, colind: torch.Tensor, rows: torch.Tensor,
-                edge_logit: torch.Tensor) -> torch.Tensor:
-        """
-        h: (B,G,D)
-        rowptr:(G+1,), colind:(E,), rows:(E,), edge_logit:(E,)
-        """
-        B, G, D = h.shape
-
-        # 1) Per-node message transform
-        M = self.msg(h)                                         # (B,G,D)
-
-        # 2) Build row-normalized edge weights from logits
-        w = torch.sigmoid(edge_logit)                           # (E,)
-        row_sums = torch.zeros(G, dtype=w.dtype, device=w.device)
-        row_sums.index_add_(0, rows, w)
-        w = w / row_sums[rows].clamp_min(1e-8)
-
-        # 3) SpMM in fp32 for cuSPARSE compatibility: Agg = A @ M
-        M2 = M.permute(1, 0, 2).reshape(G, B * D)               # (G, B*D)
-        A32 = torch.sparse_csr_tensor(rowptr, colind, w.to(torch.float32),
-                                      size=(G, G), device=h.device, dtype=torch.float32)
-        Agg2 = torch.sparse.mm(A32, M2.to(torch.float32))       # (G, B*D)
-        Agg = Agg2.reshape(G, B, D).permute(1, 0, 2)            # (B,G,D)
-
-        # 4) Gate + update on concat([h, m])
-        m = self.beta * Agg
-        h_new = self.act(self.upd(torch.cat([h, m], dim=-1)))   # (B,G,D)
-
-        # 5) Residual + norm (dropout like dense)
-        out = self.dropout(h_new)
-        return self.norm(h + out)

@@ -101,9 +101,73 @@ def parse_arguments():
     ap.add_argument("--similarity_npz", type=str, default="", help="Precomputed gene-gene similarity CSR .npz")
     ap.add_argument('--weight_edge_l1', type=float, default=0.0,
                      help='L1 weight for learned edge strengths (sparse SpMM path)')
+    ap.add_argument('--learn_dense_edges', action='store_true', help='Learn dense edge strengths (default: False)')
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     return args
+
+
+# put this near your imports
+import torch
+
+@torch.no_grad()
+def print_edge_weight_stats(model, prefix="edges"):
+    """
+    Prints mean/std/min/max for learned edge weights.
+    - For sparse SpMM: over E stored edges (CSR).
+    - For dense learned edges: over all GxG entries.
+
+    It prints both raw probabilities (sigmoid(logit)) and the row-normalized version
+    that the layer actually uses in forward.
+    """
+    printed_any = False
+
+    # --- Sparse SpMM weights (E edges) ---
+    if hasattr(model, "edge_logit") and model.edge_logit is not None:
+        logits = model.edge_logit
+        G = int(model.csr_rowptr.numel() - 1)
+        E = int(logits.numel())
+        w = torch.sigmoid(logits)  # (E,)
+
+        # row-normalize like in forward
+        rows = model.csr_rows
+        row_sums = torch.zeros(G, dtype=w.dtype, device=w.device)
+        row_sums.index_add_(0, rows, w)
+        w_norm = w / row_sums[rows].clamp_min(1e-8)
+
+        def _stats(x):
+            return (x.mean().item(), x.std(unbiased=False).item(),
+                    x.min().item(), x.max().item())
+
+        m, s, mn, mx = _stats(w)
+        mN, sN, mnN, mxN = _stats(w_norm)
+
+        print(f"[{prefix}:sparse] G={G}  E={E}")
+        print(f"  raw    σ(logit): mean={m:.5f}  std={s:.5f}  min={mn:.3e}  max={mx:.5f}")
+        print(f"  row-norm used : mean={mN:.5f} std={sN:.5f} min={mnN:.3e} max={mxN:.5f}")
+        printed_any = True
+
+    # --- Dense learned weights (GxG) ---
+    if hasattr(model, "dense_edge_logit") and model.dense_edge_logit is not None:
+        W_raw = torch.sigmoid(model.dense_edge_logit)   # (G,G)
+        # row-normalize
+        W = W_raw / W_raw.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+        def _stats2(x):
+            return (x.mean().item(), x.std(unbiased=False).item(),
+                    x.amin().item(), x.amax().item())
+
+        m, s, mn, mx = _stats2(W_raw)
+        mN, sN, mnN, mxN = _stats2(W)
+
+        G = W_raw.shape[0]
+        print(f"[{prefix}:dense ] G={G}  entries={G*G}")
+        print(f"  raw    σ(logit): mean={m:.5f}  std={s:.5f}  min={mn:.3e}  max={mx:.5f}")
+        print(f"  row-norm used : mean={mN:.5f} std={sN:.5f} min={mnN:.3e} max={mxN:.5f}")
+        printed_any = True
+
+    if not printed_any:
+        print(f"[{prefix}] No learned edge weights found on model.")
 
 
 # ----------------------------
@@ -156,6 +220,7 @@ def train(
     token_dim: int = 0,
     similarity_npz: str = "",
     weight_edge_l1: float = 0.0,
+    learn_dense_edges: bool = False
 ):
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
@@ -223,7 +288,7 @@ def train(
             G=G, A_base=A_base, device=device, hidden=hidden, T=T, tau=tau, node_dim=node_dim, prior_dim=prior_dim,
             dset_vocab=dset_vocab, dset_dim=dset_dim_, ct_vocab=ct_vocab, ct_dim=ct_dim_,
             proj_dim=proj_dim, use_sparse_topk=use_sparse_topk, topk_keep=topk_keep,
-            num_tokens=num_tokens, token_dim=token_dim
+            num_tokens=num_tokens, token_dim=token_dim, learn_dense_edges=learn_dense_edges
         ).to(device)
 
     if use_sparse_topk:
@@ -396,6 +461,10 @@ def train(
 
             if use_sparse_topk and (weight_edge_l1 > 0.0):
                 loss_edge_l1 = model.edge_l1()
+            elif learn_dense_edges and (weight_edge_l1 > 0.0):
+                W = torch.softmax(model.dense_edge_logit, dim=1)
+                ent = -(W * (W + 1e-12).log()).sum(dim=1).mean()   # mean over rows
+                loss_edge_l1 = ent
             else:
                 loss_edge_l1 = torch.tensor(0.0, device=device)
 
@@ -457,6 +526,7 @@ def train(
                 f"contrast={running['contrast']/denom:.5f}  "
                 f"edge_l1={running['edge_l1']/denom:.5f}  "
                 f"total={running['tot']/denom:.5f}")
+            print_edge_weight_stats(model, prefix=f"epoch{epoch:03d}")
 
     # estimate mean alpha on training targets (linear KD from pseudobulk)
     with torch.no_grad():
@@ -799,7 +869,8 @@ def main():
             num_tokens=args.num_tokens,
             token_dim=args.token_dim,
             similarity_npz=args.similarity_npz,
-            weight_edge_l1=args.weight_edge_l1
+            weight_edge_l1=args.weight_edge_l1,
+            learn_dense_edges=args.learn_dense_edges
         )
 
     # ---------------------------
@@ -862,7 +933,8 @@ def main():
         num_tokens=args.num_tokens,
         token_dim=args.token_dim,
         similarity_npz=args.similarity_npz,
-        weight_edge_l1=args.weight_edge_l1
+        weight_edge_l1=args.weight_edge_l1,
+        learn_dense_edges=args.learn_dense_edges
     )
 
     # ---------------------------
