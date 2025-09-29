@@ -546,15 +546,17 @@ class SparseTopKAttentionLayer(nn.Module):
 
 class SparseSpMPLayer(nn.Module):
     """
-    Vectorized sparse message passing: out = A_csr @ (W h), no per-edge attention.
-    One cuSPARSE SpMM per layer; memory-lean and fast.
+    Sparse MPNN: messages = SpMM(A, msg(h)); update = GELU(upd([h, beta*messages])); residual+norm.
+    Uses learnable per-edge logits (passed in) and row-normalizes weights each forward.
     """
     def __init__(self, in_dim: int, out_dim: int, dropout: float = 0.0):
         super().__init__()
-        self.lin = nn.Linear(in_dim, out_dim, bias=False)
-        self.out = nn.Linear(out_dim, out_dim, bias=True)
+        self.msg = nn.Linear(in_dim, out_dim, bias=False)       # like dense.msg
+        self.upd = nn.Linear(2 * out_dim, out_dim, bias=True)   # like dense.upd
+        self.act = nn.GELU()
         self.norm = nn.LayerNorm(out_dim)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.beta = nn.Parameter(torch.tensor(0.5))             # gate like dense.beta
 
     def forward(self, h: torch.Tensor,
                 rowptr: torch.Tensor, colind: torch.Tensor, rows: torch.Tensor,
@@ -564,20 +566,27 @@ class SparseSpMPLayer(nn.Module):
         rowptr:(G+1,), colind:(E,), rows:(E,), edge_logit:(E,)
         """
         B, G, D = h.shape
-        x = self.lin(h)                                   # (B,G,D)
-        x2 = x.permute(1, 0, 2).reshape(G, B * D)         # (G, B*D)
-        # Build per-edge weights: w = softplus/logistic → row-normalize
-        w = torch.sigmoid(edge_logit)                     # (E,)
-        # row sums via segment add
+
+        # 1) Per-node message transform
+        M = self.msg(h)                                         # (B,G,D)
+
+        # 2) Build row-normalized edge weights from logits
+        w = torch.sigmoid(edge_logit)                           # (E,)
         row_sums = torch.zeros(G, dtype=w.dtype, device=w.device)
         row_sums.index_add_(0, rows, w)
         w = w / row_sums[rows].clamp_min(1e-8)
-        # Assemble fp32 CSR (cuSPARSE-friendly) and run SpMM in fp32
+
+        # 3) SpMM in fp32 for cuSPARSE compatibility: Agg = A @ M
+        M2 = M.permute(1, 0, 2).reshape(G, B * D)               # (G, B*D)
         A32 = torch.sparse_csr_tensor(rowptr, colind, w.to(torch.float32),
                                       size=(G, G), device=h.device, dtype=torch.float32)
-        x2_32 = x2.to(torch.float32)
-        agg2 = torch.sparse.mm(A32, x2_32)                # (G, B*D)
-        agg = agg2.reshape(G, B, D).permute(1, 0, 2)      # (B,G,D)
-        out = self.out(agg)
-        out = self.dropout(out)
+        Agg2 = torch.sparse.mm(A32, M2.to(torch.float32))       # (G, B*D)
+        Agg = Agg2.reshape(G, B, D).permute(1, 0, 2)            # (B,G,D)
+
+        # 4) Gate + update on concat([h, m])
+        m = self.beta * Agg
+        h_new = self.act(self.upd(torch.cat([h, m], dim=-1)))   # (B,G,D)
+
+        # 5) Residual + norm (dropout like dense)
+        out = self.dropout(h_new)
         return self.norm(h + out)
