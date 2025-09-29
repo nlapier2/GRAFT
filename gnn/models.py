@@ -135,10 +135,13 @@ class GeneMPNN(nn.Module):
         super().__init__()
         self.G = G
         self.register_buffer('A_base', A_base.to(device), persistent=False)
+        # Sparse CSR adjacency (set later via set_sparse_A)
+        self.A_csr = None  # will become a torch.sparse_csr_tensor
         # Candidate CSR buffers for sparse path (filled later)
         self.register_buffer('csr_rowptr', None, persistent=False)
         self.register_buffer('csr_colind', None, persistent=False)
         self.register_buffer('csr_values', None, persistent=False)
+        self.edge_logit = None                             # nn.Parameter of shape (E,)
         self.hidden = hidden
         self.T = T
         self.alpha_cap = alpha_cap
@@ -162,13 +165,7 @@ class GeneMPNN(nn.Module):
         self.layers = nn.ModuleList()
         for _ in range(T):
             if self.use_sparse_topk:
-                self.layers.append(SparseTopKAttentionLayer(
-                    in_dim=hidden, out_dim=hidden,
-                    topk_keep=self.topk_keep,
-                    num_tokens=self.num_tokens,
-                    token_dim=self.token_dim,
-                    dropout=0.0
-                ))
+                self.layers.append(SparseSpMPLayer(hidden, hidden))
             else:
                 self.layers.append(MPNNLayer(hidden))
 
@@ -226,6 +223,32 @@ class GeneMPNN(nn.Module):
         self.csr_rowptr = rowptr
         self.csr_colind = colind
         self.csr_values = values
+
+    def set_sparse_A(self, rowptr: torch.Tensor, colind: torch.Tensor, values: torch.Tensor):
+        """
+        Register CSR structure and initialize learnable per-edge weights from 'values'.
+        rowptr:(G+1,), colind:(E,), values:(E,) – typically row-normalized priors in (0,1].
+        """
+        assert rowptr.ndim == 1 and colind.ndim == 1 and values.ndim == 1
+        G = rowptr.numel() - 1
+        E = colind.numel()
+        assert int(rowptr[-1]) == E, "rowptr[-1] must equal number of edges"
+        self.node_count = G
+        # Store CSR structure
+        self.csr_rowptr = rowptr
+        self.csr_colind = colind
+        # Precompute 'rows' index per edge for fast segment ops
+        rows = torch.repeat_interleave(torch.arange(G, device=rowptr.device), rowptr[1:] - rowptr[:-1])
+        self.csr_rows = rows
+        # Initialize learnable edge logits from prior values (clamped to (0,1))
+        v = values.clamp_(1e-6, 1 - 1e-6).float()
+        self.edge_logit = nn.Parameter(torch.log(v / (1 - v)))  # inverse sigmoid
+        # (Optional) keep a non-learnable A for sanity checks; not used in forward once weights are learnable.
+        self.A_csr = None
+
+    def edge_l1(self) -> torch.Tensor:
+        """Mean L1 of current edge weights σ(logit). Handy for regularization."""
+        return torch.sigmoid(self.edge_logit).abs().mean()
 
     def forward(self, x_ctrl: torch.Tensor, target_idx: torch.Tensor, A_base: torch.Tensor, pert_rowidx: torch.Tensor = None,
                 dset_idx: torch.Tensor | None = None, ct_idx: torch.Tensor | None = None) -> torch.Tensor:
@@ -292,12 +315,9 @@ class GeneMPNN(nn.Module):
                 h_t_prev = h[rows, cols].clone()     # snapshot target rows BEFORE this layer
 
             if self.use_sparse_topk:
-                # Sparse path: candidate CSR + learned Top-K attention
-                h = layer(
-                    h,
-                    self.csr_rowptr, self.csr_colind, self.csr_values,
-                    tokens_enabled=(self.num_tokens > 0)
-                )
+                assert (self.csr_rowptr is not None) and (self.edge_logit is not None), \
+                    "Sparse SpMM active but CSR or edge weights are not set. Call set_sparse_A()."
+                h = layer(h, self.csr_rowptr, self.csr_colind, self.csr_rows, self.edge_logit)
             else:
                 # Legacy dense path
                 h = layer(h, A_batch, h_t0)
@@ -524,3 +544,40 @@ class SparseTopKAttentionLayer(nn.Module):
         out = self.norm(h + out)
         return out
 
+class SparseSpMPLayer(nn.Module):
+    """
+    Vectorized sparse message passing: out = A_csr @ (W h), no per-edge attention.
+    One cuSPARSE SpMM per layer; memory-lean and fast.
+    """
+    def __init__(self, in_dim: int, out_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.lin = nn.Linear(in_dim, out_dim, bias=False)
+        self.out = nn.Linear(out_dim, out_dim, bias=True)
+        self.norm = nn.LayerNorm(out_dim)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(self, h: torch.Tensor,
+                rowptr: torch.Tensor, colind: torch.Tensor, rows: torch.Tensor,
+                edge_logit: torch.Tensor) -> torch.Tensor:
+        """
+        h: (B,G,D)
+        rowptr:(G+1,), colind:(E,), rows:(E,), edge_logit:(E,)
+        """
+        B, G, D = h.shape
+        x = self.lin(h)                                   # (B,G,D)
+        x2 = x.permute(1, 0, 2).reshape(G, B * D)         # (G, B*D)
+        # Build per-edge weights: w = softplus/logistic → row-normalize
+        w = torch.sigmoid(edge_logit)                     # (E,)
+        # row sums via segment add
+        row_sums = torch.zeros(G, dtype=w.dtype, device=w.device)
+        row_sums.index_add_(0, rows, w)
+        w = w / row_sums[rows].clamp_min(1e-8)
+        # Assemble fp32 CSR (cuSPARSE-friendly) and run SpMM in fp32
+        A32 = torch.sparse_csr_tensor(rowptr, colind, w.to(torch.float32),
+                                      size=(G, G), device=h.device, dtype=torch.float32)
+        x2_32 = x2.to(torch.float32)
+        agg2 = torch.sparse.mm(A32, x2_32)                # (G, B*D)
+        agg = agg2.reshape(G, B, D).permute(1, 0, 2)      # (B,G,D)
+        out = self.out(agg)
+        out = self.dropout(out)
+        return self.norm(h + out)

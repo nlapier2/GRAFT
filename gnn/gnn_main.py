@@ -99,6 +99,8 @@ def parse_arguments():
     ap.add_argument('--num_tokens', type=int, default=0, help='Global tokens R (0=off)')
     ap.add_argument('--token_dim', type=int, default=0, help='Token dim (0 => hidden)')
     ap.add_argument("--similarity_npz", type=str, default="", help="Precomputed gene-gene similarity CSR .npz")
+    ap.add_argument('--weight_edge_l1', type=float, default=0.0,
+                     help='L1 weight for learned edge strengths (sparse SpMM path)')
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     return args
@@ -153,6 +155,7 @@ def train(
     num_tokens: int = 0,
     token_dim: int = 0,
     similarity_npz: str = "",
+    weight_edge_l1: float = 0.0,
 ):
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
@@ -226,7 +229,8 @@ def train(
     if use_sparse_topk:
         genes_order = list(map(str, adata.var_names))
         rowptr, colind, values = load_similarity_npz(similarity_npz, genes_order, device=device)
-        model.set_candidate_csr(rowptr, colind, values)
+        # model.set_candidate_csr(rowptr, colind, values)  # used for attention layers, no longer used
+        model.set_sparse_A(rowptr, colind, values)
 
         # --- store category→row maps for reuse in later stages ---
         if ("dataset_id" in adata.obs.columns) and (getattr(model, "dset_E", None) is not None):
@@ -296,7 +300,7 @@ def train(
 
     for epoch in range(1, epochs + 1):
         model.train()
-        running = {"mse": 0.0, "targ": 0.0, "loc": 0.0, "proto": 0.0, "dist": 0.0, "prior": 0.0, "contrast": 0.0, "tot": 0.0}
+        running = {"mse": 0.0, "targ": 0.0, "loc": 0.0, "proto": 0.0, "dist": 0.0, "prior": 0.0, "contrast": 0.0, "edge_l1": 0.0, "tot": 0.0}
         for step in range(steps_per_epoch):
             bx_ctrl, bx_pert, btargets, sel_pert = sample_batch_by_mode(
                 single_pert_batches, pretrain_mode, rng, pert_unique,
@@ -390,6 +394,11 @@ def train(
             else:
                 loss_contrast = torch.tensor(0.0, device=device)
 
+            if use_sparse_topk and (weight_edge_l1 > 0.0):
+                loss_edge_l1 = model.edge_l1()
+            else:
+                loss_edge_l1 = torch.tensor(0.0, device=device)
+
             if weight_mse == 0.0:
                 loss_mse = loss_mse * 0.0
             if weight_target == 0.0:
@@ -411,7 +420,8 @@ def train(
                  + weight_proto * loss_proto \
                  + weight_dist * loss_dist \
                  + weight_prior * loss_prior \
-                 + weight_contrast * loss_contrast
+                 + weight_contrast * loss_contrast \
+                 + weight_edge_l1 * loss_edge_l1
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -429,6 +439,7 @@ def train(
             running["dist"] += float(loss_dist.item())
             running["prior"] += float(loss_prior.item())
             running["contrast"] += float(loss_contrast.item())
+            running["edge_l1"] += float(loss_edge_l1.item())
             running["tot"]  += float(loss.item())
 
         denom = max(steps_per_epoch, 1)
@@ -444,6 +455,7 @@ def train(
                 f"dist={running['dist']/denom:.5f}  "
                 f"prior={running['prior']/denom:.5f}  "
                 f"contrast={running['contrast']/denom:.5f}  "
+                f"edge_l1={running['edge_l1']/denom:.5f}  "
                 f"total={running['tot']/denom:.5f}")
 
     # estimate mean alpha on training targets (linear KD from pseudobulk)
@@ -694,8 +706,6 @@ def evaluate_model(
 # ----------------------------
 def main():
     args = parse_arguments()
-    if args.use_sparse_topk and not args.similarity_npz:
-        raise ValueError("When --use_sparse_topk is set, --similarity_npz must be provided.")
 
     # ---------------------------
     # Read input data
@@ -788,7 +798,8 @@ def main():
             topk_keep=args.topk_keep,
             num_tokens=args.num_tokens,
             token_dim=args.token_dim,
-            similarity_npz=args.similarity_npz
+            similarity_npz=args.similarity_npz,
+            weight_edge_l1=args.weight_edge_l1
         )
 
     # ---------------------------
@@ -850,7 +861,8 @@ def main():
         topk_keep=args.topk_keep,
         num_tokens=args.num_tokens,
         token_dim=args.token_dim,
-        similarity_npz=args.similarity_npz
+        similarity_npz=args.similarity_npz,
+        weight_edge_l1=args.weight_edge_l1
     )
 
     # ---------------------------
