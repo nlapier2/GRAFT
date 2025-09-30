@@ -621,8 +621,14 @@ def predict_all_perturbations(
     # target mapping (label -> gene index), -1 if not a gene in panel
     t2gi = build_target_to_gene_index(adata, target_label)
 
-    # adjacency
-    A_base = make_base_adjacency(G, self_loops=True).to(device)
+    # Reuse the adjacency the model was built/trained with (dense or prior-kNN).
+    # For sparse SpMM, A_base is ignored inside forward, but we pass it for API parity.
+    A_base = getattr(model, "A_base", None)
+    if A_base is None:
+        print('[predict] Warning: model has no A_base attribute; using dense adjacency.')
+        A_base = make_base_adjacency(G, self_loops=True).to(device)
+    else:
+        A_base = A_base.to(device)
 
     # allocate
     Np = len(pert_idx)
