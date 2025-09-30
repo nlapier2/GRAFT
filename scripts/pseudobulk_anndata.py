@@ -44,7 +44,8 @@ def main():
     ap.add_argument("--h5ad", required=True, help="Path to backed AnnData file (.h5ad) for ONE dataset")
     ap.add_argument("--dataset_id", required=True, help="Dataset ID matching canonical index")
     ap.add_argument("--index_parquet", required=True, help="Canonical cell index parquet (from build_index.py)")  
-    ap.add_argument("--gene_list", required=True, help="TSV with one gene per line, in target dataset order")
+    ap.add_argument("--gene_list", required=False, help="TSV with one gene per line, in target dataset order")
+    ap.add_argument("--target_h5ad", required=False, help="If provided, use this .h5ad's var_names as gene_list instead")
     ap.add_argument("--out_h5ad", required=True, help="Output pseudobulk .h5ad")
     ap.add_argument("--counts_layer", default=None, help="Optional counts layer name to use instead of X")
     ap.add_argument("--target_label", default="target_gene", help="Obs column name holding perturbation label (in canonical index)")
@@ -64,7 +65,18 @@ def main():
         raise SystemExit(f"No rows in index for dataset_id={args.dataset_id}")
 
     # Load gene list and determine which genes are present in the source .h5ad
-    gene_list = load_gene_list(args.gene_list)  # ordering to enforce
+    if args.target_h5ad is not None:
+        if args.gene_list is not None:
+            raise SystemExit("Error: --gene_list and --target_h5ad are mutually exclusive")
+        A_target = ad.read_h5ad(args.target_h5ad, backed="r")
+        gene_list = list(map(str, A_target.var_names))
+        print(f"[info] Using {len(gene_list)} genes from target .h5ad {args.target_h5ad}", file=sys.stderr)
+    elif args.gene_list is not None:
+        print(f"[info] Using gene list from {args.gene_list}", file=sys.stderr)
+        gene_list = load_gene_list(args.gene_list)  # ordering to enforce
+    else:
+        raise SystemExit("Error: one of --gene_list or --target_h5ad must be provided")
+    
     gene_to_pos = {g: i for i, g in enumerate(gene_list)}
 
     A_backed = ad.read_h5ad(args.h5ad, backed="r")
