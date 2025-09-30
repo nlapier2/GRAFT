@@ -107,8 +107,38 @@ def parse_arguments():
     return args
 
 
-# put this near your imports
-import torch
+# --- QUICK TOGGLES (just set True to try) ---
+SCRAMBLE_ACROSS_CELLS_PER_GENE = False   # column-wise: for each gene g, shuffle x[:, g] across the batch
+SCRAMBLE_WITHIN_EACH_CELL      = False  # row-wise: for each cell b, shuffle x[b, :] across genes
+
+def scramble_across_cells_per_gene(x: torch.Tensor) -> torch.Tensor:
+    """
+    For each gene g, randomly permute the values across cells in the batch.
+    x: (B,G) or (B,G,C)
+    """
+    B, G = x.shape[:2]
+    # idx has shape (B,G): each column g is a permutation of [0..B-1]
+    idx = torch.stack([torch.randperm(B, device=x.device) for _ in range(G)], dim=1)
+    if x.dim() == 2:
+        return x.gather(0, idx)
+    else:
+        # expand idx to (B,G,1) to gather the first dim and keep channels intact
+        return x.gather(0, idx.unsqueeze(-1).expand(-1, -1, x.size(2)))
+
+def scramble_within_each_cell(x: torch.Tensor) -> torch.Tensor:
+    """
+    For each cell b, randomly permute its gene positions.
+    x: (B,G) or (B,G,C)
+    """
+    B, G = x.shape[:2]
+    # idx has shape (B,G): each row b is a permutation of [0..G-1]
+    idx = torch.stack([torch.randperm(G, device=x.device) for _ in range(B)], dim=0)
+    if x.dim() == 2:
+        return x.gather(1, idx)
+    else:
+        # expand idx to (B,G,1) to gather along gene dim and keep channels intact
+        return x.gather(1, idx.unsqueeze(-1).expand(-1, -1, x.size(2)))
+
 
 @torch.no_grad()
 def print_edge_weight_stats(model, prefix="edges"):
@@ -165,9 +195,6 @@ def print_edge_weight_stats(model, prefix="edges"):
         print(f"  raw    σ(logit): mean={m:.5f}  std={s:.5f}  min={mn:.3e}  max={mx:.5f}")
         print(f"  row-norm used : mean={mN:.5f} std={sN:.5f} min={mnN:.3e} max={mxN:.5f}")
         printed_any = True
-
-    if not printed_any:
-        print(f"[{prefix}] No learned edge weights found on model.")
 
 
 # ----------------------------
@@ -379,6 +406,14 @@ def train(
             bx_ctrl = bx_ctrl.to(device)
             bx_pert = bx_pert.to(device)
             tidx = tidx.to(device)
+
+            if SCRAMBLE_ACROSS_CELLS_PER_GENE:
+                bx_ctrl = scramble_across_cells_per_gene(bx_ctrl)
+                bx_pert = scramble_across_cells_per_gene(bx_pert)
+
+            if SCRAMBLE_WITHIN_EACH_CELL:
+                bx_ctrl = scramble_within_each_cell(bx_ctrl)
+                bx_pert = scramble_within_each_cell(bx_pert)
 
             # per-sample perturbation row indices for embedding / FiLM
             pert_rowidx = torch.tensor([pert2row[t] for t in btargets], dtype=torch.long, device=device)
