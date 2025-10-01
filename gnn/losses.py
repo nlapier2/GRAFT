@@ -146,6 +146,19 @@ def _pairwise_sqdist(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     return torch.clamp(a2 + b2 - 2.0 * (A @ B.T), min=0.0)  # l2 squared distance for each row pair from A and B
 
 
+def mmd_poly2(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """
+    MMD with polynomial-degree-2 kernel: k(x,y) = (x·y)^2.
+    This kernel matches means and (uncentered) covariances in expectation.
+    Returns a biased MMD^2 estimator (fine for optimization).
+    """
+    X, Y = _match_sizes(X, Y)
+    Kxx = (X @ X.t()) ** 2
+    Kyy = (Y @ Y.t()) ** 2
+    Kxy = (X @ Y.t()) ** 2
+    return Kxx.mean() + Kyy.mean() - 2.0 * Kxy.mean()
+
+
 def mmd_rbf(
     X: torch.Tensor,
     Y: torch.Tensor,
