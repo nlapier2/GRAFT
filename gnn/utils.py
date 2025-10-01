@@ -323,8 +323,8 @@ def make_pretrain_pseudobulk_from_adata(adata: ad.AnnData, target_label: str, co
     obs.index = [f"{dataset_id}::{r[target_label]}" for _, r in obs.iterrows()]
     return ad.AnnData(X=X_bulk, obs=obs, var=adata.var.copy())
 
-def prep_external_data(pb: ad.AnnData, target_label: str, control_label: str, adata_train: ad.AnnData) -> ad.AnnData:
-    if 'target_present' in pb.obs.columns:
+def prep_external_data(pb: ad.AnnData, target_label: str, control_label: str, adata_train: ad.AnnData, remove_non_genes: bool) -> ad.AnnData:
+    if 'target_present' in pb.obs.columns and remove_non_genes:
         pb = pb[pb.obs["target_present"] | (pb.obs[target_label] == control_label), :].copy()
     # Clean placeholders before normalization
     X = pb.X
@@ -369,7 +369,7 @@ def prep_pb_all(pb_target, adata_train, args):
     if len(pb_paths) > 0:
         for p in pb_paths:
             pb_i = ad.read_h5ad(p)
-            pb_i = prep_external_data(pb_i, args.target_label, args.control_label, adata_train)
+            pb_i = prep_external_data(pb_i, args.target_label, args.control_label, adata_train, args.remove_non_gene_perts)
             pbs.append(pb_i)
         # Concatenate all pseudobulk rows
         pb_all = ad.concat(pbs, axis=0, join="outer", merge="same")

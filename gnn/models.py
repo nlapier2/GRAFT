@@ -178,7 +178,8 @@ class SparseSpMPLayer(nn.Module):
 class GeneMPNN(nn.Module):
     def __init__(self, G: int, A_base: torch.Tensor, device: str = "cuda", hidden: int = 128, T: int = 2, tau: float = 0.0, alpha_cap: float = 1.0, node_dim: int = 128,
                  prior_dim: int | None = None, dset_vocab: int = 0, dset_dim: int = 0, ct_vocab: int = 0, ct_dim: int = 0, proj_dim: int = 128,
-                 use_sparse_topk: bool = False, topk_keep: int = 12, num_tokens: int = 0, token_dim: int = 0, learn_dense_edges: bool = False):
+                 use_sparse_topk: bool = False, topk_keep: int = 12, num_tokens: int = 0, token_dim: int = 0, learn_dense_edges: bool = False,
+                 num_extra_perts: int = 0):
         super().__init__()
         self.G = G
         self.register_buffer('A_base', A_base.to(device), persistent=False)
@@ -204,6 +205,8 @@ class GeneMPNN(nn.Module):
         self.node_dim = node_dim
         self.node_E = nn.Embedding(G, self.node_dim)
         nn.init.normal_(self.node_E.weight, std=0.02)
+        self.num_extra_perts = int(num_extra_perts)
+        self.extra_E = nn.Embedding(self.num_extra_perts, node_dim) if self.num_extra_perts > 0 else None
         # Optional small projector: prior (R) -> node_dim
         self.prior_proj = nn.Linear(prior_dim, self.node_dim, bias=False) if prior_dim is not None else None
         # input becomes [log1p expression, node embedding] per gene
@@ -317,10 +320,11 @@ class GeneMPNN(nn.Module):
         return torch.sigmoid(self.edge_logit).abs().mean()
 
     def forward(self, x_ctrl: torch.Tensor, target_idx: torch.Tensor, A_base: torch.Tensor, pert_rowidx: torch.Tensor = None,
-                dset_idx: torch.Tensor | None = None, ct_idx: torch.Tensor | None = None) -> torch.Tensor:
+                dset_idx: torch.Tensor | None = None, ct_idx: torch.Tensor | None = None, pidx: torch.Tensor | None = None) -> torch.Tensor:
         """
         x_ctrl: (B,G)
-        target_idx: (B,) int tensor with -1 where unknown
+        target_idx: (B,) int tensor with -1 when the perturbation is NOT one of the G genes
+        pidx:       (B,) int tensor with -1 when not a “non-gene” perturbation; otherwise index in extra_E
         A_base: (G,G) dense row-normalized base adjacency
         """
         device = x_ctrl.device
@@ -328,16 +332,20 @@ class GeneMPNN(nn.Module):
         assert G == self.G
 
         # --- Step-0: learn efficacy and apply counts-space clamp in one place ---
-        e_t = self.node_E(torch.clamp(target_idx, min=0))                       # (B,64)
+        e_gene = self.node_E(torch.clamp(target_idx, min=0))                       # (B,64)
+        if (pidx is not None) and (self.extra_E is not None):
+            mask_extra = (pidx >= 0)                                            # (B,)
+            e_extra = self.extra_E(torch.clamp(pidx, min=0))
+            e_t = torch.where(mask_extra.unsqueeze(-1), e_extra, e_gene)        # (B, node_dim)
+        else:
+            mask_extra = torch.zeros(B, dtype=torch.bool, device=device)
+            e_t = e_gene
         # hand mean alpha to the head if we have it
         if hasattr(self, "alpha_mean_train"):
             self.step0_head.alpha_mean_train = self.alpha_mean_train
-        # For non-gene perts (target_idx == -1), skip clamp and set alpha=0
-        if (target_idx >= 0).any():
-            x0, alpha_t = self.step0_head(x_ctrl, target_idx, e_t, alpha_cap=self.alpha_cap)
-        else:
-            x0 = x_ctrl
-            alpha_t = torch.zeros(x_ctrl.size(0), device=x_ctrl.device)
+        # Step-0: predict alpha from e_t but CLAMP only where target_idx>=0. Set alpha=0 for non-gene rows.
+        x0, alpha_t = self.step0_head(x_ctrl, target_idx, e_t, alpha_cap=self.alpha_cap)  # clamps only rows with target_idx>=0
+        alpha_t = torch.where(target_idx >= 0, alpha_t, torch.zeros_like(alpha_t))
 
         # Initial hidden state (shared 1->hidden linear applied per gene)
         # assemble per-node embeddings for all genes

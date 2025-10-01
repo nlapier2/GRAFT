@@ -102,6 +102,7 @@ def parse_arguments():
     ap.add_argument('--weight_edge_l1', type=float, default=0.0,
                      help='L1 weight for learned edge strengths (sparse SpMM path)')
     ap.add_argument('--learn_dense_edges', action='store_true', help='Learn dense edge strengths (default: False)')
+    ap.add_argument('--remove_non_gene_perts', action='store_true', help='Remove non-gene perturbation labels')
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     return args
@@ -278,6 +279,11 @@ def train(
 
     # Map perturbation label -> gene index (for Step-0); unknown => -1
     t2gi = build_target_to_gene_index(adata, target_label)
+    # Map NON-gene perturbation label -> small embedding row (0..K-1), for drugs/OOF genes
+    all_perts = sorted({l for l in labels if l != control_label})
+    gene_set = set(adata.var_names.tolist())
+    extra_labels = [p for p in all_perts if p not in gene_set]
+    extra2i = {p: i for i, p in enumerate(extra_labels)}
 
     # Build stable mapping from label -> embedding row
     pert_names_unique = sorted(set(labels.tolist()))
@@ -315,7 +321,8 @@ def train(
             G=G, A_base=A_base, device=device, hidden=hidden, T=T, tau=tau, node_dim=node_dim, prior_dim=prior_dim,
             dset_vocab=dset_vocab, dset_dim=dset_dim_, ct_vocab=ct_vocab, ct_dim=ct_dim_,
             proj_dim=proj_dim, use_sparse_topk=use_sparse_topk, topk_keep=topk_keep,
-            num_tokens=num_tokens, token_dim=token_dim, learn_dense_edges=learn_dense_edges
+            num_tokens=num_tokens, token_dim=token_dim, learn_dense_edges=learn_dense_edges,
+            num_extra_perts=len(extra2i)
         ).to(device)
 
     if use_sparse_topk:
@@ -403,9 +410,11 @@ def train(
 
             # per-sample target index tensor
             tidx = torch.tensor([t2gi.get(t, -1) for t in btargets], dtype=torch.long)
+            pidx = torch.tensor([extra2i.get(t, -1) for t in btargets], device=device, dtype=torch.long)
             bx_ctrl = bx_ctrl.to(device)
             bx_pert = bx_pert.to(device)
             tidx = tidx.to(device)
+            pidx = pidx.to(device)
 
             if SCRAMBLE_ACROSS_CELLS_PER_GENE:
                 bx_ctrl = scramble_across_cells_per_gene(bx_ctrl)
@@ -419,7 +428,7 @@ def train(
             pert_rowidx = torch.tensor([pert2row[t] for t in btargets], dtype=torch.long, device=device)
             # dataset / cell-type indices pulled from the SAME rows as bx_pert
             z_d, z_ct = get_dset_indices(sel_pert, pert_rowidx, adata, device, model=model)
-            yhat, x0, alpha_vec = model(bx_ctrl, tidx, A_base, pert_rowidx=pert_rowidx, dset_idx=z_d, ct_idx=z_ct)
+            yhat, x0, alpha_vec = model(bx_ctrl, tidx, A_base, pert_rowidx=pert_rowidx, dset_idx=z_d, ct_idx=z_ct, pidx=pidx)
 
             # --- Prototype / bulk-delta loss (aligns to PDS) ---
             # Group rows by perturbation label in this batch
