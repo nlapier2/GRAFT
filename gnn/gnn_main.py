@@ -103,6 +103,8 @@ def parse_arguments():
                      help='L1 weight for learned edge strengths (sparse SpMM path)')
     ap.add_argument('--learn_dense_edges', action='store_true', help='Learn dense edge strengths (default: False)')
     ap.add_argument('--remove_non_gene_perts', action='store_true', help='Remove non-gene perturbation labels')
+    ap.add_argument('--eval_on_train', action='store_true', help='Evaluate on training set in addition to test set')
+    ap.add_argument('--test_zero_adj', action='store_true', help='For ablation: use zero adjacency during testing')
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     return args
@@ -1001,6 +1003,56 @@ def main():
         batch_size=args.batch_size,
         seed=args.seed,
     )
+    if args.test_zero_adj:
+        print("\n=== Additional evaluation with ZERO adjacency ===")
+        # Temporarily replace model adjacency with identity
+        if hasattr(model, "A_base"):
+            orig_A = model.A_base
+            G = orig_A.size(0)
+            model.A_base = orig_A * 0.0 # torch.eye(G, device=orig_A.device) * (1.0 / G)
+            _ = evaluate_model(
+                adata=eval_adata,
+                model=model,
+                target_label=args.target_label,
+                control_label=args.control_label,
+                device=args.device,
+                batch_size=args.batch_size,
+                seed=args.seed,
+            )
+            model.A_base = orig_A  # restore
+        else:
+            print("[warning] model has no A_base attribute; skipping zero-adj eval.")
+
+    if args.eval_on_train and (adata_test is not None):
+        print("\n=== Additional evaluation on TRAIN set ===")
+        _ = evaluate_model(
+            adata=adata_train,
+            model=model,
+            target_label=args.target_label,
+            control_label=args.control_label,
+            device=args.device,
+            batch_size=args.batch_size,
+            seed=args.seed,
+        )
+        if args.test_zero_adj:
+            print("\n=== Additional evaluation on TRAIN with ZERO adjacency ===")
+            # Temporarily replace model adjacency with identity
+            if hasattr(model, "A_base"):
+                orig_A = model.A_base
+                G = orig_A.size(0)
+                model.A_base = orig_A * 0.0 # torch.eye(G, device=orig_A.device) * (1.0 / G)
+                _ = evaluate_model(
+                    adata=adata_train,
+                    model=model,
+                    target_label=args.target_label,
+                    control_label=args.control_label,
+                    device=args.device,
+                    batch_size=args.batch_size,
+                    seed=args.seed,
+                )
+                model.A_base = orig_A  # restore
+            else:
+                print("[warning] model has no A_base attribute; skipping zero-adj eval.")
 
     # Save model weights (user-specified path if provided)
     if args.save_model_path:
