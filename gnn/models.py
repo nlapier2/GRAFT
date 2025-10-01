@@ -97,13 +97,18 @@ class MPNNLayer(nn.Module):
     Basic MPNN layer with dense adjacency.
     h_in -> aggregate (A @ h_in) -> update with residual
     """
-    def __init__(self, hidden_dim: int):
+    def __init__(self, hidden_dim: int, mode: str = "concat"):
         super().__init__()
         self.msg = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.upd = nn.Linear(2 * hidden_dim, hidden_dim)
+        self.mode = mode
+        if self.mode == "concat":
+            self.upd = nn.Linear(2 * hidden_dim, hidden_dim)
+        else:  # gated add message rather than concat
+            self.upd = nn.Linear(hidden_dim, hidden_dim)
         self.act = nn.GELU()
         self.norm = nn.LayerNorm(hidden_dim)
         self.beta = nn.Parameter(torch.tensor(0.5))  # start with a gentle mix of neighbor info
+        self.gamma = nn.Parameter(torch.tensor(1.0)) # gate on message path
 
     def forward(self, h: torch.Tensor, A_batch: torch.Tensor, h_t_frozen: torch.Tensor) -> torch.Tensor:
         """
@@ -117,7 +122,10 @@ class MPNNLayer(nn.Module):
         Agg = torch.mm(A_batch, M.permute(1,0,2).reshape(G, B*C)) \
                 .reshape(G, B, C).permute(1,0,2).contiguous()     # (B,G,C)
         m = self.beta * Agg
-        h_new = self.act(self.upd(torch.cat([h, m], dim=-1)))  # (B,G,C)
+        if self.mode == "concat":
+            h_new = self.act(self.upd(torch.cat([h, m], dim=-1)))  # (B,G,C)
+        else:  # add and gate
+            h_new = self.act(self.upd(h + self.gamma * m))
         # residual
         h_out = self.norm(h + h_new)
         # re-impose frozen target state
@@ -218,7 +226,7 @@ class GeneMPNN(nn.Module):
             if self.use_sparse_topk:
                 self.layers.append(SparseSpMPLayer(hidden, hidden))
             else:
-                self.layers.append(MPNNLayer(hidden))
+                self.layers.append(MPNNLayer(hidden, mode="concat"))
 
         self.readout = nn.Linear(hidden, 1)
         # Optional dataset/cell-type embeddings
