@@ -228,6 +228,14 @@ class GeneMPNN(nn.Module):
             else:
                 self.layers.append(MPNNLayer(hidden, mode="concat"))
 
+        # --- Graph filter residual (low-DOF propagation), used if a CSR graph is set ---
+        # K=1 is enough to start (I + α L). You already added GraphFilterHead class.
+        self.graph_filter = GraphFilterHead(hidden_dim=hidden, K=1)  # lightweight
+        self.L_csr = None  # set when we have a CSR graph (see set_sparse_A)
+
+        # --- Embedding dropout to defang per-gene identity shortcut ---
+        self.emb_drop = nn.Dropout(p=0.20)
+
         self.readout = nn.Linear(hidden, 1)
         # Optional dataset/cell-type embeddings
         self.dset_E = nn.Embedding(dset_vocab, dset_dim) if dset_vocab > 0 and dset_dim > 0 else None
@@ -323,6 +331,8 @@ class GeneMPNN(nn.Module):
         # (Optional) keep a non-learnable A for sanity checks; not used in forward once weights are learnable.
         self.A_csr = None
 
+        self.L_csr = None  # reset any previous Laplacian
+
     def edge_l1(self) -> torch.Tensor:
         """Mean L1 of current edge weights σ(logit). Handy for regularization."""
         return torch.sigmoid(self.edge_logit).abs().mean()
@@ -341,6 +351,7 @@ class GeneMPNN(nn.Module):
 
         # --- Step-0: learn efficacy and apply counts-space clamp in one place ---
         e_gene = self.node_E(torch.clamp(target_idx, min=0))                       # (B,64)
+        e_gene = self.emb_drop(e_gene)
         if (pidx is not None) and (self.extra_E is not None):
             mask_extra = (pidx >= 0)                                            # (B,)
             e_extra = self.extra_E(torch.clamp(pidx, min=0))
@@ -359,6 +370,7 @@ class GeneMPNN(nn.Module):
         # assemble per-node embeddings for all genes
         idx_all = torch.arange(G, device=device)
         node_feats = self.node_E(idx_all).unsqueeze(0).expand(B, G, -1)  # (B,G,node_dim)
+        node_feats = self.emb_drop(node_feats)
         x_in = torch.cat([x0.unsqueeze(-1), node_feats], dim=-1)         # (B,G,1+node_dim)
         h = self.embed(x_in)
         # FiLM conditions on both the identity (e_t) and strength (alpha_t) of the hit
@@ -415,6 +427,12 @@ class GeneMPNN(nn.Module):
 
         # Readout back to expression space
         y = self.readout(h).squeeze(-1)  # (B,G)
+
+        # --- Graph filter residual in output space: use dense A_base ---
+        # The head returns a filtered x0-like tensor; add only the residual (gf - x0).
+        gf = self.graph_filter(x0, e_t, self.A_base)   # (B,G)
+        y = y + (gf - x0)
+
         # add gene-conditioned prototype mean-effect (now nonlinear in alpha_t and optional z_extra)
         b_proto, _, _ = self.proto(target_idx, meta=None, external_alpha=alpha_t, z_extra=z_extra)
         y = y + b_proto
@@ -630,3 +648,70 @@ class SparseTopKAttentionLayer(nn.Module):
         out = self.dropout(out)
         out = self.norm(h + out)
         return out
+
+class GraphFilterHead(nn.Module):
+    """
+    yhat = x0 + sum_{k=0..K} alpha_k(e_t) * (L^k x0)
+    - L is cached (dense) normalized Laplacian from A_base
+    - alpha_k are produced from the perturbation embedding e_t
+    """
+    def __init__(self, hidden_dim: int, K: int = 2):
+        super().__init__()
+        self.K = K
+        self.alpha = nn.Sequential(
+            nn.Linear(hidden_dim, 2 * (K + 1)),
+            nn.GELU(),
+            nn.Linear(2 * (K + 1), K + 1)
+        )
+        self.register_buffer("L", None, persistent=False)  # (G,G) dense
+        # Build alpha lazily once we see e_t (its dim can vary across configs)
+        self.alpha = None
+        self._alpha_in_dim = None
+
+    @staticmethod
+    def _laplacian_from_A(A: torch.Tensor) -> torch.Tensor:
+        # A assumed row-stochastic or nonnegative. Build symmetric norm Laplacian: L = I - D^{-1/2} A D^{-1/2}
+        eps = 1e-8
+        d = A.sum(dim=1).clamp_min(eps)
+        dinv2 = torch.pow(d, -0.5)
+        Dm = torch.diag(dinv2)
+        A_sym = Dm @ A @ Dm
+        G = A.shape[0]
+        I = torch.eye(G, device=A.device, dtype=A.dtype)
+        return I - A_sym
+
+    def maybe_build_L(self, A_base: torch.Tensor):
+        if self.L is None:
+            self.L = self._laplacian_from_A(A_base.to(dtype=torch.float32))
+
+    def forward(self, x0: torch.Tensor, e_t: torch.Tensor, A_base: torch.Tensor) -> torch.Tensor:
+        """
+        x0: (B,G)   baseline after Step-0
+        e_t: (B,D)  perturbation embedding (gene or extra-pert)
+        A_base: (G,G) dense adjacency (row-normalized or nonnegative)
+        """
+        # Lazily construct alpha MLP to match the incoming e_t dimension
+        if (self.alpha is None) or (self._alpha_in_dim != e_t.size(-1)):
+            in_dim = e_t.size(-1)
+            self.alpha = nn.Sequential(
+                nn.Linear(in_dim, 2 * (self.K + 1)),
+                nn.GELU(),
+                nn.Linear(2 * (self.K + 1), self.K + 1)
+            ).to(e_t.device)
+            self._alpha_in_dim = in_dim
+        self.maybe_build_L(A_base)
+        B, G = x0.shape
+        # coefficients per sample
+        al = self.alpha(e_t)                       # (B, K+1)
+        # propagate powers of L
+        # Work in (G,B) to use mm efficiently: v_k^T = (L^k x0)^T = L^k @ x0^T
+        v = x0.t()                                 # (G,B), k=0 term
+        acc = (al[:, 0].unsqueeze(0) * v).sum(dim=0, keepdim=True)  # broadcast will be applied later
+        # accumulate per k
+        out = (al[:, 0].unsqueeze(-1) * x0)        # (B,G)
+        v_k = v
+        for k in range(1, self.K + 1):
+            v_k = self.L @ v_k                     # (G,B)
+            term = v_k.t()                         # (B,G)
+            out = out + (al[:, k].unsqueeze(-1) * term)
+        return x0 + out
