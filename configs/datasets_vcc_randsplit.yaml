@@ -155,3 +155,37 @@ datasets:
     fixed:
       pert_type: "crispri"
       cell_type: "h1_hESC"
+
+  Nadig_hepg2:
+    raw_path: "/data/PRESAGE/data/raw_data/GSE264667_hepg2_raw_singlecell_01.h5ad"
+    lab_id: "Weissman"
+    train_graft : true
+    obs_map:
+      batch_id: "gem_group"
+      cell_type: null
+      pert_type: null
+      target_gene: "gene"
+      guide_id: "sgID_AB"
+      is_control_from: "gene"
+      target_id: "gene"
+      perturbation: "gene"
+    fixed:
+      pert_type: "crispri"
+      cell_type: "HepG2"
+
+  Nadig_jurkat:
+    raw_path: "/data/PRESAGE/data/raw_data/GSE264667_jurkat_raw_singlecell_01.h5ad"
+    lab_id: "Weissman"
+    train_graft : true
+    obs_map:
+      batch_id: "gem_group"
+      cell_type: null
+      pert_type: null
+      target_gene: "gene"
+      guide_id: "sgID_AB"
+      is_control_from: "gene"
+      target_id: "gene"
+      perturbation: "gene"
+    fixed:
+      pert_type: "crispri"
+      cell_type: "jurkat"
