@@ -157,7 +157,7 @@ datasets:
       cell_type: "h1_hESC"
 
   Nadig_hepg2:
-    raw_path: "/data/PRESAGE/data/raw_data/GSE264667_hepg2_raw_singlecell_01.h5ad"
+    raw_path: "/data/other_h5ad/nadig_hepg2_fixed_index.h5ad"
     lab_id: "Weissman"
     train_graft : true
     obs_map:
@@ -174,7 +174,7 @@ datasets:
       cell_type: "HepG2"
 
   Nadig_jurkat:
-    raw_path: "/data/PRESAGE/data/raw_data/GSE264667_jurkat_raw_singlecell_01.h5ad"
+    raw_path: "/data/other_h5ad/nadig_jurkat_fixed_index.h5ad"
     lab_id: "Weissman"
     train_graft : true
     obs_map:
