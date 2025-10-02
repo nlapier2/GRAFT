@@ -848,6 +848,8 @@ def main():
     if args.use_pseudobulk:  # stage 2 pseudobulk
         args.batch_size = 1  # enforce single-row batches
         adata = collapse_to_pseudobulk(adata, args.target_label)
+        adata.obs['dataset_id'] = "target_all"
+        adata.obs['cell_type'] = "UNK"
     sc.pp.normalize_total(adata, inplace=True)
     sc.pp.log1p(adata)
     if sparse.isspmatrix(adata.X) and not sparse.isspmatrix_csr(adata.X):
