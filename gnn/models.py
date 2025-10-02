@@ -203,6 +203,14 @@ class GeneMPNN(nn.Module):
         self.alpha_cap = alpha_cap
         self.proj_dim = proj_dim
 
+        # ---- Masked-Gene Modeling (MGM) graph learner (tiny) ----
+        self.mgm_d = 32
+        self.mgm_U = nn.Parameter(torch.randn(self.G, self.mgm_d) * 0.02)
+        self.mgm_V = nn.Parameter(torch.randn(self.G, self.mgm_d) * 0.02)
+        self.mgm_K = 64                 # default K for pretraining
+        self.mgm_topk_idx = None        # (G,K) long
+        self.mgm_theta = None           # (G,K) learnable weights; created after first neighbor build
+
         # variables for sparse message passing layers
         self.use_sparse_topk = use_sparse_topk
         self.learn_dense_edges = learn_dense_edges
@@ -320,13 +328,13 @@ class GeneMPNN(nn.Module):
         assert int(rowptr[-1]) == E, "rowptr[-1] must equal number of edges"
         self.node_count = G
         # Store CSR structure
-        self.csr_rowptr = rowptr
-        self.csr_colind = colind
+        self.csr_rowptr = rowptr.detach()
+        self.csr_colind = colind.detach()
         # Precompute 'rows' index per edge for fast segment ops
-        rows = torch.repeat_interleave(torch.arange(G, device=rowptr.device), rowptr[1:] - rowptr[:-1])
+        rows = torch.repeat_interleave(torch.arange(G, device=rowptr.device), self.csr_rowptr[1:] - self.csr_rowptr[:-1])
         self.csr_rows = rows
         # Initialize learnable edge logits from prior values (clamped to (0,1))
-        v = values.clamp_(1e-6, 1 - 1e-6).float()
+        v = values.detach().clamp(1e-6, 1 - 1e-6).float()
         self.edge_logit = nn.Parameter(torch.log(v / (1 - v)))  # inverse sigmoid
         # (Optional) keep a non-learnable A for sanity checks; not used in forward once weights are learnable.
         self.A_csr = None
@@ -336,6 +344,36 @@ class GeneMPNN(nn.Module):
     def edge_l1(self) -> torch.Tensor:
         """Mean L1 of current edge weights σ(logit). Handy for regularization."""
         return torch.sigmoid(self.edge_logit).abs().mean()
+    
+    @torch.no_grad()
+    def mgm_recompute_neighbors(self, K: int | None = None):
+        """Compute Top-K per row from scores = U @ V^T. No grads through selection."""
+        K = K or self.mgm_K
+        # scores: (G,G); do it in chunks to avoid big dense peak if G is large
+        G = self.G
+        chunk = max(1, 8192 // self.mgm_d)  # safe chunking (tune as you like)
+        topk_idx = []
+        for s in range(0, G, chunk):
+            e = min(G, s + chunk)
+            scores = self.mgm_U[s:e] @ self.mgm_V.t()  # (e-s, G)
+            idx = scores.topk(K, dim=1).indices        # (e-s,K)
+            topk_idx.append(idx)
+        self.mgm_topk_idx = torch.cat(topk_idx, dim=0).to(self.mgm_U.device)  # (G,K)
+        # init theta if needed
+        if self.mgm_theta is None or self.mgm_theta.shape != self.mgm_topk_idx.shape:
+            self.mgm_theta = nn.Parameter(torch.zeros_like(self.mgm_topk_idx, dtype=torch.float32))
+
+    def mgm_current_csr(self):
+        """Build CSR (rowptr, colind, values) from current Top-K + theta (row-normalized)."""
+        assert self.mgm_topk_idx is not None
+        G, K = self.mgm_topk_idx.shape
+        rowptr = torch.arange(0, (G+1)*K, K, device=self.mgm_topk_idx.device, dtype=torch.int64)  # 0, K, 2K, ...
+        colind = self.mgm_topk_idx.reshape(-1)  # (G*K,)
+        w = torch.nn.functional.softplus(self.mgm_theta).reshape(-1) + 1e-8
+        rows = torch.arange(G, device=w.device).unsqueeze(1).expand(-1, K).reshape(-1)
+        deg = torch.zeros(G, device=w.device, dtype=w.dtype).index_add_(0, rows, w)
+        vals = w / deg[rows].clamp_min(1e-8)
+        return rowptr, colind, vals
 
     def forward(self, x_ctrl: torch.Tensor, target_idx: torch.Tensor, A_base: torch.Tensor, pert_rowidx: torch.Tensor = None,
                 dset_idx: torch.Tensor | None = None, ct_idx: torch.Tensor | None = None, pidx: torch.Tensor | None = None) -> torch.Tensor:

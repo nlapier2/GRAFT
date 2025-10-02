@@ -113,6 +113,7 @@ def parse_arguments():
 # --- QUICK TOGGLES (just set True to try) ---
 SCRAMBLE_ACROSS_CELLS_PER_GENE = False   # column-wise: for each gene g, shuffle x[:, g] across the batch
 SCRAMBLE_WITHIN_EACH_CELL      = False  # row-wise: for each cell b, shuffle x[b, :] across genes
+RUN_MGM_PRETRAIN               = False  # run masked gene pretraining before main training (always on if --use_sparse_topk and no similarity_npz)
 
 def scramble_across_cells_per_gene(x: torch.Tensor) -> torch.Tensor:
     """
@@ -326,12 +327,16 @@ def train(
             num_tokens=num_tokens, token_dim=token_dim, learn_dense_edges=learn_dense_edges,
             num_extra_perts=len(extra2i)
         ).to(device)
+        if RUN_MGM_PRETRAIN:
+            print("=== MGM pretraining: learning sparse graph from masked-gene recovery ===")
+            masked_graph_pretrain(model, adata, device, steps=250, batch_size=min(256, batch_size), mask_p=0.15, K=64, refresh_every=10)
 
     if use_sparse_topk:
         genes_order = list(map(str, adata.var_names))
-        rowptr, colind, values = load_similarity_npz(similarity_npz, genes_order, device=device)
-        # model.set_candidate_csr(rowptr, colind, values)  # used for attention layers, no longer used
-        model.set_sparse_A(rowptr, colind, values)
+        if not RUN_MGM_PRETRAIN:
+            rowptr, colind, values = load_similarity_npz(similarity_npz, genes_order, device=device)
+            # model.set_candidate_csr(rowptr, colind, values)  # used for attention layers, no longer used
+            model.set_sparse_A(rowptr, colind, values)
 
         # --- store category→row maps for reuse in later stages ---
         if ("dataset_id" in adata.obs.columns) and (getattr(model, "dset_E", None) is not None):

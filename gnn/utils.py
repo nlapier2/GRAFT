@@ -777,3 +777,79 @@ def load_similarity_npz(
         colind_t = colind_t.to(device, non_blocking=True)
         values_t = values_t.to(device, non_blocking=True)
     return rowptr_t, colind_t, values_t
+
+def masked_graph_pretrain(model, adata, device, steps=300, batch_size=256, mask_p=0.15, K=64, refresh_every=10):
+    """
+    Learn a sparse Top-K graph by masked-gene reconstruction:
+      x_obs = x * (1 - m);   x_pred = A_csr @ x_obs  (SpMM, row-normalized)
+      loss = MSE on masked entries only
+    """
+    model.train()
+    X = torch.tensor(adata.X.A if hasattr(adata.X, "A") else adata.X, dtype=torch.float32, device=device)
+    # if X is sparse CSR in anndata, convert to dense just for this quick pretrain
+    if X.dim() != 2:
+        X = X.to_dense()
+    G = X.shape[1]
+    model.mgm_K = K
+    model.mgm_recompute_neighbors(K)
+    opt = torch.optim.Adam([
+        {"params": [model.mgm_U, model.mgm_V], "lr": 5e-3},
+        {"params": [model.mgm_theta], "lr": 2e-3},
+    ])
+    num = X.shape[0]
+    for step in range(1, steps+1):
+        # mini-batch
+        idx = torch.randint(0, num, (min(batch_size, num),), device=device)
+        x = X[idx]                            # (B,G)
+        # mask a random subset of genes per sample
+        m = (torch.rand_like(x) < mask_p).float()
+        x_obs = x * (1.0 - m)                 # keep unmasked only
+        # build CSR from current neighbors/weights
+        if (step % refresh_every) == 1:
+            model.mgm_recompute_neighbors(K)
+        rowptr, colind, vals = model.mgm_current_csr()
+        A = torch.sparse_csr_tensor(rowptr, colind, vals, size=(G, G), device=device, dtype=torch.float32)
+        # predict masked entries via one SpMM
+        pred = (torch.sparse.mm(A, x_obs.t())).t()  # (B,G)
+        # MSE on masked positions only
+        denom = m.sum().clamp_min(1.0)
+        loss = ((pred - x) ** 2 * m).sum() / denom
+        # small entropy to avoid uniform rows
+        with torch.no_grad():
+            # row entropy approximation from vals (row-stochastic already)
+            pass
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        if (step % 50) == 0:
+            print(f"[MGM] step {step:04d}  loss_masked={loss.item():.4f}")
+    # finalize CSR and install into the model
+    rowptr, colind, vals = model.mgm_current_csr()
+    model.set_sparse_A(rowptr.detach(), colind.detach(), vals.detach())
+    # finalize CSR and install into the model — sever all MGM graph edges
+    with torch.no_grad():
+        rowptr, colind, vals = model.mgm_current_csr()
+        rowptr = rowptr.detach()
+        colind = colind.detach()
+        vals   = vals.detach()
+    model.set_sparse_A(rowptr, colind, vals)
+    # also provide a dense A_base for the diffusion/filter if you are using it on small G
+    if G <= 2000:
+        with torch.no_grad():
+            A_dense = torch.zeros((G, G), device=device, dtype=torch.float32)
+            for i in range(G):
+                s, e = int(rowptr[i]), int(rowptr[i+1])
+                A_dense[i, colind[s:e]] = vals[s:e]
+        # store as a buffer to guarantee it's leaf/non-differentiable
+        if hasattr(model, "A_base"):
+            model.register_buffer("A_base", A_dense)  # overwrite safely
+        else:
+            model.A_base = A_dense  # fallback if older code
+
+    # make sure no graph refs stick around
+    # drop MGM grads/graphs to be extra safe
+    for p in (model.mgm_U, model.mgm_V, model.mgm_theta):
+        if p.grad is not None:
+            p.grad = None
+        p.requires_grad_(False)
+    torch.cuda.empty_cache()  # optional; helpful if you were tight on memory
