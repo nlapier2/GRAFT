@@ -468,8 +468,8 @@ class GeneMPNN(nn.Module):
 
         # --- Graph filter residual in output space: use dense A_base ---
         # The head returns a filtered x0-like tensor; add only the residual (gf - x0).
-        gf = self.graph_filter(x0, e_t, self.A_base)   # (B,G)
-        y = y + (gf - x0)
+        #gf = self.graph_filter(x0, e_t, self.A_base)   # (B,G)
+        #y = y + (gf - x0)
 
         # add gene-conditioned prototype mean-effect (now nonlinear in alpha_t and optional z_extra)
         b_proto, _, _ = self.proto(target_idx, meta=None, external_alpha=alpha_t, z_extra=z_extra)
