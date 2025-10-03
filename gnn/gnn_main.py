@@ -856,6 +856,10 @@ def main():
         adata.X = adata.X.tocsr()  # nicer slicing, though we load to numpy anyway
     # train/test split
     adata_train, adata_test, pb_target = train_test_split(args, adata, pb_target)
+    adata_train.obs['dataset_id'] = "target_all"
+    adata_train.obs['cell_type'] = "UNK"
+    adata_test.obs['dataset_id'] = "target_all"
+    adata_test.obs['cell_type'] = "UNK"
 
     # ----- Optional: load pathway prior M_meta.npy (R x G) -----
     W_meta = None
