@@ -108,9 +108,9 @@ def prep_pb_all(pb_target, adata_train, args):
             pb_i = ad.read_h5ad(p)
             pb_i = prep_external_data(pb_i, args.target_label, args.control_label, adata_train, args.remove_non_gene_perts)
             pbs.append(pb_i)
-        # Concatenate all pseudobulk rows
-        pb_all = ad.concat(pbs, axis=0, join="outer", merge="same")
-        pb_all.obs = pb_all.obs.copy()  # ensure contiguous
+    # Concatenate all pseudobulk rows
+    pb_all = ad.concat(pbs, axis=0, join="outer", merge="same")
+    pb_all.obs = pb_all.obs.copy()  # ensure contiguous
     return pb_all, len(pbs)
 
 def train_test_split(args, adata):

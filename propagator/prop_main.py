@@ -42,10 +42,10 @@ def parse_arguments():
                     help="Optional path to a separate test AnnData. If set, overrides --test_pct_perts.")
     ap.add_argument('--eval_on_train', action='store_true', help='Evaluate on training set in addition to test set')
 
-    ap.add_argument("--dset_embed_dim", type=int, default=0,
-                    help="Dimensionality of dataset embedding (if enabled)")
-    ap.add_argument("--ct_embed_dim", type=int, default=0,
-                    help="Dimensionality of cell_type embedding (if enabled)")
+    ap.add_argument("--dset_embed_dim", type=int, default=16,
+                    help="Dimensionality of dataset embedding")
+    ap.add_argument("--ct_embed_dim", type=int, default=16,
+                    help="Dimensionality of cell_type embedding")
     ap.add_argument("--missing_gene_fill", type=str, default="nan", choices=["nan", "-1"],
                         help="Placeholder used in pseudobulk for missing genes; masked in Stage-1 losses")
 
@@ -75,7 +75,8 @@ def train(
     else:
         device = args.device
 
-    model = None
+    model = AveragePredictor().to(device)
+    model.fit(adata, target_label=args.target_label, control_label=args.control_label, device=device)
     opt = None
 
     return model, opt
@@ -110,12 +111,15 @@ def predict_all_perturbations(
     # control pseudobulk (global)
     ctrl_mean = X[ctrl_idx].mean(axis=0)
 
-    # target mapping (label -> gene index), -1 if not a gene in panel
-    t2gi = build_target_to_gene_index(adata, args.target_label)
+    # Prepare outputs aligned to perturbed rows
+    pert_names = labels[pert_idx].tolist()
+    true_mat = X[pert_idx]                                  # (N_pert, G)
 
-    # batched forward with random control matches
+    # Forward through the baseline model (predict the same vector for all perts)
     model.eval()
-    pass  # run model here
+    with torch.no_grad():
+        Y = model.predict(n_rows=len(pert_idx))             # (N_pert, G) torch
+        pred_mat = Y.detach().cpu().numpy().astype(np.float32)
 
     return pred_mat, true_mat, pert_names, ctrl_mean
 
@@ -292,7 +296,7 @@ def main():
     pb_all, pb_len = prep_pb_all(adata_train, adata_train, args)
         
     # ---------------------------
-    # Optional Stage-1: pseudobulk pretraining (reuses the same train() loop)
+    # Training loop
     # ---------------------------
     model, opt = train(pb_all, args)
 
