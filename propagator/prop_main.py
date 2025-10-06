@@ -29,7 +29,9 @@ def parse_arguments():
     ap.add_argument("--hidden", type=int, default=128)
     ap.add_argument("--T", type=int, default=2, help="Number of message-passing steps.")
     ap.add_argument("--epochs", type=int, default=10)
+    ap.add_argument("--batch_size", type=int, default=256)
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--weight_decay", type=float, default=1e-4)
     ap.add_argument("--weight_target", type=float, default=0.1)
     ap.add_argument("--weight_mse", type=float, default=0.0, help="Weight for per-cell MSE loss.")
     ap.add_argument("--weight_proto", type=float, default=0.2, help="Weight for prototype loss.")
@@ -53,6 +55,12 @@ def parse_arguments():
                     help="Path to a saved checkpoint (.pt). If set, training will start from these weights.")
     ap.add_argument("--save_model_path", type=str, default="",
                     help="Where to save the trained model (.pt). If empty, an auto name based on --in_h5ad is used.")
+    
+    ap.add_argument("--topk_keep", type=int, default=64, help="Sparsity level for gene-gene graph.")
+    ap.add_argument("--qk_dim", type=int, default=32, help="Dimensionality of Q/K embeddings.")
+    ap.add_argument("--qk_temp", type=float, default=1.0, help="Temperature for QK attention.")
+    ap.add_argument("--alpha", type=float, default=0.3, help="Alpha for propagation (1-alpha)*I + alpha*W.")
+    ap.add_argument("--rebuild_every", type=int, default=1, help="Rebuild sparse graph every N epochs.")
 
     ap.add_argument("--similarity_npz", type=str, default="", help="Precomputed gene-gene similarity CSR .npz")
     ap.add_argument('--remove_non_gene_perts', action='store_true', help='Remove non-gene perturbation labels')
@@ -70,15 +78,93 @@ def train(
 ):
     rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)
-    if args.device == "cuda" and not torch.cuda.is_available():
-        device = "cpu"
-    else:
-        device = args.device
 
-    model = AveragePredictor().to(device)
-    model.fit(adata, target_label=args.target_label, control_label=args.control_label, device=device)
-    opt = None
+    device = args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu"
+    # Map dataset/celltype to contiguous ids from obs
+    ds_cat = adata.obs['dataset_id'].astype("category").cat
+    ct_cat = adata.obs['cell_type' ].astype("category").cat
+    num_genes = adata.n_vars
+    num_ds    = len(ds_cat.categories)
+    num_ct    = len(ct_cat.categories)
 
+    model = PropSpikeModel(
+        num_genes=num_genes,
+        num_datasets=num_ds,
+        num_celltypes=num_ct,
+        gene_emb_dim=getattr(args, "gene_emb_dim", 64),
+        qk_dim=getattr(args, "qk_dim", 32),
+        topk=getattr(args, "topk_keep", 64),
+        alpha=getattr(args, "alpha", 0.3),
+        T=getattr(args, "T", 2),
+        temperature=getattr(args, "qk_temp", 1.0),
+        device=device,
+    )
+
+    # Freeze vocabularies on the model for consistent mapping at eval time
+    model.ds_vocab = [str(x) for x in ds_cat.categories]
+    model.ct_vocab = [str(x) for x in ct_cat.categories]
+    model.ds2id = {s:i for i,s in enumerate(model.ds_vocab)}
+    model.ct2id = {s:i for i,s in enumerate(model.ct_vocab)}
+
+    # === Data tensors (pseudobulk) ===
+    X = to_numpy(adata.X).astype(np.float32)            # assume Δμ in PB already
+    labels = adata.obs[args.target_label].astype(str).values
+    dset_codes = ds_cat.codes.astype(np.int64).to_numpy()
+    ct_codes   = ct_cat.codes.astype(np.int64).to_numpy()
+    # keep only pert rows (exclude controls)
+    ctrl_mask = (labels == args.control_label)
+    pert_idx_all = np.where(~ctrl_mask)[0]
+    # map pert name -> target gene index (drop non-gene perts for now)
+    p2g = build_target_to_gene_index(adata, args.target_label)
+    tgt = np.array([p2g.get(labels[i], -1) for i in pert_idx_all], dtype=np.int64)
+    keep = tgt >= 0
+    pert_rows = pert_idx_all[keep]
+    tgt = tgt[keep]
+    ds  = dset_codes[pert_rows]
+    ct  = ct_codes[pert_rows]
+    Y   = X[pert_rows]                                   # target Δμ (N,G)
+
+    # torch tensors
+    t_tgt = torch.from_numpy(tgt).to(device=device, dtype=torch.long)
+    t_ds  = torch.from_numpy(ds).to(device=device, dtype=torch.long)
+    t_ct  = torch.from_numpy(ct).to(device=device, dtype=torch.long)
+    t_Y   = torch.from_numpy(Y).to(device=device, dtype=torch.float32)
+
+    # === Optimizer & loss ===
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    huber = torch.nn.SmoothL1Loss(beta=0.1)  # Huber; tweak beta as desired
+
+    # === Train loop ===
+    rng = np.random.default_rng(args.seed)
+    model.train()
+    for epoch in range(1, args.epochs + 1):
+        # rebuild sparse graph so Top-K follows Q/K learning
+        if (epoch == 1) or (epoch % args.rebuild_every == 0):
+            model.eval()
+            model.build_sparse_graph(chunk_rows=getattr(args, "qk_chunk", 2048))
+            model.train()
+
+        # minibatch over pert rows
+        idx = np.arange(len(pert_rows))
+        rng.shuffle(idx)
+        bs = args.batch_size
+        running = 0.0
+        for s in range(0, len(idx), bs):
+            b = idx[s:s+bs]
+            pt = t_tgt[b]
+            dsb = t_ds[b]
+            ctb = t_ct[b]
+            y_true = t_Y[b]                 # (b,G) Δμ
+            y_pred = model(pt, dsb, ctb)    # (b,G) Δμ̂
+            loss = huber(y_pred, y_true)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            opt.step()
+            running += loss.item() * len(b)
+        print(f"[epoch {epoch:03d}] huber={running/len(idx):.5f}")
+
+    model.eval()
     return model, opt
 
 
@@ -115,11 +201,39 @@ def predict_all_perturbations(
     pert_names = labels[pert_idx].tolist()
     true_mat = X[pert_idx]                                  # (N_pert, G)
 
-    # Forward through the baseline model (predict the same vector for all perts)
+    # Build (pert_idx, dataset_idx, celltype_idx) for those rows
+    # The PB object must carry dataset & celltype columns (categoricals)
+    # Map using the model's frozen vocabularies
+    ds_labels = adata.obs['dataset_id'].astype(str).values
+    ct_labels = adata.obs['cell_type' ].astype(str).values
+    # unseen labels map to 0 by default (or choose a dedicated "other" id if you add one)
+    dset_codes = np.array([model.ds2id.get(s, 0) for s in ds_labels], dtype=np.int64)
+    ct_codes   = np.array([model.ct2id.get(s, 0) for s in ct_labels], dtype=np.int64)
+    pidx = build_target_to_gene_index(adata, args.target_label)  # dict: pert_name -> gene index (or -1)
+    # Map pert row names -> target gene index (assume pert name == gene symbol when it's a gene)
+    tgt_idx = np.array([pidx.get(name, -1) for name in pert_names], dtype=np.int64)
+    # Filter out rows where target gene isn't in panel
+    keep = tgt_idx >= 0
+    if not np.all(keep):
+        pert_names = [n for n, k in zip(pert_names, keep) if k]
+        true_mat = true_mat[keep]
+    tgt_idx = tgt_idx[keep]
+    ds_idx  = dset_codes[pert_idx][keep]
+    ct_idx  = ct_codes[pert_idx][keep]
+
+    # Forward through PropSpikeModel in reasonable batches
     model.eval()
+    preds = []
+    bs = max(512, 1)  # large enough for PB rows; adjust if needed
     with torch.no_grad():
-        Y = model.predict(n_rows=len(pert_idx))             # (N_pert, G) torch
-        pred_mat = Y.detach().cpu().numpy().astype(np.float32)
+        for s in range(0, len(tgt_idx), bs):
+            e = min(len(tgt_idx), s + bs)
+            pt = torch.from_numpy(tgt_idx[s:e]).to(model.device)
+            ds = torch.from_numpy(ds_idx[s:e]).to(model.device)
+            ct = torch.from_numpy(ct_idx[s:e]).to(model.device)
+            y = model(pt, ds, ct)                            # (b,G) Δμ̂
+            preds.append(y.cpu().numpy().astype(np.float32))
+    pred_mat = np.concatenate(preds, axis=0)
 
     return pred_mat, true_mat, pert_names, ctrl_mean
 
