@@ -123,11 +123,7 @@ def predict_all_perturbations(
 def evaluate_model(
     adata: ad.AnnData,
     model: nn.Module,
-    target_label: str,
-    control_label: str,
-    device: str = "cuda",
-    batch_size: int = 256,
-    seed: int = 0,
+    args,
 ):
     """
     Computes:
@@ -138,16 +134,16 @@ def evaluate_model(
     Prints a concise report and returns a dict with all metrics.
     """
     pred_mat, true_mat, pert_names, ctrl_mean = predict_all_perturbations(
-        adata, model, target_label, control_label, device=device, batch_size=batch_size, seed=seed
+        adata, model, args
     )
     G = adata.n_vars
     df_obs = adata.obs
-    labels = df_obs[target_label].astype(str).values
+    labels = df_obs[args.target_label].astype(str).values
 
     # group indices by perturbation (excluding control)
     perts = sorted(set(pert_names))
     # target mapping
-    t2gi = build_target_to_gene_index(adata, target_label)
+    t2gi = build_target_to_gene_index(adata, args.target_label)
 
     # per-pert pseudobulks (pred & true) and MAE
     pred_bulk = {}
@@ -305,84 +301,11 @@ def main():
     # ---------------------------
     eval_adata = adata_test if adata_test is not None else adata_train
     print("\n=== Evaluation on {} set ===".format("TEST (held-out perts)" if adata_test is not None else "TRAIN (no holdout)"))
-    eval_metrics = evaluate_model(
-        adata=eval_adata,
-        model=model,
-        target_label=args.target_label,
-        control_label=args.control_label,
-        device=args.device,
-        batch_size=args.batch_size,
-        seed=args.seed,
-    )
-    if args.test_zero_adj:
-        print("\n=== Additional evaluation with ZERO adjacency ===")
-        # Temporarily replace model adjacency with identity
-        if hasattr(model, "A_base"):
-            orig_A = model.A_base
-            G = orig_A.size(0)
-            model.A_base = orig_A * 0.0 # torch.eye(G, device=orig_A.device) * (1.0 / G)
-            _ = evaluate_model(
-                adata=eval_adata,
-                model=model,
-                target_label=args.target_label,
-                control_label=args.control_label,
-                device=args.device,
-                batch_size=args.batch_size,
-                seed=args.seed,
-            )
-            model.A_base = orig_A  # restore
-        else:
-            print("[warning] model has no A_base attribute; skipping zero-adj eval.")
+    eval_metrics = evaluate_model(adata=eval_adata, model=model, args=args) 
 
     if args.eval_on_train and (adata_test is not None):
         print("\n=== Additional evaluation on TRAIN set ===")
-        _ = evaluate_model(
-            adata=adata_train,
-            model=model,
-            target_label=args.target_label,
-            control_label=args.control_label,
-            device=args.device,
-            batch_size=args.batch_size,
-            seed=args.seed,
-        )
-        if args.test_zero_adj:
-            print("\n=== Additional evaluation on TRAIN with ZERO adjacency ===")
-            # Temporarily replace model adjacency with identity
-            if hasattr(model, "A_base"):
-                orig_A = model.A_base
-                G = orig_A.size(0)
-                model.A_base = orig_A * 0.0 # torch.eye(G, device=orig_A.device) * (1.0 / G)
-                _ = evaluate_model(
-                    adata=adata_train,
-                    model=model,
-                    target_label=args.target_label,
-                    control_label=args.control_label,
-                    device=args.device,
-                    batch_size=args.batch_size,
-                    seed=args.seed,
-                )
-                model.A_base = orig_A  # restore
-            else:
-                print("[warning] model has no A_base attribute; skipping zero-adj eval.")
-
-    # ---------------------------
-    # Optional: write predictions AnnData for the evaluation split
-    # ---------------------------
-    if args.out_pred_h5ad:
-        print(f"\n[write] Generating predictions AnnData → {args.out_pred_h5ad}")
-        # run the same batched predictor to get per-pert predictions + their row indices
-        pred_mat, _, pert_names_eval, _, pert_idx = predict_all_perturbations(
-            eval_adata, model, args.target_label, args.control_label,
-            device=args.device, batch_size=args.batch_size, seed=args.seed
-        )
-        # start from a copy of eval_adata.X and replace perturbed rows with predictions
-        X_eval = to_numpy(eval_adata.X).astype(np.float32, copy=True)
-        X_eval[pert_idx, :] = pred_mat  # controls remain unchanged
-        ad_pred = ad.AnnData(X_eval, obs=eval_adata.obs.copy(), var=eval_adata.var.copy())
-        ad_pred.write_h5ad(args.out_pred_h5ad, compression="lzf")
-        eval_adata.write_h5ad(os.path.splitext(args.out_pred_h5ad)[0] + ".true.h5ad", compression="lzf")
-        print(f"[done] Wrote {args.out_pred_h5ad} (cells={ad_pred.n_obs}, genes={ad_pred.n_vars})")
-
+        _ = evaluate_model(adata=adata_train, model=model, args=args)
 
 if __name__ == "__main__":
     main()
