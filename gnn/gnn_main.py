@@ -105,6 +105,7 @@ def parse_arguments():
     ap.add_argument('--remove_non_gene_perts', action='store_true', help='Remove non-gene perturbation labels')
     ap.add_argument('--eval_on_train', action='store_true', help='Evaluate on training set in addition to test set')
     ap.add_argument('--test_zero_adj', action='store_true', help='For ablation: use zero adjacency during testing')
+    ap.add_argument('--write_test', action='store_true', help='Write true test set')
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     return args
@@ -1091,6 +1092,9 @@ def main():
         ad_pred.write_h5ad(args.out_pred_h5ad, compression="lzf")
         eval_adata.write_h5ad(os.path.splitext(args.out_pred_h5ad)[0] + ".true.h5ad", compression="lzf")
         print(f"[done] Wrote {args.out_pred_h5ad} (cells={ad_pred.n_obs}, genes={ad_pred.n_vars})")
+
+        if args.write_test:
+            adata_test.write_h5ad(args.out_pred_h5ad + '_true.h5ad', compression="lzf")
 
 
 if __name__ == "__main__":
