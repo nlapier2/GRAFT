@@ -627,10 +627,12 @@ def build_model_for_dataset(adata_like, args, load_weights_from: str = ""):
     # ---- decide final vocab sizes from *merged maps* (old maps + new categories) ----
     old_dmap = None
     old_ctmap = None
+    A_base = None
     if isinstance(ckpt, dict):
         meta = ckpt.get("meta", {})
         old_dmap = meta.get("dset_id2row", None)
         old_ctmap = meta.get("ct_id2row", None)
+        A_base = meta.get("A_base", None)
 
     # Merge id maps: keep existing indices; append new categories at the end
     merged_dmap = _merge_id_maps(old_dmap, dset_cats) if dset_dim > 0 else None
@@ -645,6 +647,7 @@ def build_model_for_dataset(adata_like, args, load_weights_from: str = ""):
     # Build the model with the resolved shapes
     model = GeneMPNN(
         G=G,
+        A_base=A_base,
         hidden=args.hidden,
         T=args.T,
         tau=args.tau,
@@ -693,6 +696,7 @@ def save_full_checkpoint(path: str, model, optimizer,  extra_meta: dict = None):
         "optimizer_state_dict": optimizer.state_dict(),
         "meta": {
             "G": getattr(model, "G", None),
+            "A_base": getattr(model, "A_base", None),
             "hidden": getattr(model, "hidden", None),
             "T": getattr(model, "T", None),
             "proj_dim": getattr(model, "proj_dim", None),
