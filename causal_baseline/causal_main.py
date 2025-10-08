@@ -469,6 +469,220 @@ def run_causal_baseline_cdt_notears_train_eval(
             effects[i, :] = delta
     return pd.DataFrame(effects, index=eval_perts, columns=genes)
 
+def run_causal_baseline_igsp_train_eval(
+    adata_train: ad.AnnData,
+    adata_eval: ad.AnnData,
+    target_label: str,
+    control_label: str,
+    alpha_ci: float = 1e-3,        # CI test threshold
+    alpha_inv: float = 1e-3,       # invariance test threshold
+    ridge_alpha: float = 1.0,      # edge-weight ridge
+    standardize: bool = True,      # z-score on TRAIN before learning
+    hvgs: int | None = None,       # optional: limit structure learning to top-HVGs
+    scale_by_on_target: bool = False,  # optional magnitude calibration
+) -> pd.DataFrame:
+    """
+    Pure-Python IGSP baseline with causaldag:
+      1) Build observational (controls) + interventional settings from TRAIN.
+      2) Run UT-IGSP to get a DAG structure (directional).
+      3) Fit linear weights per node via ridge on TRAIN -> B (p x p).
+      4) Total-effect matrix A = (I - B^T)^(-1).
+      5) For EVAL perts, predicted effect = column t of A (optionally scaled by α_t).
+
+    Returns a DataFrame (rows = eval perts, cols = genes in var_names order).
+    """
+    import numpy as np, pandas as pd
+    import causaldag as cd
+    from causaldag import unknown_target_igsp
+
+    from conditional_independence import (
+        MemoizedCI_Tester,
+        partial_correlation_suffstat,
+        partial_correlation_test,
+        MemoizedInvarianceTester,
+        gauss_invariance_suffstat,
+        gauss_invariance_test,
+    )
+    from sklearn.linear_model import Ridge
+
+    # ----- prepare TRAIN data -----
+    Xtr = to_numpy(adata_train.X).astype(np.float64)   # (n_train, p)
+    genes = list(map(str, adata_train.var_names))
+    assert list(adata_eval.var_names) == genes, "Train/Eval var_names must match & be aligned."
+    p = Xtr.shape[1]
+
+    # Optional: restrict structure learning to HVGs (effects returned for all genes)
+    if hvgs is not None and 0 < hvgs < p:
+        var = Xtr.var(axis=0)
+        hvg_idx = np.argsort(var)[::-1][:hvgs]
+        hvg_idx = np.sort(hvg_idx)
+    else:
+        hvg_idx = np.arange(p)
+
+    # Standardize (fit on TRAIN only)
+    mu = Xtr[:, hvg_idx].mean(axis=0) if standardize else np.zeros(len(hvg_idx))
+    sd = Xtr[:, hvg_idx].std(axis=0); sd[sd < 1e-9] = 1.0
+    Ztr_hvg = (Xtr[:, hvg_idx] - mu) / sd if standardize else Xtr[:, hvg_idx]
+    genes_hvg = [genes[i] for i in hvg_idx]
+    gene_pos_hvg = {g: i for i, g in enumerate(genes_hvg)}
+
+    # ----- build settings from TRAIN -----
+    labels_tr = adata_train.obs[target_label].astype(str).values
+    ctrl_mask_tr = (labels_tr == control_label)
+
+    # Observational samples (controls)
+    obs_samples = Ztr_hvg[ctrl_mask_tr]
+    # Interventional settings: one per pert label present in TRAIN (rows with that label)
+    train_perts = sorted({lab for lab in labels_tr if lab != control_label})
+    iv_samples_list = []
+    setting_list = []  # for UT-IGSP API
+    # known_interventions lists use *positions in the HVG subspace*; if a pert gene not in HVGs, set empty -> observational-like
+    for plab in train_perts:
+        rows = (labels_tr == plab)
+        if rows.sum() == 0:
+            continue
+        iv_samples = Ztr_hvg[rows]
+        iv_samples_list.append(iv_samples)
+        if plab in gene_pos_hvg:
+            setting_list.append(dict(known_interventions=[gene_pos_hvg[plab]]))
+        else:
+            setting_list.append(dict(known_interventions=[]))  # pert gene not in HVGs
+
+    # Edge case: if no control rows or no IV settings, bail early with zeros
+    if obs_samples.shape[0] == 0 or len(iv_samples_list) == 0:
+        eval_perts = sorted({lab for lab in adata_eval.obs[target_label].astype(str).values if lab != control_label})
+        return pd.DataFrame(np.zeros((len(eval_perts), p)), index=eval_perts, columns=genes)
+
+    # ----- UT-IGSP inputs: CI & invariance testers -----
+    obs_suff = partial_correlation_suffstat(obs_samples)
+    inv_suff = gauss_invariance_suffstat(obs_samples, iv_samples_list)
+    ci_tester = MemoizedCI_Tester(partial_correlation_test, obs_suff, alpha=alpha_ci)
+    inv_tester = MemoizedInvarianceTester(gauss_invariance_test, inv_suff, alpha=alpha_inv)
+
+    # Nodes are 0..(p_hvg-1)
+    nodes = set(range(len(hvg_idx)))
+
+    # ----- run UT-IGSP to get a DAG on HVGs -----
+    est_dag_hvg, _ = unknown_target_igsp(
+        setting_list=setting_list,
+        nodes=nodes,
+        ci_tester=ci_tester,
+        invariance_tester=inv_tester
+    )  # est_dag_hvg is a cd.DAG over nodes
+
+    # ----- refit edge weights (linear ridge) on TRAIN (HVG subspace) -----
+    B_hvg = np.zeros((len(hvg_idx), len(hvg_idx)), dtype=np.float64)
+    Xt = Ztr_hvg
+    for j in range(len(hvg_idx)):
+        parents = list(est_dag_hvg.parents_of(j))
+        if not parents:
+            continue
+        X_par = Xt[:, parents]
+        y = Xt[:, j]
+        coef = Ridge(alpha=ridge_alpha, fit_intercept=False).fit(X_par, y).coef_
+        B_hvg[parents, j] = coef
+    np.fill_diagonal(B_hvg, 0.0)
+
+    # ----- total effects on HVGs -----
+    I_h = np.eye(B_hvg.shape[0], dtype=np.float64)
+    try:
+        A_hvg = np.linalg.inv(I_h - B_hvg.T)
+    except np.linalg.LinAlgError:
+        A_hvg = np.linalg.inv(I_h - B_hvg.T + 1e-6 * I_h)
+
+    # Expand to all genes (zeros outside HVG set)
+    A_full = np.zeros((p, p), dtype=np.float64)
+    A_full[np.ix_(hvg_idx, hvg_idx)] = A_hvg
+
+    # Optional α_t scaling from TRAIN (original space)
+    alpha_by_pert = {}
+    if scale_by_on_target:
+        Xtr_full = to_numpy(adata_train.X).astype(np.float64)
+        ctrl_mean = Xtr_full[ctrl_mask_tr].mean(axis=0, dtype=np.float64) if ctrl_mask_tr.any() else np.zeros(p)
+        for plab in train_perts:
+            if plab in genes:
+                t_idx = genes.index(plab)
+                pb_mean = Xtr_full[labels_tr == plab].mean(axis=0, dtype=np.float64)
+                base = np.expm1(np.maximum(ctrl_mean[t_idx], 0.0))
+                obs  = np.expm1(np.maximum(pb_mean[t_idx], 0.0))
+                alpha_by_pert[plab] = float(np.clip(1.0 - (obs / base) if base > 0 else 0.0, 0.0, 1.5))
+
+    # ----- build effects for EVAL perts -----
+    labels_ev = adata_eval.obs[target_label].astype(str).values
+    eval_perts = sorted({lab for lab in labels_ev if lab != control_label})
+    effects = np.zeros((len(eval_perts), p), dtype=np.float64)
+    for i, plab in enumerate(eval_perts):
+        if plab in genes:
+            t = genes.index(plab)
+            delta = A_full[:, t].copy()
+            if scale_by_on_target and plab in alpha_by_pert:
+                delta *= alpha_by_pert[plab]
+            effects[i, :] = delta
+    return pd.DataFrame(effects, index=eval_perts, columns=genes)
+
+def run_causal_baseline_precision_train_eval(
+    adata_train: ad.AnnData,
+    adata_eval: ad.AnnData,
+    target_label: str,
+    control_label: str,
+    shrinkage: str = "lw",  # "lw" or "oas"
+    scale_by_on_target: bool = False,
+) -> pd.DataFrame:
+    import numpy as np, pandas as pd
+    from sklearn.covariance import LedoitWolf, OAS
+
+    Xtr = to_numpy(adata_train.X).astype(np.float64)
+    genes = list(map(str, adata_train.var_names))
+    assert list(adata_eval.var_names) == genes
+
+    # Standardize on TRAIN
+    mu = Xtr.mean(axis=0, dtype=np.float64)
+    sd = Xtr.std(axis=0, dtype=np.float64); sd[sd < 1e-9] = 1.0
+    Ztr = (Xtr - mu) / sd
+
+    # Precision estimate
+    prec = (OAS().fit(Ztr).precision_ if shrinkage == "oas"
+            else LedoitWolf().fit(Ztr).precision_)
+    Theta = prec
+
+    # Regression coefficients from precision
+    B = -Theta / (np.diag(Theta)[:, None])
+    np.fill_diagonal(B, 0.0)
+
+    # Total effects
+    I = np.eye(B.shape[0])
+    try:
+        A = np.linalg.inv(I - B.T)
+    except np.linalg.LinAlgError:
+        A = np.linalg.inv(I - B.T + 1e-6 * I)
+
+    # Optional α_t scaling from TRAIN (original space)
+    alpha_by_pert = {}
+    if scale_by_on_target:
+        labels_tr = adata_train.obs[target_label].astype(str).values
+        ctrl_mask_tr = (labels_tr == control_label)
+        if ctrl_mask_tr.sum() > 0:
+            ctrl_mean = Xtr[ctrl_mask_tr].mean(axis=0, dtype=np.float64)
+            for p_label in np.unique(labels_tr[~ctrl_mask_tr]):
+                if p_label in genes:
+                    t_idx = genes.index(p_label)
+                    pb_mean = Xtr[labels_tr == p_label].mean(axis=0, dtype=np.float64)
+                    base = np.expm1(np.maximum(ctrl_mean[t_idx], 0.0))
+                    obs  = np.expm1(np.maximum(pb_mean[t_idx], 0.0))
+                    alpha = float(np.clip(1.0 - (obs / base) if base > 0 else 0.0, 0.0, 1.5))
+                    alpha_by_pert[p_label] = alpha
+
+    labels_ev = adata_eval.obs[target_label].astype(str).values
+    eval_perts = sorted({lab for lab in labels_ev if lab != control_label})
+    effects = np.zeros((len(eval_perts), len(genes)), dtype=np.float64)
+    for i, p_label in enumerate(eval_perts):
+        if p_label in genes:
+            t = genes.index(p_label)
+            delta = A[:, t].copy()
+            if scale_by_on_target and p_label in alpha_by_pert:
+                delta *= alpha_by_pert[p_label]
+            effects[i, :] = delta
+    return pd.DataFrame(effects, index=eval_perts, columns=genes)
 
 def evaluate_model(
     adata: ad.AnnData,
@@ -627,6 +841,8 @@ def main():
     # Read input data
     # ---------------------------
     adata = ad.read_h5ad(args.in_h5ad)
+    sc.pp.normalize_total(adata, inplace=True)
+    sc.pp.log1p(adata)
     adata_train, adata_test = train_test_split(args, adata)
 
     eval_adata = adata_test if adata_test is not None else adata_train
@@ -639,16 +855,14 @@ def main():
     #     hvgs=None,                 # adjust or None
     #     scale_by_on_target=False,  # optional
     # )
-    effects_df = run_causal_baseline_cdt_notears_train_eval(
+    effects_df = run_causal_baseline_precision_train_eval(
         adata_train=adata_train,
         adata_eval=eval_adata,
         target_label=args.target_label,
         control_label=args.control_label,
-        max_iter=200,
-        l1=0.01,                # increase for sparser graph; decrease for denser
-        ridge_alpha=1.0,
         scale_by_on_target=False
     )
+
     # 2) Convert effects_df -> (pred_mat, true_mat, pert_names, ctrl_mean)
     pred_bundle = _bundle_from_effects_df(
         eval_adata, effects_df, args.target_label, args.control_label
