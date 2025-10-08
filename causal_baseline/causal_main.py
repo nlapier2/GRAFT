@@ -14,6 +14,10 @@ from rpy2.robjects import numpy2ri, pandas2ri
 from rpy2.robjects.vectors import ListVector, IntVector
 from rpy2.robjects.conversion import localconverter
 
+from sklearn.linear_model import Ridge
+import networkx as nx
+from cdt.causality.graph import GIES
+
 from utils import *
 
 
@@ -370,6 +374,102 @@ def run_causal_baseline_train_eval(
     effects_pred = pd.DataFrame(effects_mat, index=eval_perts, columns=genes_all)
     return effects_pred
 
+def run_causal_baseline_cdt_notears_train_eval(
+    adata_train: ad.AnnData,
+    adata_eval: ad.AnnData,
+    target_label: str,
+    control_label: str,
+    max_iter: int = 200,
+    l1: float = 0.01,           # NOTEARS sparsity (lambda)
+    ridge_alpha: float = 1.0,   # weight fitting (per-node ridge)
+    scale_by_on_target: bool = False,
+) -> pd.DataFrame:
+    """
+    Pure-Python baseline:
+      1) Learn DAG structure on TRAIN via CDT's NOTEARS (linear).
+      2) For each node j, fit ridge regression X_j ~ X_parents(j) on TRAIN to get edge weights.
+      3) Build B (p x p) from those weights; total effects = (I - B^T)^(-1).
+      4) For each eval perturbation t, predict effect as column t of that inverse (optionally scaled by α_t).
+
+    Returns a DataFrame (rows = eval perturbation labels, cols = genes in var_names order), in log1p space.
+    """
+
+    # --- Prepare TRAIN data (standardize) ---
+    Xtr = to_numpy(adata_train.X).astype(np.float64)  # (n_train, p)
+    genes = list(map(str, adata_train.var_names))
+    assert list(adata_eval.var_names) == genes, "Train/eval var_names must match (order too)."
+    n, p = Xtr.shape
+
+    mu = Xtr.mean(axis=0, dtype=np.float64)
+    sd = Xtr.std(axis=0, dtype=np.float64); sd[sd < 1e-9] = 1.0
+    Ztr = (Xtr - mu) / sd
+    df_tr = pd.DataFrame(Ztr, columns=genes)
+
+    # --- 1) Structure learning with NOTEARS (CDT, pure Python) ---
+    # Keep it simple & deterministic-ish
+    #algo = NOTEARS(l1=l1, max_iter=max_iter, verbose=False)
+    algo = GIES()
+    # Returns a weighted DAG as networkx.DiGraph (edge weights are NOTEARS' parameters)
+    dag_nx: nx.DiGraph = algo.predict(df_tr)
+
+    # --- 2) Edge-weight refit via ridge on TRAIN (parents -> child) ---
+    # Build B (p x p) so that X ≈ B^T X + eps; i.e., for child j, parents P, coeffs on P go into B[P, j]
+    B = np.zeros((p, p), dtype=np.float64)
+    Xt = Ztr  # standardized features
+    for j, gene_j in enumerate(genes):
+        # parents are nodes with edges i -> j
+        parents = [u for u, v in dag_nx.in_edges(gene_j)]
+        if not parents:
+            continue
+        P_idx = [genes.index(g) for g in parents]
+        X_par = Xt[:, P_idx]
+        y = Xt[:, j]
+        # Small ridge to stabilize
+        coef = Ridge(alpha=ridge_alpha, fit_intercept=False).fit(X_par, y).coef_
+        B[P_idx, j] = coef
+
+    # Zero diagonal (safety) and tiny thresholding
+    np.fill_diagonal(B, 0.0)
+    thr = np.percentile(np.abs(B), 95) * 1e-8 + 1e-10
+    B[np.abs(B) < thr] = 0.0
+
+    # --- 3) Total-effect matrix A = (I - B^T)^(-1) ---
+    I = np.eye(p, dtype=np.float64)
+    try:
+        A = np.linalg.inv(I - B.T)
+    except np.linalg.LinAlgError:
+        A = np.linalg.inv(I - B.T + 1e-6 * I)
+
+    # --- 4) Optional α_t scaling estimated from TRAIN (original space) ---
+    alpha_by_pert = {}
+    if scale_by_on_target:
+        labels_tr = adata_train.obs[target_label].astype(str).values
+        ctrl_mask_tr = (labels_tr == control_label)
+        if ctrl_mask_tr.sum() > 0:
+            ctrl_mean = Xtr[ctrl_mask_tr].mean(axis=0, dtype=np.float64)
+            for p_label in np.unique(labels_tr[~ctrl_mask_tr]):
+                if p_label in genes:
+                    t_idx = genes.index(p_label)
+                    pb_mean = Xtr[labels_tr == p_label].mean(axis=0, dtype=np.float64)
+                    base = np.expm1(np.maximum(ctrl_mean[t_idx], 0.0))
+                    obs  = np.expm1(np.maximum(pb_mean[t_idx], 0.0))
+                    alpha = float(np.clip(1.0 - (obs / base) if base > 0 else 0.0, 0.0, 1.5))
+                    alpha_by_pert[p_label] = alpha
+
+    # --- Build per-pert predicted effects for EVAL ---
+    labels_ev = adata_eval.obs[target_label].astype(str).values
+    eval_perts = sorted({lab for lab in labels_ev if lab != control_label})
+    effects = np.zeros((len(eval_perts), p), dtype=np.float64)
+    for i, p_label in enumerate(eval_perts):
+        if p_label in genes:
+            t = genes.index(p_label)
+            delta = A[:, t].copy()
+            if scale_by_on_target and p_label in alpha_by_pert:
+                delta *= alpha_by_pert[p_label]
+            effects[i, :] = delta
+    return pd.DataFrame(effects, index=eval_perts, columns=genes)
+
+
 def evaluate_model(
     adata: ad.AnnData,
     args,
@@ -531,13 +631,23 @@ def main():
 
     eval_adata = adata_test if adata_test is not None else adata_train
     print("\n=== Building causal-baseline predictions ===")
-    effects_df = run_causal_baseline_train_eval(
+    # effects_df = run_causal_baseline_train_eval(
+    #     adata_train=adata_train,
+    #     adata_eval=eval_adata,
+    #     target_label=args.target_label,
+    #     control_label=args.control_label,
+    #     hvgs=None,                 # adjust or None
+    #     scale_by_on_target=False,  # optional
+    # )
+    effects_df = run_causal_baseline_cdt_notears_train_eval(
         adata_train=adata_train,
         adata_eval=eval_adata,
         target_label=args.target_label,
         control_label=args.control_label,
-        hvgs=None,                 # adjust or None
-        scale_by_on_target=False,  # optional
+        max_iter=200,
+        l1=0.01,                # increase for sparser graph; decrease for denser
+        ridge_alpha=1.0,
+        scale_by_on_target=False
     )
     # 2) Convert effects_df -> (pred_mat, true_mat, pert_names, ctrl_mean)
     pred_bundle = _bundle_from_effects_df(
@@ -549,15 +659,15 @@ def main():
     )
     _ = evaluate_model(adata=eval_adata, args=args, pred_bundle=pred_bundle)
 
-    if args.eval_on_train and (adata_test is not None):
-        print("\n=== (Optional) Evaluate same baseline on TRAIN set ===")
-        effects_df_tr = run_causal_baseline(
-            adata_train, target_label=args.target_label, control_label=args.control_label
-        )
-        pred_bundle_tr = _bundle_from_effects_df(
-            adata_train, effects_df_tr, args.target_label, args.control_label
-        )
-        _ = evaluate_model(adata=adata_train, args=args, pred_bundle=pred_bundle_tr)
+    # if args.eval_on_train and (adata_test is not None):
+    #     print("\n=== (Optional) Evaluate same baseline on TRAIN set ===")
+    #     effects_df_tr = run_causal_baseline(
+    #         adata_train, target_label=args.target_label, control_label=args.control_label
+    #     )
+    #     pred_bundle_tr = _bundle_from_effects_df(
+    #         adata_train, effects_df_tr, args.target_label, args.control_label
+    #     )
+    #     _ = evaluate_model(adata=adata_train, args=args, pred_bundle=pred_bundle_tr)
 
 if __name__ == "__main__":
     main()
