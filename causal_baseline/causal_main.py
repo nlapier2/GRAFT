@@ -89,6 +89,49 @@ def _bundle_from_effects_df(
     true_mat = np.stack(true_rows, axis=0)
     return pred_mat, true_mat, pert_names, ctrl_mean
 
+def _write_pred_true_h5ads(
+    eval_adata: ad.AnnData,
+    pred_bundle: tuple[np.ndarray, np.ndarray, list[str], np.ndarray],
+    out_pred_h5ad: str,
+    target_label: str,
+    control_label: str,
+):
+    """
+    Write two AnnData files for the *full evaluation split* (controls INCLUDED):
+      - predicted (.h5ad): X has predictions on perturbation rows; control rows are copied from eval_adata.
+      - true (.true.h5ad): exact copy of eval_adata (ground truth).
+    """
+    pred_mat, _true_mat_nc, pert_names, _ctrl_mean = pred_bundle
+    labels = eval_adata.obs[target_label].astype(str).values
+    nonctrl_mask = labels != control_label
+    pert_idx = np.where(nonctrl_mask)[0]  # order matches pred_mat rows
+
+    # Start from the true matrix for ALL rows; then replace only the pert rows with predictions
+    X_true_all = np.asarray(eval_adata.X).astype(np.float32, copy=False)
+    X_pred_all = X_true_all.copy()
+    X_pred_all[pert_idx, :] = pred_mat.astype(np.float32)
+
+    # Build AnnData objects with the full eval obs/var/uns
+    ad_pred = ad.AnnData(
+        X=X_pred_all,
+        obs=eval_adata.obs.copy(),
+        var=eval_adata.var.copy(),
+        uns=eval_adata.uns.copy(),
+    )
+    ad_true = ad.AnnData(
+        X=X_true_all,
+        obs=eval_adata.obs.copy(),
+        var=eval_adata.var.copy(),
+        uns=eval_adata.uns.copy(),
+    )
+    # Optional breadcrumbs
+    ad_pred.obs[f"{target_label}_predicted_for"] = labels  # includes control_label entries
+    ad_true.obs[f"{target_label}_true_for"] = labels
+
+    os.makedirs(os.path.dirname(out_pred_h5ad) or ".", exist_ok=True)
+    ad_pred.write_h5ad(out_pred_h5ad)
+    ad_true.write_h5ad(out_pred_h5ad + ".true.h5ad")
+
 
 def run_causal_baseline(
     adata_eval: ad.AnnData,
@@ -867,11 +910,38 @@ def main():
     pred_bundle = _bundle_from_effects_df(
         eval_adata, effects_df, args.target_label, args.control_label
     )
+
     # 3) Evaluate with your existing metrics
     print("\n=== Evaluation on {} set ===".format(
         "TEST (held-out perts)" if adata_test is not None else "TRAIN (no holdout)")
     )
     _ = evaluate_model(adata=eval_adata, args=args, pred_bundle=pred_bundle)
+
+    # 5) (Optional) Evaluate on TRAIN split as well (fit on TRAIN, eval on TRAIN)
+    if args.eval_on_train and (adata_test is not None):
+        print("\n=== Evaluation on TRAIN set (fit on TRAIN) ===")
+        # Build predictions for TRAIN split using the same precision baseline
+        effects_df_tr = run_causal_baseline_precision_train_eval(
+            adata_train=adata_train,
+            adata_eval=adata_train,
+            target_label=args.target_label,
+            control_label=args.control_label,
+            shrinkage="lw",
+            scale_by_on_target=False,
+        )
+        pred_bundle_tr = _bundle_from_effects_df(
+            adata_train, effects_df_tr, args.target_label, args.control_label
+        )
+        _ = evaluate_model(adata=adata_train, args=args, pred_bundle=pred_bundle_tr)
+
+    if args.out_pred_h5ad:
+        _write_pred_true_h5ads(
+            eval_adata=eval_adata,
+            pred_bundle=pred_bundle,
+            out_pred_h5ad=args.out_pred_h5ad,
+            target_label=args.target_label,
+            control_label=args.control_label,
+        )
 
     # if args.eval_on_train and (adata_test is not None):
     #     print("\n=== (Optional) Evaluate same baseline on TRAIN set ===")
