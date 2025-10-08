@@ -536,7 +536,7 @@ def run_causal_baseline_igsp_train_eval(
     """
     import numpy as np, pandas as pd
     import causaldag as cd
-    from causaldag import unknown_target_igsp
+    from causaldag import igsp
 
     from conditional_independence import (
         MemoizedCI_Tester,
@@ -587,9 +587,14 @@ def run_causal_baseline_igsp_train_eval(
         iv_samples = Ztr_hvg[rows]
         iv_samples_list.append(iv_samples)
         if plab in gene_pos_hvg:
-            setting_list.append(dict(known_interventions=[gene_pos_hvg[plab]]))
+            tgt = [gene_pos_hvg[plab]]
         else:
-            setting_list.append(dict(known_interventions=[]))  # pert gene not in HVGs
+            tgt = []  # pert gene not in HVGs -> treat as observational for structure learning
+        # Provide BOTH keys to be compatible with different package variants
+        setting_list.append({
+            "interventions": tgt,           # required by graphical_model_learning.algorithms.dag.gsp.igsp
+            "known_interventions": tgt,     # used by unknown_target_igsp and some older APIs
+        })
 
     # Edge case: if no control rows or no IV settings, bail early with zeros
     if obs_samples.shape[0] == 0 or len(iv_samples_list) == 0:
@@ -606,12 +611,13 @@ def run_causal_baseline_igsp_train_eval(
     nodes = set(range(len(hvg_idx)))
 
     # ----- run UT-IGSP to get a DAG on HVGs -----
-    est_dag_hvg, _ = unknown_target_igsp(
+    _igsp_out = igsp(
         setting_list=setting_list,
         nodes=nodes,
         ci_tester=ci_tester,
         invariance_tester=inv_tester
     )  # est_dag_hvg is a cd.DAG over nodes
+    est_dag_hvg = _igsp_out[0] if isinstance(_igsp_out, tuple) else _igsp_out
 
     # ----- refit edge weights (linear ridge) on TRAIN (HVG subspace) -----
     B_hvg = np.zeros((len(hvg_idx), len(hvg_idx)), dtype=np.float64)
@@ -650,18 +656,22 @@ def run_causal_baseline_igsp_train_eval(
                 obs  = np.expm1(np.maximum(pb_mean[t_idx], 0.0))
                 alpha_by_pert[plab] = float(np.clip(1.0 - (obs / base) if base > 0 else 0.0, 0.0, 1.5))
 
-    # ----- build effects for EVAL perts -----
+    # ----- build effects for ALL perts seen in TRAIN ∪ EVAL (no refit needed later) -----
+    labels_tr = adata_train.obs[target_label].astype(str).values
     labels_ev = adata_eval.obs[target_label].astype(str).values
-    eval_perts = sorted({lab for lab in labels_ev if lab != control_label})
-    effects = np.zeros((len(eval_perts), p), dtype=np.float64)
-    for i, plab in enumerate(eval_perts):
+    train_perts = {lab for lab in labels_tr if lab != control_label}
+    eval_perts  = {lab for lab in labels_ev if lab != control_label}
+    all_perts   = sorted(train_perts | eval_perts)
+
+    effects = np.zeros((len(all_perts), p), dtype=np.float64)
+    for i, plab in enumerate(all_perts):
         if plab in genes:
             t = genes.index(plab)
             delta = A_full[:, t].copy()
             if scale_by_on_target and plab in alpha_by_pert:
                 delta *= alpha_by_pert[plab]
             effects[i, :] = delta
-    return pd.DataFrame(effects, index=eval_perts, columns=genes)
+    return pd.DataFrame(effects, index=all_perts, columns=genes)
 
 def run_causal_baseline_precision_train_eval(
     adata_train: ad.AnnData,
@@ -898,7 +908,7 @@ def main():
     #     hvgs=None,                 # adjust or None
     #     scale_by_on_target=False,  # optional
     # )
-    effects_df = run_causal_baseline_precision_train_eval(
+    effects_all_df = run_causal_baseline_igsp_train_eval(  # run_causal_baseline_precision_train_eval(
         adata_train=adata_train,
         adata_eval=eval_adata,
         target_label=args.target_label,
@@ -907,9 +917,15 @@ def main():
     )
 
     # 2) Convert effects_df -> (pred_mat, true_mat, pert_names, ctrl_mean)
-    pred_bundle = _bundle_from_effects_df(
-        eval_adata, effects_df, args.target_label, args.control_label
-    )
+    # pred_bundle = _bundle_from_effects_df(
+    #     eval_adata, effects_df, args.target_label, args.control_label
+    # )
+    # --- Slice rows for the EVAL split perts ---
+    eval_labels = eval_adata.obs[args.target_label].astype(str).values
+    eval_perts  = sorted({lab for lab in eval_labels if lab != args.control_label})
+    effects_eval_df = effects_all_df.loc[[p for p in eval_perts if p in effects_all_df.index]]
+    pred_bundle = _bundle_from_effects_df(eval_adata, effects_eval_df, args.target_label, args.control_label)
+
 
     # 3) Evaluate with your existing metrics
     print("\n=== Evaluation on {} set ===".format(
@@ -921,20 +937,24 @@ def main():
     if args.eval_on_train and (adata_test is not None):
         print("\n=== Evaluation on TRAIN set (fit on TRAIN) ===")
         # Build predictions for TRAIN split using the same precision baseline
-        effects_df_tr = run_causal_baseline_precision_train_eval(
-            adata_train=adata_train,
-            adata_eval=adata_train,
-            target_label=args.target_label,
-            control_label=args.control_label,
-            shrinkage="lw",
-            scale_by_on_target=False,
-        )
+        # effects_df_tr = run_causal_baseline_precision_train_eval(
+        #     adata_train=adata_train,
+        #     adata_eval=adata_train,
+        #     target_label=args.target_label,
+        #     control_label=args.control_label,
+        #     scale_by_on_target=False,
+        # )
+        train_labels = adata_train.obs[args.target_label].astype(str).values
+        train_perts  = sorted({lab for lab in train_labels if lab != args.control_label})
+        effects_df_tr = effects_all_df.loc[[p for p in train_perts if p in effects_all_df.index]]
         pred_bundle_tr = _bundle_from_effects_df(
             adata_train, effects_df_tr, args.target_label, args.control_label
         )
         _ = evaluate_model(adata=adata_train, args=args, pred_bundle=pred_bundle_tr)
 
     if args.out_pred_h5ad:
+        if hasattr(eval_adata.X, "toarray"):
+            eval_adata.X = eval_adata.X.toarray()
         _write_pred_true_h5ads(
             eval_adata=eval_adata,
             pred_bundle=pred_bundle,
