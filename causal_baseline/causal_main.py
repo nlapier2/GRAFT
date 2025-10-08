@@ -206,8 +206,25 @@ def run_causal_baseline(
         # idaFast returns total effects from x to *all* variables in CPDAG
         with localconverter(ro.default_converter + numpy2ri.converter + pandas2ri.converter):
             ro.globalenv["x_pos"] = x_pos
-            beta = ro.r("idaFast(x.pos = x_pos, S = S, graph = cpdag_obj)")
-            beta = np.asarray(beta, dtype=np.float64)  # length = G_hvg
+            beta = ro.r("""
+                p <- ncol(S_tr)
+                eff <- numeric(p)
+                for (y in 1:p) {
+                    be <- tryCatch(
+                            ida(x.pos = x_pos, y.pos = y,
+                                graph = cpdag_obj,  covMat = S_tr,
+                                method = "local", type = "cpdag"),
+                            error = function(e)
+                            ida(x.pos = x_pos, y.pos = y,
+                                graphEst = cpdag_obj, CovMat = S_tr,
+                                method = "local", type = "cpdag")
+                        )
+                    # ida() can return multiple values (different valid parent-sets).
+                    eff[y] <- mean(be)
+                }
+                eff
+            """)
+            beta = np.asarray(beta, dtype=np.float64)
         # Optional magnitude calibration by α_t (on HVG subset only; later broadcast)
         if scale_by_on_target and p in alpha_by_pert:
             beta = beta * float(alpha_by_pert[p])
@@ -318,9 +335,29 @@ def run_causal_baseline_train_eval(
     for i, p in enumerate(eval_perts):
         if p in gene_to_pos_hvg:
             x_pos = gene_to_pos_hvg[p] + 1
+            # Version-agnostic ida(): pick correct arg names (graph vs graphEst,
+            # cov.mat vs CovMat vs covMat), then loop over all y and average parent-sets.
             with localconverter(ro.default_converter + numpy2ri.converter + pandas2ri.converter):
                 ro.globalenv["x_pos"] = x_pos
-                beta = ro.r("idaFast(x.pos = x_pos, S = S_tr, graph = cpdag_obj)")
+                beta = ro.r("""
+                    ida_one <- function(xpos, ypos) {
+                      f <- formals(ida)
+                      # Choose graph argument name
+                      garg <- if ("graph"   %in% names(f)) "graph" else "graphEst"
+                      # Choose covariance argument name
+                      carg <- if ("cov.mat" %in% names(f)) "cov.mat" else if ("CovMat" %in% names(f)) "CovMat" else "covMat"
+                      # Build the call programmatically
+                      a <- list(x.pos = xpos, y.pos = ypos, method = "local", type = "cpdag")
+                      a[[garg]] <- cpdag_obj
+                      a[[carg]] <- S_tr
+                      be <- do.call(ida, a)
+                      # ida can return a vector (multiple parent-sets); take the mean
+                      mean(as.numeric(be))
+                    }
+                    p <- ncol(S_tr)
+                    eff <- vapply(1:p, function(y) ida_one(x_pos, y), numeric(1))
+                    eff
+                """)
                 beta = np.asarray(beta, dtype=np.float64)
             if scale_by_on_target and p in alpha_by_pert:
                 beta = beta * float(alpha_by_pert[p])
