@@ -4,14 +4,15 @@ import numpy as np
 import pandas as pd
 import anndata as ad
 import scanpy as sc
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from scipy import sparse
 from collections import defaultdict
 from sklearn.metrics import pairwise_distances
-
 from typing import Tuple, Optional, List
+
+import rpy2.robjects as ro
+from rpy2.robjects import numpy2ri, pandas2ri
+from rpy2.robjects.vectors import ListVector, IntVector
+from rpy2.robjects.conversion import localconverter
 
 from utils import *
 
@@ -114,16 +115,6 @@ def run_causal_baseline(
       pip install rpy2
       In R: install.packages("pcalg"); install.packages("graph")
     """
-    try:
-        import rpy2.robjects as ro
-        from rpy2.robjects import numpy2ri, pandas2ri
-        from rpy2.robjects.vectors import ListVector, IntVector
-    except Exception as e:
-        raise RuntimeError(
-            "rpy2 is required to run the causal baseline. "
-            "Please `pip install rpy2` and make sure R is available with "
-            "`pcalg` and `graph` installed (in R: install.packages(c('pcalg','graph')))."
-        ) from e
 
     # --- Prepare data ---
     X = to_numpy(adata_eval.X).astype(np.float64)  # (B, G)
@@ -152,16 +143,16 @@ def run_causal_baseline(
     sd[sd < eps] = 1.0  # avoid zero-div
     Xz = (X_hvg - mu) / sd
 
-    # Build interventional target list for each context (R uses 1-based indices)
-    # For controls: integer(0)
+    # Build interventional SETTINGS (unique labels) for this dataset
     gene_to_pos_hvg = {g: i for i, g in enumerate(genes_hvg)}
-    targets_idx_per_row = []
-    for p in labels:
-        if p == control_label or p not in gene_to_pos_hvg:
-            targets_idx_per_row.append(IntVector([]))  # no intervention or gene not in HVGs
-        else:
-            # +1 for 1-based R index
-            targets_idx_per_row.append(IntVector([gene_to_pos_hvg[p] + 1]))
+    unique_labels = pd.Index(labels).astype(str).unique().tolist()
+    def label_to_iv(lbl: str):
+        if lbl == control_label:
+            return IntVector([])
+        return IntVector([gene_to_pos_hvg[lbl] + 1]) if lbl in gene_to_pos_hvg else IntVector([])
+    targets_unique = [label_to_iv(lbl) for lbl in unique_labels]
+    label_to_sid = {lbl: i+1 for i, lbl in enumerate(unique_labels)}
+    target_index = IntVector([label_to_sid[lbl] for lbl in labels])
 
     # Estimate per-pert on-target efficacy α_t if requested (in *z-scored HVG space* for consistency)
     alpha_by_pert = {}
@@ -182,20 +173,21 @@ def run_causal_baseline(
                 alpha_by_pert[p] = alpha
 
     # --- rpy2: ship data to R and run GIES + IDA ---
-    numpy2ri.activate()
-    pandas2ri.activate()
     ro.r("suppressPackageStartupMessages(library(pcalg))")
     ro.r("suppressPackageStartupMessages(library(graph))")
 
-    # Assign variables in R global env
-    ro.globalenv["Xz"] = Xz  # numeric matrix (B x G_hvg)
-    ro.globalenv["targets_list"] = ListVector(targets_idx_per_row)
+    # Assign variables in R global env (with explicit conversion context)
+    with localconverter(ro.default_converter + numpy2ri.converter + pandas2ri.converter):
+        ro.globalenv["Xz"] = Xz
+        ro.globalenv["targets_unique"] = ListVector({str(i+1): iv for i, iv in enumerate(targets_unique)})
+        ro.globalenv["target_index"] = target_index
 
     # Build score and run GIES
     ro.r("""
         # Xz: rows = contexts, cols = genes (HVG set), standardized
-        # targets_list: list(len = nrow(Xz)), each element integer vector of target columns (1-based), or integer(0)
-        score_obj <- new("GaussL0penIntScore", data = Xz, targets = targets_list)
+        # targets_unique: list of targets per *setting*; target_index: setting id per row
+        score_obj <- new("GaussL0penIntScore", data = Xz,
+                         targets = targets_unique, target.index = target_index)
         gies_fit <- gies(score_obj)
         cpdag_obj <- gies_fit$essgraph  # CPDAG as graphNEL
         # sample covariance (on standardized data => ~correlation)
@@ -211,10 +203,11 @@ def run_causal_baseline(
             effects_hvg.append((p, None))
             continue
         x_pos = gene_to_pos_hvg[p] + 1  # 1-based
-        ro.globalenv["x_pos"] = x_pos
         # idaFast returns total effects from x to *all* variables in CPDAG
-        beta = ro.r("idaFast(x.pos = x_pos, S = S, graph = cpdag_obj)")
-        beta = np.asarray(beta, dtype=np.float64)  # length = G_hvg
+        with localconverter(ro.default_converter + numpy2ri.converter + pandas2ri.converter):
+            ro.globalenv["x_pos"] = x_pos
+            beta = ro.r("idaFast(x.pos = x_pos, S = S, graph = cpdag_obj)")
+            beta = np.asarray(beta, dtype=np.float64)  # length = G_hvg
         # Optional magnitude calibration by α_t (on HVG subset only; later broadcast)
         if scale_by_on_target and p in alpha_by_pert:
             beta = beta * float(alpha_by_pert[p])
@@ -239,6 +232,106 @@ def run_causal_baseline(
     return effects_pred.reindex(row_index)
 
 
+def run_causal_baseline_train_eval(
+    adata_train: ad.AnnData,
+    adata_eval: ad.AnnData,
+    target_label: str,
+    control_label: str,
+    hvgs: int | None = None,
+    scale_by_on_target: bool = False,
+) -> pd.DataFrame:
+    """
+    Fit GIES (+ interventional score) on TRAIN, then compute IDA total effects
+    for the perts present in EVAL. Returns a DataFrame (rows=eval perts, cols=genes).
+    """
+
+    # ----- TRAIN side: build Xz_train and targets_list_train -----
+    Xtr = to_numpy(adata_train.X).astype(np.float64)
+    genes_all = list(map(str, adata_train.var_names))
+    if list(adata_eval.var_names) != genes_all:
+        raise ValueError("Train and eval var_names must match and be identically ordered.")
+    labels_tr = adata_train.obs[target_label].astype(str).values
+    ctrl_mask_tr = (labels_tr == control_label)
+    if ctrl_mask_tr.sum() == 0:
+        raise ValueError("Training split must include at least one control context.")
+
+    # HVG restriction for *structure learning* only
+    if hvgs is not None and 0 < hvgs < Xtr.shape[1]:
+        var = Xtr.var(axis=0)
+        hvg_idx = np.argsort(var)[::-1][:hvgs]
+        hvg_idx = np.sort(hvg_idx)
+    else:
+        hvg_idx = np.arange(Xtr.shape[1])
+    genes_hvg = [genes_all[i] for i in hvg_idx]
+    gene_to_pos_hvg = {g: i for i, g in enumerate(genes_hvg)}
+
+    Xtr_hvg = Xtr[:, hvg_idx]
+    mu = Xtr_hvg.mean(axis=0, dtype=np.float64)
+    sd = Xtr_hvg.std(axis=0, dtype=np.float64); sd[sd < 1e-9] = 1.0
+    Xz_tr = (Xtr_hvg - mu) / sd
+
+    # ---- Build interventional SETTINGS for TRAIN ----
+    # Each setting corresponds to a label value (control or a pert).
+    # targets_unique : list of IntVector (length = n_settings)
+    # target_index_tr: IntVector of length n_rows mapping each row to its setting (1-based).
+    unique_labels_tr = pd.Index(labels_tr).astype(str).unique().tolist()
+    def label_to_iv(lbl: str):
+        if lbl == control_label:
+            return IntVector([])  # observational/control setting
+        return IntVector([gene_to_pos_hvg[lbl] + 1]) if lbl in gene_to_pos_hvg else IntVector([])
+    targets_unique = [label_to_iv(lbl) for lbl in unique_labels_tr]
+    # map each row's label to its setting id (1-based for R)
+    label_to_sid = {lbl: i+1 for i, lbl in enumerate(unique_labels_tr)}
+    target_index_tr = IntVector([label_to_sid[lbl] for lbl in labels_tr])
+
+    # Optional efficacy scaling computed from TRAIN only (original space)
+    alpha_by_pert = {}
+    if scale_by_on_target:
+        ctrl_mean_tr = Xtr[ctrl_mask_tr].mean(axis=0, dtype=np.float64)
+        for p in np.unique(labels_tr[~ctrl_mask_tr]):
+            if p in genes_all:
+                t_idx = genes_all.index(p)
+                pb_p = Xtr[labels_tr == p].mean(axis=0, dtype=np.float64)
+                base = np.expm1(np.maximum(ctrl_mean_tr[t_idx], 0.0))
+                obs  = np.expm1(np.maximum(pb_p[t_idx], 0.0))
+                alpha = float(np.clip(1.0 - (obs / base) if base > 0 else 0.0, 0.0, 1.5))
+                alpha_by_pert[p] = alpha
+
+    # ----- R: fit on TRAIN only -----
+    ro.r("suppressPackageStartupMessages(library(pcalg))")
+    ro.r("suppressPackageStartupMessages(library(graph))")
+    with localconverter(ro.default_converter + numpy2ri.converter + pandas2ri.converter):
+        ro.globalenv["Xz_tr"] = Xz_tr
+        ro.globalenv["targets_unique"] = ListVector({str(i+1): iv for i, iv in enumerate(targets_unique)})
+        ro.globalenv["target_index_tr"] = target_index_tr
+    ro.r("""
+        score_tr <- new("GaussL0penIntScore", data = Xz_tr, targets = targets_unique, target.index = target_index_tr)
+        gies_fit <- gies(score_tr)
+        cpdag_obj <- gies_fit$essgraph
+        S_tr <- stats::cov(Xz_tr)
+    """)
+
+    # ----- EVAL side: request IDA effects for EVAL perts (even if unseen in train) -----
+    labels_ev = adata_eval.obs[target_label].astype(str).values
+    eval_perts = sorted({p for p in labels_ev if p != control_label})
+    effects_mat = np.zeros((len(eval_perts), len(genes_all)), dtype=np.float64)
+    for i, p in enumerate(eval_perts):
+        if p in gene_to_pos_hvg:
+            x_pos = gene_to_pos_hvg[p] + 1
+            with localconverter(ro.default_converter + numpy2ri.converter + pandas2ri.converter):
+                ro.globalenv["x_pos"] = x_pos
+                beta = ro.r("idaFast(x.pos = x_pos, S = S_tr, graph = cpdag_obj)")
+                beta = np.asarray(beta, dtype=np.float64)
+            if scale_by_on_target and p in alpha_by_pert:
+                beta = beta * float(alpha_by_pert[p])
+            full = np.zeros(len(genes_all), dtype=np.float64)
+            full[hvg_idx] = beta
+            effects_mat[i, :] = full
+        else:
+            # pert gene not in HVG set: leave zeros (conservative)
+            pass
+    effects_pred = pd.DataFrame(effects_mat, index=eval_perts, columns=genes_all)
+    return effects_pred
 
 def evaluate_model(
     adata: ad.AnnData,
@@ -398,13 +491,16 @@ def main():
     # ---------------------------
     adata = ad.read_h5ad(args.in_h5ad)
     adata_train, adata_test = train_test_split(args, adata)
-        
 
     eval_adata = adata_test if adata_test is not None else adata_train
     print("\n=== Building causal-baseline predictions ===")
-    # 1) Run your causal baseline on the *evaluation split* to get per-pert mean effects (DataFrame)
-    effects_df = run_causal_baseline(
-        eval_adata, target_label=args.target_label, control_label=args.control_label
+    effects_df = run_causal_baseline_train_eval(
+        adata_train=adata_train,
+        adata_eval=eval_adata,
+        target_label=args.target_label,
+        control_label=args.control_label,
+        hvgs=None,                 # adjust or None
+        scale_by_on_target=False,  # optional
     )
     # 2) Convert effects_df -> (pred_mat, true_mat, pert_names, ctrl_mean)
     pred_bundle = _bundle_from_effects_df(
