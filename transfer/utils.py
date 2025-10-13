@@ -248,3 +248,13 @@ def write_pred_true_h5ads(
     os.makedirs(os.path.dirname(out_pred_h5ad) or ".", exist_ok=True)
     ad_pred.write_h5ad(out_pred_h5ad)
     ad_true.write_h5ad(out_pred_h5ad + ".true.h5ad")
+
+def collapse_to_pseudobulk(adata, target_label: str):
+    """Return a new AnnData with one row per label (perturbation + control)."""
+    X = to_numpy(adata.X).astype(np.float32)
+    labels = adata.obs[target_label].astype(str).values
+    df = pd.DataFrame(X, columns=adata.var_names).groupby(labels).mean()
+    ad_bulk = ad.AnnData(df.values.astype(np.float32))
+    ad_bulk.var_names = adata.var_names.copy()
+    ad_bulk.obs[target_label] = df.index.astype(str)
+    return ad_bulk

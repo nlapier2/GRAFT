@@ -16,6 +16,7 @@ def parse_arguments():
     ap = argparse.ArgumentParser(description="Step0-aware MPNN to fit perturbed gene vectors on a small panel.")
     # Basic and I/O options
     ap.add_argument("--in_h5ad", required=True, help="Small input AnnData object.")
+    ap.add_argument("--external_h5ad", required=True, help="Path to the external pseudobulked AnnData object.")
     ap.add_argument("--out_pred_h5ad", type=str, default="",
                     help="If set, write an AnnData with predictions for the evaluation split.")
     ap.add_argument("--seed", type=int, default=0)
@@ -74,6 +75,88 @@ def parse_arguments():
                         help="Placeholder used in pseudobulk for missing genes; masked in Stage-1 losses")
     args = ap.parse_args()
     return args
+
+def intersect_datasets(adata_source, adata_target, target_label, control_label):
+    """
+    Subsets two AnnData objects to their common genes and perturbations.
+
+    Args:
+        adata_source: The source (external) AnnData object.
+        adata_target: The target AnnData object.
+        target_label: The obs column containing perturbation labels.
+        control_label: The label for control samples.
+
+    Returns:
+        A tuple of (subsetted source AnnData, subsetted target AnnData).
+    """
+    print("Finding intersection of genes and perturbations...")
+    # First, get a list of valid genes from the source (not all NaN), then intersect.
+    common_genes = np.intersect1d(
+        adata_source.var_names[~np.isnan(to_numpy(adata_source.X)).all(axis=0)],
+        adata_target.var_names
+    )
+
+    source_perts = set(adata_source.obs[target_label].unique())
+    target_perts = set(adata_target.obs[target_label].unique())
+    common_perts = sorted(list(source_perts.intersection(target_perts)))
+
+    # Ensure the control label is always kept, even if it's not in the intersection
+    if control_label not in common_perts:
+        if control_label in source_perts and control_label in target_perts:
+            common_perts.append(control_label)
+    
+    print(f"  Found {len(common_genes)} common genes.")
+    print(f"  Found {len(common_perts) - 1} common perturbations (plus control).")
+
+    adata_source_sub = adata_source[adata_source.obs[target_label].isin(common_perts), common_genes].copy()
+    adata_target_sub = adata_target[adata_target.obs[target_label].isin(common_perts), common_genes].copy()
+
+    return adata_source_sub, adata_target_sub
+
+def compute_deltas(adata, target_label, control_label):
+    """
+    Computes the delta (perturbation - control) vectors for a pseudobulked dataset.
+
+    Args:
+        adata: A pseudobulked AnnData object.
+        target_label: The obs column containing perturbation labels.
+        control_label: The label for control samples.
+
+    Returns:
+        A dictionary mapping perturbation labels to their delta vectors.
+    """
+    control_mask = adata.obs[target_label] == control_label
+    control_mean = adata[control_mask].X.mean(axis=0)
+
+    pert_adata = adata[~control_mask]
+    
+    deltas = {
+        pert: pert_adata[pert_adata.obs[target_label] == pert].X.flatten() - control_mean
+        for pert in pert_adata.obs[target_label].unique()
+    }
+    return deltas, control_mean
+
+def predict_direct_transfer(source_deltas, target_adata, target_label, control_label):
+    """
+    Generates predictions by adding source deltas to the target control mean.
+
+    Args:
+        source_deltas: A dictionary of {perturbation: delta_vector} from the source.
+        target_adata: The target AnnData object.
+        target_label: The obs column containing perturbation labels.
+        control_label: The label for control samples.
+
+    Returns:
+        A dictionary mapping perturbation labels to their predicted expression vectors.
+    """
+    control_mask = target_adata.obs[target_label] == control_label
+    target_control_mean = target_adata[control_mask].X.mean(axis=0)
+
+    predictions = {}
+    for pert_label, delta_vec in source_deltas.items():
+        predictions[pert_label] = target_control_mean + delta_vec
+    
+    return predictions
 
 
 def evaluate_model(
@@ -228,53 +311,86 @@ def evaluate_model(
 # ----------------------------
 def main():
     args = parse_arguments()
+    # Your script already assumes pseudobulking for this baseline
+    args.use_pseudobulk = True
 
     # ---------------------------
     # Read input data
     # ---------------------------
-    adata = ad.read_h5ad(args.in_h5ad)
-    adata.obs['dataset_id'] = "target_all"
-    adata.obs['cell_type'] = "UNK"
-    pb_target = None  # pseudobulked target data for Stage-1 pretraining
-    if args.include_target_pseudobulk:
-        pb_target = make_pretrain_pseudobulk_from_adata(adata, args.target_label, args.control_label, dataset_id="target_all")
-        sc.pp.normalize_total(pb_target, inplace=True)
-        sc.pp.log1p(pb_target)
-    if args.use_pseudobulk:  # stage 2 pseudobulk
-        args.batch_size = 1  # enforce single-row batches
-        adata = collapse_to_pseudobulk(adata, args.target_label)
-        adata.obs['dataset_id'] = "target_all"
-        adata.obs['cell_type'] = "UNK"
-    sc.pp.normalize_total(adata, inplace=True)
-    sc.pp.log1p(adata)
-    if sparse.isspmatrix(adata.X) and not sparse.isspmatrix_csr(adata.X):
-        adata.X = adata.X.tocsr()  # nicer slicing, though we load to numpy anyway
-    # train/test split
-    adata_train, adata_test, pb_target = train_test_split(args, adata, pb_target)
-    adata_train.obs['dataset_id'] = "target_all"
-    adata_train.obs['cell_type'] = "UNK"
-    adata_test.obs['dataset_id'] = "target_all"
-    adata_test.obs['cell_type'] = "UNK"
+    adata_target = ad.read_h5ad(args.in_h5ad)
+    adata_source = ad.read_h5ad(args.external_h5ad)
 
-    model = None
-    pred_bundle = None
+    # --- NEW BASELINE LOGIC START ---
+
+    # 1) Subset both datasets to their intersection of genes and perturbations
+    adata_source, adata_target = intersect_datasets(
+        adata_source, adata_target, args.target_label, args.control_label
+    )
+
+    # 2) Process and pseudobulk the target dataset
+    adata_target.obs['dataset_id'] = "target_all"
+    adata_target.obs['cell_type'] = "UNK"
+    sc.pp.normalize_total(adata_target, inplace=True)
+    sc.pp.log1p(adata_target)
+    if args.use_pseudobulk:
+        adata_target = collapse_to_pseudobulk(adata_target, args.target_label)
+    
+    # Process the source dataset (assumed to be pseudobulked already)
+    sc.pp.normalize_total(adata_source, inplace=True)
+    sc.pp.log1p(adata_source)
+
+    # 3) Compute deltas from the source dataset
+    source_deltas, _ = compute_deltas(adata_source, args.target_label, args.control_label)
+
+    # 4) Generate predictions for the target dataset via direct transfer
+    predictions = predict_direct_transfer(source_deltas, adata_target, args.target_label, args.control_label)
+
+    # --- NEW BASELINE LOGIC END ---
+
+    # train/test split on the (now intersected and pseudobulked) target data
+    adata_train, adata_test = train_test_split(args, adata_target)
+
     # ---------------------------
     # Evaluate: external test if provided, else held-out split, else train split
     # ---------------------------
     eval_adata = adata_test if adata_test is not None else adata_train
-    # 3) Evaluate with your existing metrics
     print("\n=== Evaluation on {} set ===".format(
         "TEST (held-out perts)" if adata_test is not None else "TRAIN (no holdout)")
     )
+    
+    # --- NEW BASELINE LOGIC START ---
+
+    # 5) Assemble the `pred_bundle` for the evaluation function
+    # Get the ground truth from the evaluation set
+    true_deltas, target_ctrl_mean = compute_deltas(eval_adata, args.target_label, args.control_label)
+    
+    # Get the list of perturbations in the evaluation set, in order
+    pert_mask = eval_adata.obs[args.target_label] != args.control_label
+    eval_perts = eval_adata[pert_mask].obs[args.target_label].tolist()
+    
+    # Look up the prediction for each evaluation perturbation and stack them
+    pred_mat = np.array([predictions[p] for p in eval_perts])
+    
+    # Get the true expression matrix for these perturbations
+    true_mat = eval_adata[pert_mask].X
+    
+    # Create the bundle
+    pred_bundle = (pred_mat, true_mat, eval_perts, target_ctrl_mean)
+
+    # --- NEW BASELINE LOGIC END ---
+
     _ = evaluate_model(adata=eval_adata, args=args, pred_bundle=pred_bundle)
 
-    # 5) (Optional) Evaluate on TRAIN split as well (fit on TRAIN, eval on TRAIN)
     if args.eval_on_train and (adata_test is not None):
         print("\n=== Evaluation on TRAIN set (fit on TRAIN) ===")
-        train_labels = adata_train.obs[args.target_label].astype(str).values
-        train_perts  = sorted({lab for lab in train_labels if lab != args.control_label})
-        _ = evaluate_model(adata=adata_train, args=args, pred_bundle=None)
-
+        # Assemble pred_bundle for the training set
+        _, train_target_ctrl_mean = compute_deltas(adata_train, args.target_label, args.control_label)
+        train_pert_mask = adata_train.obs[args.target_label] != args.control_label
+        train_eval_perts = adata_train[train_pert_mask].obs[args.target_label].tolist()
+        train_pred_mat = np.array([predictions[p] for p in train_eval_perts])
+        train_true_mat = adata_train[train_pert_mask].X
+        train_pred_bundle = (train_pred_mat, train_true_mat, train_eval_perts, train_target_ctrl_mean)
+        _ = evaluate_model(adata=adata_train, args=args, pred_bundle=train_pred_bundle)
 
     if args.out_pred_h5ad:
         if hasattr(eval_adata.X, "toarray"):
