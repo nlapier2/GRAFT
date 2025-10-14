@@ -113,7 +113,7 @@ def prep_pb_all(pb_target, adata_train, args):
         pb_all.obs = pb_all.obs.copy()  # ensure contiguous
     return pb_all, len(pbs)
 
-def train_test_split(args, adata):
+def train_test_split(args, adata, pb_target):
     # ---------------------------
     # Train/Test setup
     # If --test_h5ad is provided, use that file for evaluation and ignore --test_pct_perts.
@@ -123,6 +123,9 @@ def train_test_split(args, adata):
         print(f"=== Using external TEST set: {args.test_h5ad} (overrides --test_pct_perts) ===")
         adata_train = adata
         adata_test = ad.read_h5ad(args.test_h5ad)
+        # (Optional) apply the same pseudobulk collapse if requested
+        if args.use_pseudobulk:
+            adata_test = collapse_to_pseudobulk(adata_test, args.target_label)
         sc.pp.normalize_total(adata_test, inplace=True)
         sc.pp.log1p(adata_test)
         if sparse.isspmatrix(adata_test.X) and not sparse.isspmatrix_csr(adata_test.X):
@@ -141,13 +144,15 @@ def train_test_split(args, adata):
         train_perts = [p for p in all_perts if p not in test_perts]
         mask_train = adata.obs[args.target_label].isin([args.control_label] + train_perts)
         adata_train = adata[mask_train].copy()
+        if pb_target is not None:  # also filter pseudobulk to training perts only
+            pb_target = pb_target[pb_target.obs[args.target_label].isin([args.control_label] + train_perts)].copy()
         adata_test = adata[adata.obs[args.target_label].isin([args.control_label] + list(test_perts))].copy() if n_test > 0 else None
         print("=== Split summary ===")
         print(f"Total perts (excl. control): {len(all_perts)}  |  Held-out test perts: {len(test_perts)}")
         if n_test > 0:
             print(f"Test perts: {sorted(test_perts)[:10]}{' ...' if len(test_perts) > 10 else ''}")
         print(f"Train cells: {adata_train.n_obs}, Test cells: {adata_test.n_obs if adata_test is not None else 0}")
-    return adata_train, adata_test
+    return adata_train, adata_test, pb_target
 
 @torch.no_grad()
 def print_edge_weight_stats(model, prefix="edges"):
