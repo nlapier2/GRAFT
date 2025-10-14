@@ -8,6 +8,8 @@ from scipy import sparse
 from collections import defaultdict
 from sklearn.metrics import pairwise_distances
 
+from sklearn.linear_model import Ridge
+
 from utils import *
 from losses import *
 
@@ -24,6 +26,12 @@ def parse_arguments():
     ap.add_argument("--control_label", default="non-targeting", help="label value for control cells.")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--epochs", type=int, default=10)
+
+    # Ridge / model arguments
+    ap.add_argument("--model_type", type=str, default="ridge", choices=["ridge", "direct"],
+                    help="The type of transfer model to train.")
+    ap.add_argument("--ridge_alpha", type=float, default=1.0,
+                    help="Regularization strength (alpha) for Ridge regression.")
 
     # Train/test split and eval options
     ap.add_argument("--test_pct_perts", type=float, default=0.0,
@@ -157,6 +165,34 @@ def predict_direct_transfer(source_deltas, target_adata, target_label, control_l
         predictions[pert_label] = target_control_mean + delta_vec
     
     return predictions
+
+
+def train_ridge(X_source, Y_target, alpha=1.0):
+    """Trains a Ridge Regression model."""
+    print(f"Training Ridge Regression model with alpha={alpha}...")
+    model = Ridge(alpha=alpha)
+    model.fit(X_source, Y_target)
+    print("Training complete.")
+    return model
+
+def train_transfer_model(X_source, Y_target, args):
+    """
+    A general training loop that dispatches to the correct model function.
+    """
+    if args.model_type == 'ridge':
+        return train_ridge(X_source, Y_target, alpha=args.ridge_alpha)
+    # You can add other models here later, e.g.:
+    # elif args.model_type == 'mlp':
+    #     return train_mlp(X_source, Y_target, args)
+    else:
+        raise ValueError(f"Unknown model_type: {args.model_type}")
+
+def predict(model, X_source):
+    """
+    Generates predictions from a trained model.
+    """
+    print("Generating predictions on the test set...")
+    return model.predict(X_source)
 
 
 def evaluate_model(
@@ -306,102 +342,116 @@ def evaluate_model(
     }
 
 
-# ----------------------------
-# CLI
-# ----------------------------
 def main():
     args = parse_arguments()
-    # Your script already assumes pseudobulking for this baseline
+    # Both baselines require pseudobulked data, so we enforce it.
     args.use_pseudobulk = True
 
     # ---------------------------
-    # Read input data
+    # 1. Read and Prepare Data
     # ---------------------------
+    print("Reading and preparing data...")
     adata_target = ad.read_h5ad(args.in_h5ad)
     adata_source = ad.read_h5ad(args.external_h5ad)
 
-    # --- NEW BASELINE LOGIC START ---
-
-    # 1) Subset both datasets to their intersection of genes and perturbations
+    # Subset both datasets to their intersection of genes and perturbations
     adata_source, adata_target = intersect_datasets(
         adata_source, adata_target, args.target_label, args.control_label
     )
 
-    # 2) Process and pseudobulk the target dataset
-    adata_target.obs['dataset_id'] = "target_all"
-    adata_target.obs['cell_type'] = "UNK"
-    sc.pp.normalize_total(adata_target, inplace=True)
-    sc.pp.log1p(adata_target)
-    if args.use_pseudobulk:
+    # Process and pseudobulk both datasets
+    for adata in [adata_source, adata_target]:
+        # Normalize and log1p. We assume source is already pseudobulked.
+        sc.pp.normalize_total(adata, inplace=True)
+        sc.pp.log1p(adata)
+    
+    # Pseudobulk the target data if it's not already
+    if adata_target.n_obs > len(adata_target.obs[args.target_label].unique()):
+        print("Collapsing target data to pseudobulk...")
         adata_target = collapse_to_pseudobulk(adata_target, args.target_label)
-    
-    # Process the source dataset (assumed to be pseudobulked already)
-    sc.pp.normalize_total(adata_source, inplace=True)
-    sc.pp.log1p(adata_source)
 
-    # 3) Compute deltas from the source dataset
-    source_deltas, _ = compute_deltas(adata_source, args.target_label, args.control_label)
-
-    # 4) Generate predictions for the target dataset via direct transfer
-    predictions = predict_direct_transfer(source_deltas, adata_target, args.target_label, args.control_label)
-
-    # --- NEW BASELINE LOGIC END ---
-
-    # train/test split on the (now intersected and pseudobulked) target data
+    # Split the TARGET data into train/test sets
     adata_train, adata_test = train_test_split(args, adata_target)
-
-    # ---------------------------
-    # Evaluate: external test if provided, else held-out split, else train split
-    # ---------------------------
     eval_adata = adata_test if adata_test is not None else adata_train
-    print("\n=== Evaluation on {} set ===".format(
-        "TEST (held-out perts)" if adata_test is not None else "TRAIN (no holdout)")
-    )
-    
-    # --- NEW BASELINE LOGIC START ---
 
-    # 5) Assemble the `pred_bundle` for the evaluation function
-    # Get the ground truth from the evaluation set
-    true_deltas, target_ctrl_mean = compute_deltas(eval_adata, args.target_label, args.control_label)
-    
-    # Get the list of perturbations in the evaluation set, in order
-    pert_mask = eval_adata.obs[args.target_label] != args.control_label
-    eval_perts = eval_adata[pert_mask].obs[args.target_label].tolist()
-    
-    # Look up the prediction for each evaluation perturbation and stack them
-    pred_mat = np.array([predictions[p] for p in eval_perts])
-    
-    # Get the true expression matrix for these perturbations
-    true_mat = eval_adata[pert_mask].X
-    
-    # Create the bundle
-    pred_bundle = (pred_mat, true_mat, eval_perts, target_ctrl_mean)
+    # ---------------------------
+    # 2. Generate Predictions based on Model Type
+    # ---------------------------
+    all_predictions_dict = {}
 
-    # --- NEW BASELINE LOGIC END ---
+    if args.model_type == 'direct':
+        print("\n=== Running Direct Transfer Baseline ===")
+        # Compute deltas from the source dataset
+        source_deltas, _ = compute_deltas(adata_source, args.target_label, args.control_label)
+        # Generate predictions for all common perturbations
+        all_predictions_dict = predict_direct_transfer(
+            source_deltas, adata_target, args.target_label, args.control_label
+        )
 
-    _ = evaluate_model(adata=eval_adata, args=args, pred_bundle=pred_bundle)
+    elif args.model_type == 'ridge':
+        print("\n=== Running Ridge Regression Baseline ===")
+        # Prepare training matrices from the target training split
+        train_perts = sorted([p for p in adata_train.obs[args.target_label].unique() if p != args.control_label])
+        X_train_source = adata_source[adata_source.obs[args.target_label].isin(train_perts)].X
+        Y_train_target = adata_train[adata_train.obs[args.target_label].isin(train_perts)].X
 
+        # Train the transfer model
+        model = train_transfer_model(X_train_source, Y_train_target, args)
+        
+        # Predict on ALL common perturbations from the source data at once
+        all_common_perts = sorted([p for p in adata_source.obs[args.target_label].unique() if p != args.control_label])
+        X_all_source = adata_source[adata_source.obs[args.target_label].isin(all_common_perts)].X
+        all_predictions_mat = predict(model, X_all_source)
+        
+        # Store predictions in a dictionary for easy lookup
+        all_predictions_dict = {p: v for p, v in zip(all_common_perts, all_predictions_mat)}
+
+    else:
+        raise ValueError(f"Unknown model_type: {args.model_type}")
+
+    # ---------------------------
+    # 3. Evaluate on the Test Set
+    # ---------------------------
+    print("\n=== Evaluation on {} set ===".format("TEST" if adata_test is not None else "TRAIN"))
+    
+    # Assemble the prediction bundle for the evaluation set
+    eval_perts = sorted([p for p in eval_adata.obs[args.target_label].unique() if p != args.control_label])
+    eval_pred_mat = np.array([all_predictions_dict[p] for p in eval_perts])
+    pert_mask = eval_adata.obs[args.target_label].isin(eval_perts)
+    eval_true_mat = to_numpy(eval_adata[pert_mask].X)
+    _, eval_ctrl_mean = compute_deltas(eval_adata, args.target_label, args.control_label)
+    eval_pred_bundle = (eval_pred_mat, eval_true_mat, eval_perts, eval_ctrl_mean.flatten())
+    
+    evaluate_model(adata=eval_adata, args=args, pred_bundle=eval_pred_bundle)
+
+    # ---------------------------
+    # 4. (Optional) Evaluate on the Train Set
+    # ---------------------------
     if args.eval_on_train and (adata_test is not None):
-        print("\n=== Evaluation on TRAIN set (fit on TRAIN) ===")
-        # Assemble pred_bundle for the training set
-        _, train_target_ctrl_mean = compute_deltas(adata_train, args.target_label, args.control_label)
-        train_pert_mask = adata_train.obs[args.target_label] != args.control_label
-        train_eval_perts = adata_train[train_pert_mask].obs[args.target_label].tolist()
-        train_pred_mat = np.array([predictions[p] for p in train_eval_perts])
-        train_true_mat = adata_train[train_pert_mask].X
-        train_pred_bundle = (train_pred_mat, train_true_mat, train_eval_perts, train_target_ctrl_mean)
-        _ = evaluate_model(adata=adata_train, args=args, pred_bundle=train_pred_bundle)
+        print("\n=== Evaluation on TRAIN set ===")
+        train_perts = sorted([p for p in adata_train.obs[args.target_label].unique() if p != args.control_label])
+        train_pred_mat = np.array([all_predictions_dict[p] for p in train_perts])
+        train_pert_mask = adata_train.obs[args.target_label].isin(train_perts)
+        train_true_mat = to_numpy(adata_train[train_pert_mask].X)
+        _, train_ctrl_mean = compute_deltas(adata_train, args.target_label, args.control_label)
+        train_pred_bundle = (train_pred_mat, train_true_mat, train_perts, train_ctrl_mean.flatten())
+        
+        evaluate_model(adata=adata_train, args=args, pred_bundle=train_pred_bundle)
 
+    # ---------------------------
+    # 5. (Optional) Write Output Files
+    # ---------------------------
     if args.out_pred_h5ad:
-        if hasattr(eval_adata.X, "toarray"):
-            eval_adata.X = eval_adata.X.toarray()
+        print(f"\nWriting prediction outputs to {args.out_pred_h5ad}...")
         write_pred_true_h5ads(
             eval_adata=eval_adata,
-            pred_bundle=pred_bundle,
+            pred_bundle=eval_pred_bundle,
             out_pred_h5ad=args.out_pred_h5ad,
             target_label=args.target_label,
             control_label=args.control_label,
         )
+    
+    print("\n✨ Done!")
 
 if __name__ == "__main__":
     main()
