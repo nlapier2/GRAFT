@@ -26,6 +26,8 @@ def parse_arguments():
     ap.add_argument("--control_label", default="non-targeting", help="label value for control cells.")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--epochs", type=int, default=10)
+    ap.add_argument("--out_influence_csv", type=str, default="",
+                    help="If set, write a CSV with directed influence scores for each gene pair.")
 
     # Train/test split and eval options
     ap.add_argument("--test_pct_perts", type=float, default=0.0,
@@ -200,7 +202,44 @@ def analyze_asymmetry_vs_effects(
     for p, c in sorted_corrs[:5]:
         print(f"    - {p:<15}: {c:.4f}")
 
+@torch.no_grad()
+def write_influence_scores_csv(
+    model: LinearReconstructor,
+    adata: ad.AnnData,
+    output_path: str,
+    epsilon: float = 1e-8,
+):
+    """
+    Calculates the directed influence asymmetry score for all gene pairs
+    and saves the resulting matrix to a CSV file.
+    """
+    print(f"\n📝 Calculating and writing influence scores to {output_path}...")
+    
+    # 1. Extract the learned weight matrix W (G_i <- G_j)
+    W = model.reconstruct.weight.data.cpu().numpy()  # Shape (G_out, G_in)
+    
+    # 2. Calculate the asymmetry score: (W_ij - W_ji) / (W_ij + W_ji)
+    # W_ij is the influence of gene j on gene i. In the matrix W, this is W[i, j].
+    # W_ji is the influence of gene i on gene j. This is W[j, i], or W.T[i, j].
+    W_t = W.T
+    
+    numerator = W - W_t
+    denominator = W + W_t + epsilon
+    
+    asymmetry_matrix = numerator / denominator
+    
+    # 3. Create a Pandas DataFrame for clear labeling
+    influence_df = pd.DataFrame(
+        asymmetry_matrix,
+        index=adata.var_names,
+        columns=adata.var_names,
+    )
+    influence_df.index.name = "TargetGene"
+    influence_df.columns.name = "SourceGene"
 
+    # 4. Save to CSV
+    influence_df.to_csv(output_path)
+    print(f"   ...Done. Matrix shape: {influence_df.shape}")
 
 def evaluate_model(
     adata: ad.AnnData,
@@ -379,8 +418,9 @@ def main():
     adata_train, adata_test, pb_target = train_test_split(args, adata, pb_target)
     adata_train.obs['dataset_id'] = "target_all"
     adata_train.obs['cell_type'] = "UNK"
-    adata_test.obs['dataset_id'] = "target_all"
-    adata_test.obs['cell_type'] = "UNK"
+    if adata_test is not None:
+        adata_test.obs['dataset_id'] = "target_all"
+        adata_test.obs['cell_type'] = "UNK"
 
     # 1) Train the linear reconstructor model using MGM
     print("\n=== 1. Training Linear Reconstructor (Baseline #1) ===")
@@ -400,6 +440,13 @@ def main():
         target_label=args.target_label,
         control_label=args.control_label,
     )
+
+    if args.out_influence_csv:
+        write_influence_scores_csv(
+            model=linear_model,
+            adata=adata_train,
+            output_path=args.out_influence_csv,
+        )
 
     # model = None
     # pred_bundle = None
