@@ -527,6 +527,23 @@ def main():
                 pred_bundle=pred_bundle
             )
 
+            if args.eval_on_train:
+                print("\n=== Evaluation on TRAIN set (fit on TRAIN) ===")
+                pred_bundle_tr = predict_held_out_perts(
+                    model=model,
+                    adata_train=adata_train,
+                    adata_test=adata_train,
+                    args=args,
+                )
+                
+                # Pass the predictions to the user's evaluation function
+                print("\n=== Final Evaluation on Held-Out Perturbations ===")
+                evaluate_model(
+                    adata=adata_train, # Evaluate on the test set AnnData
+                    args=args,
+                    pred_bundle=pred_bundle_tr
+                )
+
     # model = None
     # pred_bundle = None
     # # ---------------------------
