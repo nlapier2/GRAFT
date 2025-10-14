@@ -13,6 +13,7 @@ from torch.utils.data import TensorDataset, DataLoader
 
 from utils import *
 from losses import *
+from models import *
 
 
 def parse_arguments():
@@ -28,6 +29,15 @@ def parse_arguments():
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--out_influence_csv", type=str, default="",
                     help="If set, write a CSV with directed influence scores for each gene pair.")
+    
+    # masked model options
+    ap.add_argument("--model_type", type=str, default="linear_mgm", choices=["linear_mgm", "mlp_ae"],
+                    help="Which modeling approach to run. 'linear_mgm' for observational masked modeling, "
+                         "'mlp_ae' for interventional autoencoder on response vectors.")
+    ap.add_argument("--pert_embed_dim", type=int, default=32,
+                    help="Dimension of the learnable embedding for each perturbation (for mlp_ae).")
+    ap.add_argument("--hidden_dim", type=int, default=256,
+                    help="Hidden dimension of the MLP autoencoder (for mlp_ae).")
 
     # Train/test split and eval options
     ap.add_argument("--test_pct_perts", type=float, default=0.0,
@@ -422,31 +432,31 @@ def main():
         adata_test.obs['dataset_id'] = "target_all"
         adata_test.obs['cell_type'] = "UNK"
 
-    # 1) Train the linear reconstructor model using MGM
-    print("\n=== 1. Training Linear Reconstructor (Baseline #1) ===")
-    linear_model = train_linear_model(
-        adata=adata_train,
-        epochs=args.epochs,
-        lr=args.lr,
-        batch_size=args.batch_size,
-        device=args.device,
-    )
-
-    # 2) Analyze the model's weights against true perturbation effects
-    print("\n=== 2. Analyzing Influence vs. True Effects (Baseline #3) ===")
-    analyze_asymmetry_vs_effects(
-        model=linear_model,
-        adata=adata_train,
-        target_label=args.target_label,
-        control_label=args.control_label,
-    )
-
-    if args.out_influence_csv:
-        write_influence_scores_csv(
-            model=linear_model,
-            adata=adata_train,
-            output_path=args.out_influence_csv,
+    if args.model_type == 'linear_mgm':
+        # --- Run the original observational MGM flow ---
+        print("\n=== Running Observational Model (linear_mgm) ===")
+        # 1) Train the linear reconstructor model using MGM
+        print("\n=== 1. Training Linear Reconstructor (Baseline #1) ===")
+        linear_model = train_linear_model(
+            adata=adata_train, epochs=args.epochs, lr=args.lr,
+            batch_size=args.batch_size, device=args.device,
         )
+        # 2) Analyze the model's weights against true perturbation effects
+        print("\n=== 2. Analyzing Influence vs. True Effects (Baseline #3) ===")
+        analyze_asymmetry_vs_effects(
+            model=linear_model, adata=adata_train,
+            target_label=args.target_label, control_label=args.control_label,
+        )
+        if args.out_influence_csv:
+            write_influence_scores_csv(
+                model=linear_model, adata=adata_train,
+                output_path=args.out_influence_csv
+            )
+            
+    elif args.model_type == 'mlp_ae':
+        # --- Run the new interventional autoencoder flow ---
+        print("\n=== Running Interventional Model (mlp_ae) ===")
+        run_mlp_autoencoder_flow(args, adata_train)
 
     # model = None
     # pred_bundle = None
