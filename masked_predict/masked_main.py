@@ -410,13 +410,13 @@ def main():
         pb_target = make_pretrain_pseudobulk_from_adata(adata, args.target_label, args.control_label, dataset_id="target_all")
         sc.pp.normalize_total(pb_target, inplace=True)
         sc.pp.log1p(pb_target)
+    sc.pp.normalize_total(adata, inplace=True)
+    sc.pp.log1p(adata)
     if args.use_pseudobulk:  # stage 2 pseudobulk
         args.batch_size = 1  # enforce single-row batches
         adata = collapse_to_pseudobulk(adata, args.target_label)
         adata.obs['dataset_id'] = "target_all"
         adata.obs['cell_type'] = "UNK"
-    sc.pp.normalize_total(adata, inplace=True)
-    sc.pp.log1p(adata)
     if sparse.isspmatrix(adata.X) and not sparse.isspmatrix_csr(adata.X):
         adata.X = adata.X.tocsr()  # nicer slicing, though we load to numpy anyway
     # train/test split
