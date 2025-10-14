@@ -214,31 +214,27 @@ def analyze_asymmetry_vs_effects(
 
 @torch.no_grad()
 def write_influence_scores_csv(
-    model: LinearReconstructor,
+    influence_matrix: np.ndarray, # <-- Changed from model to matrix
     adata: ad.AnnData,
     output_path: str,
     epsilon: float = 1e-8,
 ):
     """
-    Calculates the directed influence asymmetry score for all gene pairs
-    and saves the resulting matrix to a CSV file.
+    Calculates the directed influence asymmetry score from a pre-computed
+    (G, G) influence matrix and saves it to a CSV file.
     """
-    print(f"\n📝 Calculating and writing influence scores to {output_path}...")
+    print(f"\n📝 Calculating asymmetry and writing influence scores to {output_path}...")
     
-    # 1. Extract the learned weight matrix W (G_i <- G_j)
-    W = model.reconstruct.weight.data.cpu().numpy()  # Shape (G_out, G_in)
+    # The first dimension is the target (output) and the second is the source (input)
+    # So, W[i, j] is the influence of j on i.
+    W = influence_matrix
     
-    # 2. Calculate the asymmetry score: (W_ij - W_ji) / (W_ij + W_ji)
-    # W_ij is the influence of gene j on gene i. In the matrix W, this is W[i, j].
-    # W_ji is the influence of gene i on gene j. This is W[j, i], or W.T[i, j].
+    # The rest of the function remains the same!
     W_t = W.T
-    
     numerator = W - W_t
     denominator = W + W_t + epsilon
-    
     asymmetry_matrix = numerator / denominator
     
-    # 3. Create a Pandas DataFrame for clear labeling
     influence_df = pd.DataFrame(
         asymmetry_matrix,
         index=adata.var_names,
@@ -247,7 +243,6 @@ def write_influence_scores_csv(
     influence_df.index.name = "TargetGene"
     influence_df.columns.name = "SourceGene"
 
-    # 4. Save to CSV
     influence_df.to_csv(output_path)
     print(f"   ...Done. Matrix shape: {influence_df.shape}")
 
@@ -435,21 +430,20 @@ def main():
     if args.model_type == 'linear_mgm':
         # --- Run the original observational MGM flow ---
         print("\n=== Running Observational Model (linear_mgm) ===")
-        # 1) Train the linear reconstructor model using MGM
-        print("\n=== 1. Training Linear Reconstructor (Baseline #1) ===")
         linear_model = train_linear_model(
             adata=adata_train, epochs=args.epochs, lr=args.lr,
             batch_size=args.batch_size, device=args.device,
         )
-        # 2) Analyze the model's weights against true perturbation effects
-        print("\n=== 2. Analyzing Influence vs. True Effects (Baseline #3) ===")
         analyze_asymmetry_vs_effects(
             model=linear_model, adata=adata_train,
             target_label=args.target_label, control_label=args.control_label,
         )
         if args.out_influence_csv:
+            # Extract the weight matrix from the linear model
+            influence_matrix = linear_model.reconstruct.weight.data.cpu().numpy()
             write_influence_scores_csv(
-                model=linear_model, adata=adata_train,
+                influence_matrix=influence_matrix, # Pass the matrix
+                adata=adata_train,
                 output_path=args.out_influence_csv
             )
             

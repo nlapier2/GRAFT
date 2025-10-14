@@ -13,6 +13,7 @@ import torch
 from torch.utils.data import TensorDataset, DataLoader
 
 from utils import to_numpy
+from masked_main import write_influence_scores_csv
 
 class PerturbationAutoencoder(torch.nn.Module):
     """
@@ -174,3 +175,55 @@ def run_mlp_autoencoder_flow(args, adata_train: ad.AnnData):
     # 3. Evaluate the model's ability to predict held-out responses
     print("\n=== 2. Evaluating Gene Response Reconstruction ===")
     evaluate_mlp_reconstruction(delta_vectors, pert_indices, model, args)
+
+    if args.out_influence_csv:
+        mlp_influence_matrix = compute_mlp_influence_matrix(
+            model=model,
+            num_genes=adata_train.n_vars,
+            num_perts=len(pert_labels),
+            device=args.device
+        )
+        write_influence_scores_csv(
+            influence_matrix=mlp_influence_matrix,
+            adata=adata_train,
+            output_path=args.out_influence_csv
+        )
+
+@torch.no_grad()
+def compute_mlp_influence_matrix(
+    model: PerturbationAutoencoder,
+    num_genes: int,
+    num_perts: int,
+    device: str,
+) -> np.ndarray:
+    """
+    Computes a (G, G) influence matrix from the trained MLP autoencoder
+    by performing in-silico perturbations.
+    """
+    print("\n🧠 Computing MLP influence matrix via in-silico perturbation...")
+    print("   (This may be slow for a large number of genes as it requires G forward passes)")
+    model.eval()
+    
+    # Use an average perturbation embedding as a neutral context
+    avg_pert_idx = torch.arange(num_perts, device=device)
+    avg_pert_embedding = model.pert_embedding(avg_pert_idx).mean(dim=0, keepdim=True)
+
+    influence_matrix = np.zeros((num_genes, num_genes))
+
+    for j in range(num_genes): # j is the source gene
+        # Create a one-hot vector for the source gene's response
+        delta_input = torch.zeros(1, num_genes, device=device)
+        delta_input[0, j] = 1.0
+        
+        # Combine with the average perturbation embedding
+        net_input = torch.cat([delta_input, avg_pert_embedding], dim=1)
+        
+        # Predict the full response vector
+        hidden = model.encoder(net_input)
+        response_pred = model.decoder(hidden)
+        
+        # The predicted vector is the influence of gene j on all other genes
+        influence_matrix[:, j] = response_pred.squeeze().cpu().numpy()
+
+    print("   ...Done.")
+    return influence_matrix
