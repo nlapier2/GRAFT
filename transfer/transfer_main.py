@@ -31,7 +31,7 @@ def parse_arguments():
     ap.add_argument("--epochs", type=int, default=10)
 
     # Transfer model arguments
-    ap.add_argument("--model_type", type=str, default="ridge", choices=["ridge", "direct", "mlp"],
+    ap.add_argument("--model_type", type=str, default="ridge", choices=["ridge", "direct", "mlp", "low_rank"],
                     help="The type of transfer model to train.")
     ap.add_argument("--ridge_alpha", type=float, default=1.0,
                     help="Regularization strength (alpha) for Ridge regression.")
@@ -41,6 +41,8 @@ def parse_arguments():
                     help="Hidden dimension size for the MLP model.")
     ap.add_argument("--mlp_dropout", type=float, default=0.2,
                     help="Dropout rate for the MLP model.")
+    ap.add_argument("--latent_dim", type=int, default=64,
+                    help="Latent dimension size for the low-rank model.")
 
     # Train/test split and eval options
     ap.add_argument("--test_pct_perts", type=float, default=0.0,
@@ -175,7 +177,51 @@ def predict_direct_transfer(source_deltas, target_adata, target_label, control_l
     
     return predictions
 
-# In transfer_main.py
+class LowRankModel(nn.Module):
+    """An encoder-decoder model for low-rank vector-to-vector regression."""
+    def __init__(self, n_genes, latent_dim=64):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(n_genes, latent_dim), # Encoder
+            nn.Linear(latent_dim, n_genes)  # Decoder
+        )
+    def forward(self, x):
+        return self.model(x)
+
+def train_low_rank(X_source, Y_target, args):
+    """Trains a low-rank encoder-decoder model using PyTorch."""
+    print(f"Training LowRankModel for {args.epochs} epochs (latent_dim={args.latent_dim})...")
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    n_genes = X_source.shape[1]
+    
+    model = LowRankModel(n_genes, args.latent_dim).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    loss_fn = nn.MSELoss()
+
+    # Create DataLoader for batching
+    dataset = TensorDataset(
+        torch.from_numpy(X_source.astype(np.float32)),
+        torch.from_numpy(Y_target.astype(np.float32))
+    )
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+
+    model.train()
+    for epoch in range(args.epochs):
+        epoch_loss = 0.0
+        for x_batch, y_batch in loader:
+            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+            optimizer.zero_grad()
+            y_pred = model(x_batch)
+            loss = loss_fn(y_pred, y_batch)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+        
+        if (epoch + 1) % 10 == 0:
+            print(f"  Epoch {epoch+1:03d} | Loss: {epoch_loss / len(loader):.6f}")
+
+    print("Training complete.")
+    return model.to("cpu")
 
 class MLP(nn.Module):
     """A simple Multi-Layer Perceptron for vector-to-vector regression."""
@@ -242,6 +288,8 @@ def train_transfer_model(X_source, Y_target, args):
         return train_ridge(X_source, Y_target, alpha=args.ridge_alpha)
     elif args.model_type == 'mlp':
         return train_mlp(X_source, Y_target, args)
+    elif args.model_type == 'low_rank':
+        return train_low_rank(X_source, Y_target, args)
     else:
         raise ValueError(f"Unknown model_type: {args.model_type}")
 
