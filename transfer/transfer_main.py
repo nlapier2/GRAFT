@@ -9,6 +9,9 @@ from collections import defaultdict
 from sklearn.metrics import pairwise_distances
 
 from sklearn.linear_model import Ridge
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
 
 from utils import *
 from losses import *
@@ -27,11 +30,17 @@ def parse_arguments():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--epochs", type=int, default=10)
 
-    # Ridge / model arguments
-    ap.add_argument("--model_type", type=str, default="ridge", choices=["ridge", "direct"],
+    # Transfer model arguments
+    ap.add_argument("--model_type", type=str, default="ridge", choices=["ridge", "direct", "mlp"],
                     help="The type of transfer model to train.")
     ap.add_argument("--ridge_alpha", type=float, default=1.0,
                     help="Regularization strength (alpha) for Ridge regression.")
+    ap.add_argument("--learn_residual", action="store_true",
+                    help="If set, model learns to predict the residual from direct transfer.")
+    ap.add_argument("--mlp_hidden_dim", type=int, default=256,
+                    help="Hidden dimension size for the MLP model.")
+    ap.add_argument("--mlp_dropout", type=float, default=0.2,
+                    help="Dropout rate for the MLP model.")
 
     # Train/test split and eval options
     ap.add_argument("--test_pct_perts", type=float, default=0.0,
@@ -166,6 +175,55 @@ def predict_direct_transfer(source_deltas, target_adata, target_label, control_l
     
     return predictions
 
+# In transfer_main.py
+
+class MLP(nn.Module):
+    """A simple Multi-Layer Perceptron for vector-to-vector regression."""
+    def __init__(self, n_genes, hidden_dim=256, dropout=0.2):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(n_genes, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, n_genes)
+        )
+    def forward(self, x):
+        return self.model(x)
+
+def train_mlp(X_source, Y_target, args):
+    """Trains a simple MLP model using PyTorch."""
+    print(f"Training MLP model for {args.epochs} epochs...")
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    n_genes = X_source.shape[1]
+    
+    model = MLP(n_genes, args.mlp_hidden_dim, args.mlp_dropout).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    loss_fn = nn.MSELoss()
+
+    # Create DataLoader for batching
+    dataset = TensorDataset(
+        torch.from_numpy(X_source.astype(np.float32)),
+        torch.from_numpy(Y_target.astype(np.float32))
+    )
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+
+    model.train()
+    for epoch in range(args.epochs):
+        epoch_loss = 0.0
+        for x_batch, y_batch in loader:
+            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+            optimizer.zero_grad()
+            y_pred = model(x_batch)
+            loss = loss_fn(y_pred, y_batch)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+        
+        if (epoch + 1) % 10 == 0:
+            print(f"  Epoch {epoch+1:03d} | Loss: {epoch_loss / len(loader):.6f}")
+
+    print("Training complete.")
+    return model.to("cpu") # Move model to CPU for consistent prediction
 
 def train_ridge(X_source, Y_target, alpha=1.0):
     """Trains a Ridge Regression model."""
@@ -175,24 +233,31 @@ def train_ridge(X_source, Y_target, alpha=1.0):
     print("Training complete.")
     return model
 
+# general training function
 def train_transfer_model(X_source, Y_target, args):
     """
     A general training loop that dispatches to the correct model function.
     """
     if args.model_type == 'ridge':
         return train_ridge(X_source, Y_target, alpha=args.ridge_alpha)
-    # You can add other models here later, e.g.:
-    # elif args.model_type == 'mlp':
-    #     return train_mlp(X_source, Y_target, args)
+    elif args.model_type == 'mlp':
+        return train_mlp(X_source, Y_target, args)
     else:
         raise ValueError(f"Unknown model_type: {args.model_type}")
 
 def predict(model, X_source):
     """
-    Generates predictions from a trained model.
+    Generates predictions from a trained model (scikit-learn or PyTorch).
     """
     print("Generating predictions on the test set...")
-    return model.predict(X_source)
+    if isinstance(model, nn.Module): # PyTorch model
+        model.eval()
+        with torch.no_grad():
+            X_tensor = torch.from_numpy(X_source.astype(np.float32))
+            predictions = model(X_tensor).numpy()
+    else: # scikit-learn model
+        predictions = model.predict(X_source)
+    return predictions
 
 
 def evaluate_model(
@@ -388,26 +453,49 @@ def main():
             source_deltas, adata_target, args.target_label, args.control_label
         )
 
-    elif args.model_type == 'ridge':
-        print("\n=== Running Ridge Regression Baseline ===")
-        # Prepare training matrices from the target training split
-        train_perts = sorted([p for p in adata_train.obs[args.target_label].unique() if p != args.control_label])
-        X_train_source = adata_source[adata_source.obs[args.target_label].isin(train_perts)].X
-        Y_train_target = adata_train[adata_train.obs[args.target_label].isin(train_perts)].X
-
-        # Train the transfer model
-        model = train_transfer_model(X_train_source, Y_train_target, args)
-        
-        # Predict on ALL common perturbations from the source data at once
-        all_common_perts = sorted([p for p in adata_source.obs[args.target_label].unique() if p != args.control_label])
-        X_all_source = adata_source[adata_source.obs[args.target_label].isin(all_common_perts)].X
-        all_predictions_mat = predict(model, X_all_source)
-        
-        # Store predictions in a dictionary for easy lookup
-        all_predictions_dict = {p: v for p, v in zip(all_common_perts, all_predictions_mat)}
-
     else:
-        raise ValueError(f"Unknown model_type: {args.model_type}")
+        # For Ridge and MLP, we train a model
+        print(f"\n=== Training {args.model_type.upper()} Model ===")
+        train_perts = sorted([p for p in adata_train.obs[args.target_label].unique() if p != args.control_label])
+        
+        # Prepare source inputs and target outputs for training
+        X_train_source = to_numpy(adata_source[adata_source.obs[args.target_label].isin(train_perts)].X)
+        Y_train_target = to_numpy(adata_train[adata_train.obs[args.target_label].isin(train_perts)].X)
+        
+        # --- RESIDUAL LEARNING LOGIC ---
+        Y_train_for_model = Y_train_target
+        if args.learn_residual:
+            print("Mode: Learning the residual from direct transfer.")
+            # Calculate direct transfer predictions for the training set
+            source_deltas, _ = compute_deltas(adata_source, args.target_label, args.control_label)
+            train_preds_direct_dict = predict_direct_transfer(source_deltas, adata_train, args.target_label, args.control_label)
+            Y_direct_transfer_train = np.array([train_preds_direct_dict[p] for p in train_perts])
+            
+            # The model learns to predict the correction
+            Y_train_for_model = Y_train_target - Y_direct_transfer_train
+        # --- END RESIDUAL LEARNING LOGIC ---
+
+        model = train_transfer_model(X_train_source, Y_train_for_model, args)
+        
+        # Predict on ALL common perturbations from the source data
+        all_common_perts = sorted([p for p in adata_source.obs[args.target_label].unique() if p != args.control_label])
+        X_all_source = to_numpy(adata_source[adata_source.obs[args.target_label].isin(all_common_perts)].X)
+        
+        # This is the raw model prediction (either the final value or the residual)
+        all_preds_raw = predict(model, X_all_source)
+
+        # --- RESIDUAL PREDICTION LOGIC ---
+        if args.learn_residual:
+            # Add the predicted residual to the direct transfer baseline
+            source_deltas, _ = compute_deltas(adata_source, args.target_label, args.control_label)
+            all_preds_direct_dict = predict_direct_transfer(source_deltas, adata_target, args.target_label, args.control_label)
+            Y_direct_transfer_all = np.array([all_preds_direct_dict[p] for p in all_common_perts])
+            all_preds_final = Y_direct_transfer_all + all_preds_raw
+        else:
+            all_preds_final = all_preds_raw
+        # --- END RESIDUAL PREDICTION LOGIC ---
+        
+        all_predictions_dict = {p: v for p, v in zip(all_common_perts, all_preds_final)}
 
     # ---------------------------
     # 3. Evaluate on the Test Set
