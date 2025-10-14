@@ -246,6 +246,65 @@ def write_influence_scores_csv(
     influence_df.to_csv(output_path)
     print(f"   ...Done. Matrix shape: {influence_df.shape}")
 
+@torch.no_grad()
+def predict_held_out_perts(
+    model,
+    adata_train: ad.AnnData,
+    adata_test: ad.AnnData,
+    args,
+) -> tuple:
+    """
+    Uses the trained autoencoder to predict response vectors for held-out perturbations.
+    """
+    print("\n=== Stage 2: Predicting responses for held-out perturbations ===")
+    model.eval()
+    num_genes = adata_train.n_vars
+    
+    # 1. Get the global control mean from the TRAINING data
+    train_labels = adata_train.obs[args.target_label].astype(str)
+    ctrl_mean = to_numpy(adata_train[train_labels == args.control_label].X).mean(axis=0)
+
+    # 2. Prepare a neutral input by encoding a zero-vector
+    zero_delta = torch.zeros(1, num_genes, device=args.device)
+    # Use a dummy embedding for the encoder pass (it will be replaced at the decoder)
+    dummy_pert_idx = torch.tensor([0], device=args.device)
+    dummy_pert_emb = model.pert_embedding(dummy_pert_idx)
+    
+    net_input = torch.cat([zero_delta, dummy_pert_emb], dim=1)
+    h_neutral = model.encoder(net_input)
+
+    # 3. Get embeddings for the HELD-OUT genes
+    # Create a map from gene name to its index in the full var_names list
+    gene_to_idx = {name: i for i, name in enumerate(adata_train.var_names)}
+    
+    test_perts = sorted({
+        p for p in adata_test.obs[args.target_label].unique() if p != args.control_label
+    })
+    
+    pred_deltas = []
+    for p_label in test_perts:
+        p_idx = torch.tensor([gene_to_idx[p_label]], device=args.device)
+        p_emb = model.pert_embedding(p_idx)
+        
+        # 4. Generate prediction by feeding the DECODER the neutral latent vector
+        #    and the specific embedding of the held-out gene.
+        decoder_input = h_neutral # In a more complex model, you might cat p_emb here too
+        pred_delta = model.decoder(decoder_input)
+        pred_deltas.append(pred_delta.squeeze().cpu().numpy())
+
+    pred_delta_mat = np.array(pred_deltas)
+    
+    # 5. The model predicts DELTAS. Add the control mean back to get final expression.
+    pred_mat = pred_delta_mat + ctrl_mean
+    
+    # 6. Prepare the final "pred_bundle" for the evaluation function
+    test_pert_mask = adata_test.obs[args.target_label].isin(test_perts)
+    true_mat = to_numpy(adata_test[test_pert_mask].X)
+    pert_names = adata_test[test_pert_mask].obs[args.target_label].tolist()
+    
+    print("   ...Done. Predicted effects for {} perturbations.".format(len(test_perts)))
+    return (pred_mat, true_mat, pert_names, ctrl_mean)
+
 def evaluate_model(
     adata: ad.AnnData,
     args,
@@ -450,7 +509,23 @@ def main():
     elif args.model_type == 'mlp_ae':
         # --- Run the new interventional autoencoder flow ---
         print("\n=== Running Interventional Model (mlp_ae) ===")
-        run_mlp_autoencoder_flow(args, adata_train)
+        model = run_mlp_autoencoder_flow(args, adata_train)
+        if adata_test is not None:
+            # Perform Stage 2 prediction
+            pred_bundle = predict_held_out_perts(
+                model=model,
+                adata_train=adata_train,
+                adata_test=adata_test,
+                args=args,
+            )
+            
+            # Pass the predictions to the user's evaluation function
+            print("\n=== Final Evaluation on Held-Out Perturbations ===")
+            evaluate_model(
+                adata=adata_test, # Evaluate on the test set AnnData
+                args=args,
+                pred_bundle=pred_bundle
+            )
 
     # model = None
     # pred_bundle = None

@@ -20,9 +20,9 @@ class PerturbationAutoencoder(torch.nn.Module):
     An MLP autoencoder that learns to reconstruct perturbation response vectors,
     conditioned on the identity of the perturbed gene.
     """
-    def __init__(self, num_genes: int, num_perts: int, pert_embed_dim: int, hidden_dim: int):
+    def __init__(self, num_genes: int, pert_embed_dim: int, hidden_dim: int):
         super().__init__()
-        self.pert_embedding = torch.nn.Embedding(num_perts, pert_embed_dim)
+        self.pert_embedding = torch.nn.Embedding(num_genes, pert_embed_dim)
         
         self.encoder = torch.nn.Sequential(
             torch.nn.Linear(num_genes + pert_embed_dim, hidden_dim),
@@ -165,7 +165,6 @@ def run_mlp_autoencoder_flow(args, adata_train: ad.AnnData):
     
     model = PerturbationAutoencoder(
         num_genes=num_genes,
-        num_perts=num_perts,
         pert_embed_dim=args.pert_embed_dim,
         hidden_dim=args.hidden_dim,
     ).to(args.device)
@@ -188,6 +187,7 @@ def run_mlp_autoencoder_flow(args, adata_train: ad.AnnData):
             adata=adata_train,
             output_path=args.out_influence_csv
         )
+    return model
 
 def compute_mlp_influence_matrix(
     model: PerturbationAutoencoder,
