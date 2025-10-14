@@ -179,7 +179,7 @@ def run_mlp_autoencoder_flow(args, adata_train: ad.AnnData):
     if args.out_influence_csv:
         mlp_influence_matrix = compute_mlp_influence_matrix(
             model=model,
-            num_genes=adata_train.n_vars,
+            delta_vectors=delta_vectors, # <-- Pass the full delta tensor
             num_perts=len(pert_labels),
             device=args.device
         )
@@ -189,41 +189,50 @@ def run_mlp_autoencoder_flow(args, adata_train: ad.AnnData):
             output_path=args.out_influence_csv
         )
 
-@torch.no_grad()
 def compute_mlp_influence_matrix(
     model: PerturbationAutoencoder,
-    num_genes: int,
+    delta_vectors: torch.Tensor, # <-- Pass in the data to compute the mean
     num_perts: int,
     device: str,
 ) -> np.ndarray:
     """
     Computes a (G, G) influence matrix from the trained MLP autoencoder
-    by performing in-silico perturbations.
+    using the Gradient Saliency method at the mean response vector.
     """
-    print("\n🧠 Computing MLP influence matrix via in-silico perturbation...")
-    print("   (This may be slow for a large number of genes as it requires G forward passes)")
+    print("\n🧠 Computing MLP influence matrix via Gradient Saliency...")
     model.eval()
-    
-    # Use an average perturbation embedding as a neutral context
+    num_genes = delta_vectors.shape[1]
+
+    # 1. Compute the baseline: the mean response vector across all perturbations
+    delta_mean = delta_vectors.mean(dim=0, keepdim=True).to(device)
+    delta_mean.requires_grad = True # IMPORTANT: Track gradients with respect to the input
+
+    # 2. Use an average perturbation embedding as a neutral context
     avg_pert_idx = torch.arange(num_perts, device=device)
     avg_pert_embedding = model.pert_embedding(avg_pert_idx).mean(dim=0, keepdim=True)
 
+    # 3. Get the baseline prediction
+    net_input = torch.cat([delta_mean, avg_pert_embedding], dim=1)
+    hidden = model.encoder(net_input)
+    y_pred = model.decoder(hidden)
+
     influence_matrix = np.zeros((num_genes, num_genes))
 
-    for j in range(num_genes): # j is the source gene
-        # Create a one-hot vector for the source gene's response
-        delta_input = torch.zeros(1, num_genes, device=device)
-        delta_input[0, j] = 1.0
-        
-        # Combine with the average perturbation embedding
-        net_input = torch.cat([delta_input, avg_pert_embedding], dim=1)
-        
-        # Predict the full response vector
-        hidden = model.encoder(net_input)
-        response_pred = model.decoder(hidden)
-        
-        # The predicted vector is the influence of gene j on all other genes
-        influence_matrix[:, j] = response_pred.squeeze().cpu().numpy()
+    # 4. Iterate through each OUTPUT gene to compute its gradient w.r.t. all INPUT genes
+    for i in range(num_genes):
+        if model.training: model.zero_grad() # Zero out gradients in model, just in case
+        if delta_mean.grad is not None:
+            delta_mean.grad.zero_() # Zero out gradients on the input tensor
+
+        # Backpropagate from the i-th output neuron.
+        # retain_graph=True is crucial because we perform multiple backward passes
+        # on the same computational graph.
+        y_pred[0, i].backward(retain_graph=True)
+
+        # The gradient delta_mean.grad now contains d(output_i) / d(input_j) for all j.
+        # This vector is the influence of all input genes on the i-th output gene.
+        grad_vector = delta_mean.grad.squeeze().cpu().numpy()
+        influence_matrix[i, :] = grad_vector # This becomes the i-th ROW of the matrix
 
     print("   ...Done.")
     return influence_matrix
