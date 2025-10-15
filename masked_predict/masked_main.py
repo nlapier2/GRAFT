@@ -420,6 +420,16 @@ def run_dual_head_flow(args, adata_train: ad.AnnData, adata_test: ad.AnnData):
         
         print("\n=== Final Evaluation on Held-Out Perturbations ===")
         evaluate_model(adata=adata_test, args=args, pred_bundle=pred_bundle)
+
+        if args.out_pred_h5ad:
+            print(f"\n💾 Writing prediction and true AnnData files to {args.out_pred_h5ad}...")
+            write_pred_true_h5ads(
+                eval_adata=adata_test,
+                pred_bundle=pred_bundle,
+                out_pred_h5ad=args.out_pred_h5ad,
+                target_label=args.target_label,
+                control_label=args.control_label,
+            )
     
     if args.eval_on_train:
         print("\n=== Evaluation on Training Set ===")
