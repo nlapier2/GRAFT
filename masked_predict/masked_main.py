@@ -31,13 +31,17 @@ def parse_arguments():
                     help="If set, write a CSV with directed influence scores for each gene pair.")
     
     # masked model options
-    ap.add_argument("--model_type", type=str, default="linear_mgm", choices=["linear_mgm", "mlp_ae"],
+    ap.add_argument("--model_type", type=str, default="linear_mgm", choices=["linear_mgm", "mlp_ae", "dual_head_mt"],
                     help="Which modeling approach to run. 'linear_mgm' for observational masked modeling, "
                          "'mlp_ae' for interventional autoencoder on response vectors.")
     ap.add_argument("--pert_embed_dim", type=int, default=32,
                     help="Dimension of the learnable embedding for each perturbation (for mlp_ae).")
     ap.add_argument("--hidden_dim", type=int, default=256,
                     help="Hidden dimension of the MLP autoencoder (for mlp_ae).")
+    ap.add_argument("--weight_recon", type=float, default=1.0,
+                    help="Weight for the reconstruction loss in the dual-head model.")
+    ap.add_argument("--weight_pred", type=float, default=1.0,
+                    help="Weight for the prediction loss in the dual-head model.")
 
     # Train/test split and eval options
     ap.add_argument("--test_pct_perts", type=float, default=0.0,
@@ -305,6 +309,123 @@ def predict_held_out_perts(
     print("   ...Done. Predicted effects for {} perturbations.".format(len(test_perts)))
     return (pred_mat, true_mat, pert_names, ctrl_mean)
 
+def train_dual_head_model(
+    delta_vectors: torch.Tensor,
+    pert_indices: torch.Tensor,
+    model,
+    args):
+    model.train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    loss_fn = torch.nn.MSELoss()
+    
+    dataset = TensorDataset(delta_vectors, pert_indices)
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    
+    print("  Training on {} perturbation response vectors...".format(len(dataset)))
+    for epoch in range(1, args.epochs + 1):
+        epoch_loss_recon, epoch_loss_pred = 0, 0
+        for delta_batch, p_idx_batch in loader:
+            delta_batch = delta_batch.to(args.device)
+            p_idx_batch = p_idx_batch.to(args.device)
+            
+            mask = (torch.rand(delta_batch.shape, device=args.device) > 0.15)
+            delta_masked = delta_batch * mask
+            
+            # Get outputs from both heads
+            recon_output, pred_output = model(delta_masked, p_idx_batch)
+            
+            # Calculate loss for each task
+            loss_recon = loss_fn(recon_output[~mask], delta_batch[~mask])
+            loss_pred = loss_fn(pred_output, delta_batch)
+            
+            # Combine losses with weights
+            total_loss = (args.weight_recon * loss_recon) + (args.weight_pred * loss_pred)
+            
+            optimizer.zero_grad()
+            total_loss.backward()
+            optimizer.step()
+            
+            epoch_loss_recon += loss_recon.item()
+            epoch_loss_pred += loss_pred.item()
+        
+        if epoch % 5 == 0 or epoch == args.epochs:
+            avg_loss_r = epoch_loss_recon / len(loader)
+            avg_loss_p = epoch_loss_pred / len(loader)
+            print(f"  [Epoch {epoch:02d}] Recon Loss: {avg_loss_r:.6f} | Pred Loss: {avg_loss_p:.6f}")
+            
+    return model.eval()
+
+@torch.no_grad()
+def predict_with_dual_head_model(
+    model,
+    adata_train: ad.AnnData,
+    adata_test: ad.AnnData,
+    args,
+) -> tuple:
+    print("\n=== Predicting responses for held-out perturbations using Dual-Head Model ===")
+    model.eval()
+    
+    ctrl_mean = to_numpy(adata_train[adata_train.obs[args.target_label] == args.control_label].X).mean(axis=0)
+    gene_to_idx = {name: i for i, name in enumerate(adata_train.var_names)}
+    test_perts = sorted({p for p in adata_test.obs[args.target_label].unique() if p != args.control_label})
+    
+    pred_deltas = []
+    for p_label in test_perts:
+        p_idx = torch.tensor([gene_to_idx[p_label]], device=args.device)
+        
+        # Use the model's dedicated prediction method
+        pred_delta = model.predict(p_idx)
+        pred_deltas.append(pred_delta.squeeze().cpu().numpy())
+        
+    pred_delta_mat = np.array(pred_deltas)
+    pred_mat = pred_delta_mat + ctrl_mean
+    
+    test_pert_mask = adata_test.obs[args.target_label].isin(test_perts)
+    true_mat = to_numpy(adata_test[test_pert_mask].X)
+    pert_names = adata_test[test_pert_mask].obs[args.target_label].tolist()
+    
+    print("   ...Done. Predicted effects for {} perturbations.".format(len(test_perts)))
+    return (pred_mat, true_mat, pert_names, ctrl_mean)
+
+def run_dual_head_flow(args, adata_train: ad.AnnData, adata_test: ad.AnnData):
+    """Orchestrates the training and prediction for the dual-head model."""
+    if not args.use_pseudobulk:
+        raise ValueError("--model_type 'dual_head_mt' requires the --use_pseudobulk flag.")
+
+    # --- Stage 1: Train the multi-task model ---
+    print("\n=== Training Dual-Head Multi-Task Model ===")
+    labels = adata_train.obs[args.target_label].astype(str)
+    control_vec = to_numpy(adata_train[labels == args.control_label].X).mean(axis=0)
+    
+    gene_to_idx = {name: i for i, name in enumerate(adata_train.var_names)}
+    train_perts = sorted({p for p in labels if p != args.control_label and p in gene_to_idx})
+    
+    delta_vectors = [to_numpy(adata_train[labels == p].X).mean(axis=0) - control_vec for p in train_perts]
+    pert_indices = [gene_to_idx[p] for p in train_perts]
+    
+    delta_vectors = torch.from_numpy(np.array(delta_vectors, dtype=np.float32))
+    pert_indices = torch.from_numpy(np.array(pert_indices, dtype=np.int64))
+    
+    model = DualHeadAutoencoder(
+        num_genes=adata_train.n_vars,
+        pert_embed_dim=args.pert_embed_dim,
+        hidden_dim=args.hidden_dim,
+    ).to(args.device)
+    
+    model = train_dual_head_model(delta_vectors, pert_indices, model, args)
+    
+    # --- Stage 2: Predict and Evaluate on held-out data ---
+    if adata_test is not None:
+        pred_bundle = predict_with_dual_head_model(model, adata_train, adata_test, args)
+        
+        print("\n=== Final Evaluation on Held-Out Perturbations ===")
+        evaluate_model(adata=adata_test, args=args, pred_bundle=pred_bundle)
+    
+    if args.eval_on_train:
+        print("\n=== Evaluation on Training Set ===")
+        pred_bundle_train = predict_with_dual_head_model(model, adata_train, adata_train, args)
+        evaluate_model(adata=adata_train, args=args, pred_bundle=pred_bundle_train)
+
 def evaluate_model(
     adata: ad.AnnData,
     args,
@@ -543,6 +664,12 @@ def main():
                     args=args,
                     pred_bundle=pred_bundle_tr
                 )
+    elif args.model_type == 'dual_head_mt':
+        # --- Run the dual-head multi-task model flow ---
+        print("\n=== Running Dual-Head Multi-Task Model (dual_head_mt) ===")
+        run_dual_head_flow(args, adata_train, adata_test)
+    else:
+        raise ValueError(f"Unknown model_type: {args.model_type}")
 
     # model = None
     # pred_bundle = None

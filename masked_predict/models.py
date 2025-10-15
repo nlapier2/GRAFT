@@ -236,3 +236,55 @@ def compute_mlp_influence_matrix(
 
     print("   ...Done.")
     return influence_matrix
+
+# In your models.py file
+
+import torch
+import torch.nn as nn
+
+# ... (your other model classes like PerturbationAutoencoder) ...
+
+class DualHeadAutoencoder(nn.Module):
+    """
+    A multi-task model with a shared gene embedding layer and two heads:
+    1. Reconstruction Head: Predicts masked genes in a response vector.
+    2. Prediction Head: Predicts the full response vector from a gene's embedding.
+    """
+    def __init__(self, num_genes: int, pert_embed_dim: int, hidden_dim: int):
+        super().__init__()
+        # Core Component: A single, shared embedding for ALL genes
+        self.shared_embedding = nn.Embedding(num_genes, pert_embed_dim)
+        
+        # Head 1: Reconstruction (Encoder-Decoder)
+        self.recon_encoder = nn.Sequential(
+            nn.Linear(num_genes, hidden_dim),
+            nn.GELU(),
+        )
+        self.recon_decoder = nn.Sequential(
+            nn.Linear(hidden_dim, num_genes)
+        )
+        
+        # Head 2: Perturbation Prediction (MLP)
+        self.pred_head = nn.Sequential(
+            nn.Linear(pert_embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_genes)
+        )
+
+    def forward(self, delta_masked: torch.Tensor, pert_idx: torch.Tensor):
+        """Forward pass for multi-task training."""
+        # --- Task 1: Reconstruction ---
+        h_context = self.recon_encoder(delta_masked)
+        recon_output = self.recon_decoder(h_context)
+        
+        # --- Task 2: Prediction ---
+        pert_emb = self.shared_embedding(pert_idx)
+        pred_output = self.pred_head(pert_emb)
+        
+        return recon_output, pred_output
+
+    def predict(self, pert_idx: torch.Tensor):
+        """Forward pass for zero-shot prediction (uses only the prediction head)."""
+        pert_emb = self.shared_embedding(pert_idx)
+        pred_output = self.pred_head(pert_emb)
+        return pred_output
