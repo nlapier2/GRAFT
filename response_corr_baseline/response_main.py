@@ -75,69 +75,83 @@ def parse_arguments():
     args = ap.parse_args()
     return args
 
-
-# --- Add this new function to boilerplate_main.py ---
-
 def run_correlation_baseline(
     adata: ad.AnnData,
     args
 ) -> tuple[np.ndarray, np.ndarray, list[str], np.ndarray]:
     """
-    Implements a simple baseline where the effect on a response gene is
-    predicted as the target gene's knockdown delta multiplied by the
-    correlation of the response gene's and target gene's deltas across all perturbations.
+    Implements a leave-one-out baseline. For each perturbation, it:
+    1. Estimates the target knockdown efficiency by averaging the efficiency of all other perturbations.
+    2. Computes a gene-gene response correlation matrix using only the other perturbations.
+    3. Predicts the effect vector using the estimated efficiency and the leave-one-out correlation matrix.
     """
-    print("=== Running simple correlation baseline ===")
+    print("=== Running leave-one-out correlation baseline ===")
 
     # Ensure data is a dense numpy array for calculations
     X = to_numpy(adata.X)
+    t2gi = build_target_to_gene_index(adata, args.target_label)
+    eps = 1e-8
 
     # 1. Separate control and perturbed data
     ctrl_mask = adata.obs[args.target_label] == args.control_label
     pert_mask = ~ctrl_mask
-
-    # Since the data is pseudobulked, there is one control row. Get its expression vector.
     ctrl_mean = X[ctrl_mask, :].mean(axis=0)
 
-    # Get the data for the perturbed samples
     pert_X = X[pert_mask, :]
     pert_names = adata.obs[args.target_label][pert_mask].tolist()
     num_perts = len(pert_names)
-
-    # 2. Compute the true deltas (perturbed - control) and the response correlation matrix
-    print("Computing gene-gene response correlation matrix...")
-    delta_matrix_true = pert_X - ctrl_mean
-
-    # np.corrcoef with rowvar=False computes correlation between columns (genes)
-    response_corr = np.corrcoef(delta_matrix_true, rowvar=False)
-    # Handle cases where a gene has zero variance across perturbations, which results in NaN
-    response_corr = np.nan_to_num(response_corr)
-
-    # 3. Predict effects for each perturbation based on its target gene
-    t2gi = build_target_to_gene_index(adata, args.target_label)
     pred_mat = np.zeros_like(pert_X)
 
-    print("Predicting effects for each perturbation...")
+    print("Predicting effects for each perturbation using leave-one-out...")
+    # --- Main leave-one-out loop ---
     for i, p_name in enumerate(pert_names):
+        # Define the "in-group" for this iteration (all perts except the current one)
+        loo_indices = [j for j in range(num_perts) if i != j]
+        
+        # If there are no other perts to learn from, predict no effect
+        if not loo_indices:
+            pred_mat[i, :] = ctrl_mean
+            continue
+
+        loo_pert_X = pert_X[loo_indices, :]
+        loo_pert_names = [pert_names[j] for j in loo_indices]
+
+        # 2. Compute average knockdown efficiency from the leave-one-out set
+        efficiencies = []
+        for j, p_other_name in enumerate(loo_pert_names):
+            target_idx_other = t2gi.get(p_other_name, -1)
+            if target_idx_other >= 0:
+                ctrl_val = ctrl_mean[target_idx_other]
+                pert_val = loo_pert_X[j, target_idx_other]
+                # Avoid division by zero for non-expressed genes
+                if abs(ctrl_val) > eps:
+                    eff = (ctrl_val - pert_val) / ctrl_val
+                    efficiencies.append(eff)
+        
+        # Use the mean efficiency of other perts as the estimate for this one
+        avg_efficiency = np.mean(efficiencies) if efficiencies else 0.0
+
+        # 3. Compute the response correlation matrix on the leave-one-out set
+        loo_delta_matrix = loo_pert_X - ctrl_mean
+        loo_response_corr = np.corrcoef(loo_delta_matrix, rowvar=False)
+        loo_response_corr = np.nan_to_num(loo_response_corr)
+
+        # 4. Predict the delta vector for the held-out perturbation `p_name`
         target_gene_idx = t2gi.get(p_name, -1)
         predicted_delta_vector = np.zeros(adata.n_vars)
 
-        # Only predict an effect if the perturbation targets a known gene in the panel
         if target_gene_idx >= 0:
-            # Get the true observed delta for the target gene itself
-            target_knockdown_delta = delta_matrix_true[i, target_gene_idx]
+            # Estimate the knockdown delta on the target gene
+            ctrl_val_target = ctrl_mean[target_gene_idx]
+            estimated_target_delta = - (avg_efficiency * ctrl_val_target)
 
-            # Get the correlation of this target gene with all other genes
-            corr_vector = response_corr[:, target_gene_idx]
-
-            # Predict deltas for all genes: delta_R = delta_P * corr(G_p, R)
-            predicted_delta_vector = target_knockdown_delta * corr_vector
-
-        # Final prediction is the control mean + the predicted delta vector
+            # Get the correlation of this target gene with all other genes (from LOO matrix)
+            corr_vector = loo_response_corr[:, target_gene_idx]
+            predicted_delta_vector = estimated_target_delta * corr_vector
+        
         pred_mat[i, :] = ctrl_mean + predicted_delta_vector
 
-    # 4. Assemble the prediction bundle for the evaluation function
-    # The bundle contains: (predicted_expressions, true_expressions, perturbation_names, control_mean)
+    # 5. Assemble the prediction bundle for the evaluation function
     pred_bundle = (pred_mat, pert_X, pert_names, ctrl_mean)
 
     return pred_bundle
