@@ -76,6 +76,73 @@ def parse_arguments():
     return args
 
 
+# --- Add this new function to boilerplate_main.py ---
+
+def run_correlation_baseline(
+    adata: ad.AnnData,
+    args
+) -> tuple[np.ndarray, np.ndarray, list[str], np.ndarray]:
+    """
+    Implements a simple baseline where the effect on a response gene is
+    predicted as the target gene's knockdown delta multiplied by the
+    correlation of the response gene's and target gene's deltas across all perturbations.
+    """
+    print("=== Running simple correlation baseline ===")
+
+    # Ensure data is a dense numpy array for calculations
+    X = to_numpy(adata.X)
+
+    # 1. Separate control and perturbed data
+    ctrl_mask = adata.obs[args.target_label] == args.control_label
+    pert_mask = ~ctrl_mask
+
+    # Since the data is pseudobulked, there is one control row. Get its expression vector.
+    ctrl_mean = X[ctrl_mask, :].mean(axis=0)
+
+    # Get the data for the perturbed samples
+    pert_X = X[pert_mask, :]
+    pert_names = adata.obs[args.target_label][pert_mask].tolist()
+    num_perts = len(pert_names)
+
+    # 2. Compute the true deltas (perturbed - control) and the response correlation matrix
+    print("Computing gene-gene response correlation matrix...")
+    delta_matrix_true = pert_X - ctrl_mean
+
+    # np.corrcoef with rowvar=False computes correlation between columns (genes)
+    response_corr = np.corrcoef(delta_matrix_true, rowvar=False)
+    # Handle cases where a gene has zero variance across perturbations, which results in NaN
+    response_corr = np.nan_to_num(response_corr)
+
+    # 3. Predict effects for each perturbation based on its target gene
+    t2gi = build_target_to_gene_index(adata, args.target_label)
+    pred_mat = np.zeros_like(pert_X)
+
+    print("Predicting effects for each perturbation...")
+    for i, p_name in enumerate(pert_names):
+        target_gene_idx = t2gi.get(p_name, -1)
+        predicted_delta_vector = np.zeros(adata.n_vars)
+
+        # Only predict an effect if the perturbation targets a known gene in the panel
+        if target_gene_idx >= 0:
+            # Get the true observed delta for the target gene itself
+            target_knockdown_delta = delta_matrix_true[i, target_gene_idx]
+
+            # Get the correlation of this target gene with all other genes
+            corr_vector = response_corr[:, target_gene_idx]
+
+            # Predict deltas for all genes: delta_R = delta_P * corr(G_p, R)
+            predicted_delta_vector = target_knockdown_delta * corr_vector
+
+        # Final prediction is the control mean + the predicted delta vector
+        pred_mat[i, :] = ctrl_mean + predicted_delta_vector
+
+    # 4. Assemble the prediction bundle for the evaluation function
+    # The bundle contains: (predicted_expressions, true_expressions, perturbation_names, control_mean)
+    pred_bundle = (pred_mat, pert_X, pert_names, ctrl_mean)
+
+    return pred_bundle
+
+
 def evaluate_model(
     adata: ad.AnnData,
     args,
@@ -235,18 +302,18 @@ def main():
     adata = ad.read_h5ad(args.in_h5ad)
     adata.obs['dataset_id'] = "target_all"
     adata.obs['cell_type'] = "UNK"
-    sc.pp.normalize_total(adata, inplace=True)
-    sc.pp.log1p(adata)
     pb_target = None  # pseudobulked target data for Stage-1 pretraining
     if args.include_target_pseudobulk:
         pb_target = make_pretrain_pseudobulk_from_adata(adata, args.target_label, args.control_label, dataset_id="target_all")
-        # sc.pp.normalize_total(pb_target, inplace=True)
-        # sc.pp.log1p(pb_target)
+        sc.pp.normalize_total(pb_target, inplace=True)
+        sc.pp.log1p(pb_target)
     if args.use_pseudobulk:  # stage 2 pseudobulk
         args.batch_size = 1  # enforce single-row batches
         adata = collapse_to_pseudobulk(adata, args.target_label)
         adata.obs['dataset_id'] = "target_all"
         adata.obs['cell_type'] = "UNK"
+    sc.pp.normalize_total(adata, inplace=True)
+    sc.pp.log1p(adata)
     if sparse.isspmatrix(adata.X) and not sparse.isspmatrix_csr(adata.X):
         adata.X = adata.X.tocsr()  # nicer slicing, though we load to numpy anyway
     # train/test split
@@ -258,8 +325,9 @@ def main():
         adata_test.obs['cell_type'] = "UNK"
     eval_adata = adata_test if adata_test is not None else adata_train
 
-    model = None
-    pred_bundle = None
+    print(f"\nRunning baseline and evaluating on pseudobulked data with {eval_adata.n_obs} rows.")
+    pred_bundle = run_correlation_baseline(eval_adata, args)
+
     # ---------------------------
     # Evaluate: external test if provided, else held-out split, else train split
     # ---------------------------
@@ -273,6 +341,7 @@ def main():
         train_labels = adata_train.obs[args.target_label].astype(str).values
         train_perts  = sorted({lab for lab in train_labels if lab != args.control_label})
         _ = evaluate_model(adata=adata_train, args=args, pred_bundle=None)
+
 
     if args.out_pred_h5ad:
         if hasattr(eval_adata.X, "toarray"):
