@@ -42,56 +42,63 @@ class CausalGNN(nn.Module):
             nn.Sigmoid()
         )
 
-# In your models.py file, replace the forward method in the CausalGNN class
+        # MLP to learn perturbation effectiveness
+        self.effectiveness_head = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid() # Output a value between 0 and 1 (knockdown percentage)
+        )
 
-    def forward(self, pert_idx: torch.Tensor) -> torch.Tensor:
-        """
-        Predicts the full delta vector by simulating effect propagation.
 
-        Args:
-            pert_idx: A tensor of shape (B,) with indices of the perturbed genes.
-        
-        Returns:
-            A tensor of shape (B, G) with the predicted delta vectors.
-        """
-        B = pert_idx.shape[0]
-        device = pert_idx.device
+    def forward(self, pert_idx: torch.Tensor, control_expr_at_pert: torch.Tensor) -> torch.Tensor:
+            """
+            Predicts the full delta vector by simulating effect propagation.
 
-        # --- Compute the (G, G) Relatedness Matrix (same as before) ---
-        all_embeddings = self.shared_embedding.weight
-        G, D = all_embeddings.shape
-        source_embs = all_embeddings.repeat(G, 1)
-        target_embs = all_embeddings.repeat_interleave(G, dim=0)
-        embedding_pairs = torch.cat([source_embs, target_embs], dim=1)
-        relatedness_scores = self.relatedness_mlp(embedding_pairs)
-        R = relatedness_scores.view(G, G)
+            Args:
+                pert_idx: (B,) tensor with indices of the perturbed genes.
+                control_expr_at_pert: (B,) tensor with the control expression
+                                    of the specific gene being perturbed.
+            """
+            B = pert_idx.shape[0]
+            device = pert_idx.device
 
-        # This tensor will accumulate the total effects over time
-        delta_state = torch.zeros(B, G, device=device)
-        
-        # This tensor represents the "wave" of new effects to be propagated at each step
-        updates = torch.zeros(B, G, device=device)
-        
-        # The initial "wave" is just the direct perturbation effect
-        initial_effect = torch.full((B, 1), -1.0, device=device)
-        updates.scatter_(1, pert_idx.unsqueeze(1), initial_effect)
-        
-        # Add the initial direct effect to the total state
-        delta_state = delta_state + updates
+            # ... (Relatedness Matrix calculation remains the same) ...
+            all_embeddings = self.shared_embedding.weight
+            G, D = all_embeddings.shape
+            source_embs = all_embeddings.repeat(G, 1)
+            target_embs = all_embeddings.repeat_interleave(G, dim=0)
+            embedding_pairs = torch.cat([source_embs, target_embs], dim=1)
+            relatedness_scores = self.relatedness_mlp(embedding_pairs)
+            R = relatedness_scores.view(G, G)
 
-        # --- Run the Propagation Loop ---
-        for _ in range(self.num_steps):
-            # Propagate the most recent "wave" of effects
-            # R @ updates.T -> (G, B), so we transpose back
-            messages = (R @ updates.t()).t()
+            # --- Calculate the initial perturbation effect ---
+            # Get the embedding for the perturbed gene
+            pert_emb = self.shared_embedding(pert_idx)
             
-            # Apply damping and add the new indirect effects to the total state
-            delta_state = delta_state + self.damping_factor * messages
+            # Predict the knockdown effectiveness (alpha)
+            knockdown_alpha = self.effectiveness_head(pert_emb).squeeze(-1) # Shape: (B,)
             
-            # The new "wave" for the next step is the messages we just calculated
-            updates = self.damping_factor * messages
+            # Calculate the initial effect: knockdown % * baseline expression
+            # The effect is negative for knockdown.
+            initial_effect = -knockdown_alpha * control_expr_at_pert
+
+            # --- Initialize the Propagation State ---
+            delta_state = torch.zeros(B, G, device=device)
+            updates = torch.zeros(B, G, device=device)
             
-        return delta_state
+            # The initial "wave" is the calculated effect
+            updates.scatter_(1, pert_idx.unsqueeze(1), initial_effect.unsqueeze(1))
+            
+            delta_state = delta_state + updates
+            
+            # --- Run the Propagation Loop (same as before) ---
+            for _ in range(self.num_steps):
+                messages = (R @ updates.t()).t()
+                delta_state = delta_state + self.damping_factor * messages
+                updates = self.damping_factor * messages
+                
+            return delta_state
 
 class PerturbationAutoencoder(torch.nn.Module):
     """

@@ -102,25 +102,29 @@ def parse_arguments():
 def train_causal_gnn(
     delta_vectors: torch.Tensor,
     pert_indices: torch.Tensor,
-    model: 'CausalGNN', # From models.py
+    control_vec: torch.Tensor, # <-- Add control_vec here
+    model: 'CausalGNN',
     args,
 ) -> 'CausalGNN':
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
     loss_fn = torch.nn.MSELoss()
     
-    dataset = TensorDataset(delta_vectors, pert_indices)
+    # The dataset now includes the control expression for each perturbation
+    control_exprs_for_perts = control_vec[pert_indices]
+    dataset = TensorDataset(delta_vectors, pert_indices, control_exprs_for_perts)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
     
     print("  Training on {} perturbation response vectors...".format(len(dataset)))
     for epoch in range(1, args.epochs + 1):
         total_loss = 0
-        for delta_batch, p_idx_batch in loader:
+        for delta_batch, p_idx_batch, control_expr_batch in loader:
             delta_batch = delta_batch.to(args.device)
             p_idx_batch = p_idx_batch.to(args.device)
+            control_expr_batch = control_expr_batch.to(args.device) # <-- Get from loader
             
-            # Predict the delta vector from the perturbation index
-            pred_delta = model(p_idx_batch)
+            # Pass the control expression to the model
+            pred_delta = model(p_idx_batch, control_expr_batch)
             
             # Calculate simple MSE loss
             loss = loss_fn(pred_delta, delta_batch)
@@ -149,11 +153,18 @@ def predict_with_causal_gnn(
     ctrl_mean = to_numpy(adata_train[adata_train.obs[args.target_label] == args.control_label].X).mean(axis=0)
     gene_to_idx = {name: i for i, name in enumerate(adata_train.var_names)}
     test_perts = sorted({p for p in adata_test.obs[args.target_label].unique() if p != args.control_label})
-    
+    ctrl_mean_tensor = torch.from_numpy(ctrl_mean).to(args.device)
+
     pred_deltas = []
     for p_label in test_perts:
-        p_idx = torch.tensor([gene_to_idx[p_label]], device=args.device)
-        pred_delta = model(p_idx)
+        p_idx_val = gene_to_idx[p_label]
+        p_idx = torch.tensor([p_idx_val], device=args.device)
+        
+        # Get the control expression for this specific gene
+        control_expr_for_pert = ctrl_mean_tensor[p_idx_val]
+        
+        # Pass it to the model
+        pred_delta = model(p_idx, control_expr_for_pert.unsqueeze(0))
         pred_deltas.append(pred_delta.squeeze().cpu().numpy())
         
     pred_delta_mat = np.array(pred_deltas)
@@ -174,6 +185,7 @@ def run_causal_gnn_flow(args, adata_train: ad.AnnData, adata_test: ad.AnnData):
     print("\n=== Training CausalGNN Model ===")
     labels = adata_train.obs[args.target_label].astype(str)
     control_vec = to_numpy(adata_train[labels == args.control_label].X).mean(axis=0)
+    control_vec_tensor = torch.from_numpy(control_vec)
     
     gene_to_idx = {name: i for i, name in enumerate(adata_train.var_names)}
     train_perts = sorted({p for p in labels if p != args.control_label and p in gene_to_idx})
@@ -192,7 +204,7 @@ def run_causal_gnn_flow(args, adata_train: ad.AnnData, adata_test: ad.AnnData):
         damping_factor=args.damping_factor,
     ).to(args.device)
     
-    model = train_causal_gnn(delta_vectors, pert_indices, model, args)
+    model = train_causal_gnn(delta_vectors, pert_indices, control_vec_tensor, model, args)
     
     if adata_test is not None:
         pred_bundle = predict_with_causal_gnn(model, adata_train, adata_test, args)
