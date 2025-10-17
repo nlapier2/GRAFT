@@ -177,6 +177,81 @@ def predict_with_causal_gnn(
     print("   ...Done. Predicted effects for {} perturbations.".format(len(test_perts)))
     return (pred_mat, true_mat, pert_names, ctrl_mean)
 
+@torch.no_grad()
+def print_causal_gnn_diagnostics(
+    model: 'CausalGNN',
+    adata_train: ad.AnnData,
+    args,
+):
+    """
+    Computes and prints useful diagnostics from a trained CausalGNN model,
+    including statistics about the learned relatedness weights.
+    """
+    print("\n" + "="*25)
+    print("🔬 CAUSAL GNN DIAGNOSTICS")
+    print("="*25)
+    model.eval()
+    
+    # 1. Re-compute the (G, G) relatedness matrix R
+    all_embeddings = model.shared_embedding.weight
+    G, D = all_embeddings.shape
+    source_embs = all_embeddings.repeat(G, 1)
+    target_embs = all_embeddings.repeat_interleave(G, dim=0)
+    embedding_pairs = torch.cat([source_embs, target_embs], dim=1)
+    relatedness_scores = model.relatedness_mlp(embedding_pairs)
+    R = relatedness_scores.view(G, G) # R_ij is relatedness of source j to target i
+
+    # 2. Exclude self-relatedness from all stats
+    no_self_loop_mask = ~torch.eye(G, dtype=torch.bool, device=R.device)
+
+    # --- Stats for ALL gene pairs ---
+    all_relatedness = R[no_self_loop_mask]
+    mean_relatedness_all = all_relatedness.mean().item()
+    max_relatedness_all = all_relatedness.max().item()
+    
+    print("\n--- Relatedness Weights (All Genes) ---")
+    print(f"  - Mean (off-diagonal): {mean_relatedness_all:.4f}")
+    print(f"  - Max (off-diagonal):  {max_relatedness_all:.4f}")
+
+    # --- Stats for UNPERTURBED target genes ---
+    train_perts = {p for p in adata_train.obs[args.target_label] if p in adata_train.var_names}
+    unperturbed_mask = torch.ones(G, dtype=torch.bool, device=R.device)
+    gene_to_idx = {name: i for i, name in enumerate(adata_train.var_names)}
+    for p in train_perts:
+        unperturbed_mask[gene_to_idx[p]] = False
+        final_unperturbed_mask = unperturbed_mask.view(-1, 1) & no_self_loop_mask
+    unperturbed_relatedness = R[final_unperturbed_mask]
+    
+    # Select rows corresponding to unperturbed genes, then apply off-diagonal mask
+    unperturbed_relatedness = R[final_unperturbed_mask]
+    if unperturbed_relatedness.numel() > 0:
+        mean_relatedness_unp = unperturbed_relatedness.mean().item()
+        max_relatedness_unp = unperturbed_relatedness.max().item()
+        print("\n--- Relatedness Weights (Unperturbed Target Genes Only) ---")
+        print(f"  - Mean (off-diagonal): {mean_relatedness_unp:.4f}")
+        print(f"  - Max (off-diagonal):  {max_relatedness_unp:.4f}")
+
+    # --- Top 5 most related gene pairs ---
+    top_vals, top_indices_flat = torch.topk(all_relatedness, 5)
+    # Need to map flat indices back to (row, col)
+    row_indices, col_indices = np.unravel_index(top_indices_flat.cpu().numpy(), (G, G))
+    
+    print("\n--- Top 5 Most Related Pairs (Source -> Target) ---")
+    gene_names = adata_train.var_names
+    for i in range(5):
+        target_gene = gene_names[row_indices[i]]
+        source_gene = gene_names[col_indices[i]]
+        print(f"  1. {source_gene} -> {target_gene} (Score: {top_vals[i]:.4f})")
+        
+    # --- Effectiveness Head Diagnostics ---
+    all_embs = model.shared_embedding.weight
+    effectiveness = model.effectiveness_head(all_embs).squeeze()
+    print("\n--- Knockdown Effectiveness Head ---")
+    print(f"  - Mean predicted alpha: {effectiveness.mean().item():.3f}")
+    print(f"  - Min predicted alpha:  {effectiveness.min().item():.3f}")
+    print(f"  - Max predicted alpha:  {effectiveness.max().item():.3f}")
+    print("="*25 + "\n")
+
 def run_causal_gnn_flow(args, adata_train: ad.AnnData, adata_test: ad.AnnData):
     """Orchestrates the training and prediction for the CausalGNN model."""
     if not args.use_pseudobulk:
@@ -205,7 +280,9 @@ def run_causal_gnn_flow(args, adata_train: ad.AnnData, adata_test: ad.AnnData):
     ).to(args.device)
     
     model = train_causal_gnn(delta_vectors, pert_indices, control_vec_tensor, model, args)
-    
+
+    print_causal_gnn_diagnostics(model, adata_train, args)
+
     if adata_test is not None:
         pred_bundle = predict_with_causal_gnn(model, adata_train, adata_test, args)
         
