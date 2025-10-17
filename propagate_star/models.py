@@ -1,5 +1,3 @@
-# In masked_main.py, after write_influence_scores_csv()
-
 import argparse, math, os
 import numpy as np
 import pandas as pd
@@ -14,7 +12,6 @@ import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 
 from utils import to_numpy
-from masked_main import write_influence_scores_csv
 
 
 class CausalGNN(nn.Module):
@@ -45,6 +42,8 @@ class CausalGNN(nn.Module):
             nn.Sigmoid()
         )
 
+# In your models.py file, replace the forward method in the CausalGNN class
+
     def forward(self, pert_idx: torch.Tensor) -> torch.Tensor:
         """
         Predicts the full delta vector by simulating effect propagation.
@@ -58,48 +57,39 @@ class CausalGNN(nn.Module):
         B = pert_idx.shape[0]
         device = pert_idx.device
 
-        # --- Efficiently compute the (G, G) Relatedness Matrix ---
-        # This matrix is shared across all samples in the batch.
+        # --- Compute the (G, G) Relatedness Matrix (same as before) ---
         all_embeddings = self.shared_embedding.weight
         G, D = all_embeddings.shape
-
-        # Create all G*G source-target embedding pairs
-        source_embs = all_embeddings.repeat(G, 1) # Repeats the whole block G times
-        target_embs = all_embeddings.repeat_interleave(G, dim=0) # Repeats each element G times
-        
-        # Shape: (G*G, 2*D)
+        source_embs = all_embeddings.repeat(G, 1)
+        target_embs = all_embeddings.repeat_interleave(G, dim=0)
         embedding_pairs = torch.cat([source_embs, target_embs], dim=1)
-        
-        # Compute scores and reshape into a matrix
         relatedness_scores = self.relatedness_mlp(embedding_pairs)
-        # R_ij is the relatedness of source j to target i
         R = relatedness_scores.view(G, G)
 
-        # --- Initialize the Propagation State ---
-        # delta_state tracks the accumulated effect on each gene over time
+        # This tensor will accumulate the total effects over time
         delta_state = torch.zeros(B, G, device=device)
         
-        # Apply the initial perturbation effect (e.g., knockdown)
-        initial_effect = torch.full((B, 1), -1.0, device=device)
-        delta_state.scatter_(1, pert_idx.unsqueeze(1), initial_effect)
+        # This tensor represents the "wave" of new effects to be propagated at each step
+        updates = torch.zeros(B, G, device=device)
         
-        # last_delta_state is used to calculate the "new" signal at each step
-        last_delta_state = delta_state.clone()
+        # The initial "wave" is just the direct perturbation effect
+        initial_effect = torch.full((B, 1), -1.0, device=device)
+        updates.scatter_(1, pert_idx.unsqueeze(1), initial_effect)
+        
+        # Add the initial direct effect to the total state
+        delta_state = delta_state + updates
 
         # --- Run the Propagation Loop ---
         for _ in range(self.num_steps):
-            # The "update" is the new signal from the last step's changes
-            updates = delta_state - last_delta_state
-            last_delta_state = delta_state.clone()
-
-            # Propagate messages: new_effects = R @ updates
-            # R has shape (G, G), updates has shape (B, G)
-            # We need to compute this for each item in the batch.
-            # R @ updates.T results in (G, B), which we transpose back.
+            # Propagate the most recent "wave" of effects
+            # R @ updates.T -> (G, B), so we transpose back
             messages = (R @ updates.t()).t()
-
-            # Update the state with the new messages, applying damping
+            
+            # Apply damping and add the new indirect effects to the total state
             delta_state = delta_state + self.damping_factor * messages
+            
+            # The new "wave" for the next step is the messages we just calculated
+            updates = self.damping_factor * messages
             
         return delta_state
 
@@ -270,11 +260,11 @@ def run_mlp_autoencoder_flow(args, adata_train: ad.AnnData):
             num_perts=len(pert_labels),
             device=args.device
         )
-        write_influence_scores_csv(
-            influence_matrix=mlp_influence_matrix,
-            adata=adata_train,
-            output_path=args.out_influence_csv
-        )
+        # write_influence_scores_csv(
+        #     influence_matrix=mlp_influence_matrix,
+        #     adata=adata_train,
+        #     output_path=args.out_influence_csv
+        # )
     return model
 
 def compute_mlp_influence_matrix(

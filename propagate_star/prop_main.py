@@ -209,6 +209,11 @@ def run_causal_gnn_flow(args, adata_train: ad.AnnData, adata_test: ad.AnnData):
                 target_label=args.target_label,
                 control_label=args.control_label,
             )
+    
+    if args.eval_on_train:
+        print("\n=== Evaluation on Training Set ===")
+        pred_bundle_train = predict_with_causal_gnn(model, adata_train, adata_train, args)
+        evaluate_model(adata=adata_train, args=args, pred_bundle=pred_bundle_train)
 
 
 class LinearReconstructor(torch.nn.Module):
