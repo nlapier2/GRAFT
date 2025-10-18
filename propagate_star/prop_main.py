@@ -319,9 +319,9 @@ def run_causal_gnn_flow(args, adata_train: ad.AnnData, adata_test: ad.AnnData):
     
     model = train_causal_gnn(delta_vectors, pert_indices, control_vec_tensor, model, args)
 
-    print_causal_gnn_diagnostics(model, adata_train, args)
-    if args.out_relatedness_csv:
-            write_relatedness_csv(model, adata_train, args.out_relatedness_csv)
+    # print_causal_gnn_diagnostics(model, adata_train, args)
+    # if args.out_relatedness_csv:
+    #         write_relatedness_csv(model, adata_train, args.out_relatedness_csv)
 
     if adata_test is not None:
         pred_bundle = predict_with_causal_gnn(model, adata_train, adata_test, args)

@@ -16,11 +16,8 @@ from utils import to_numpy
 
 class CausalGNN(nn.Module):
     """
-    A GNN that simulates the step-by-step propagation of a perturbation's effects.
-
-    The model learns a single "relatedness" function (MLP) that determines the
-    influence of a source gene on a target gene based on their shared embeddings.
-    This creates a coherent and causally-constrained prediction mechanism.
+    A GNN that simulates effect propagation using a dynamic, dot-product
+    attention mechanism to compute context-aware gene relatedness.
     """
     def __init__(self, num_genes: int, embed_dim: int, hidden_dim: int,
                  num_steps: int, damping_factor: float = 1.0):
@@ -28,77 +25,78 @@ class CausalGNN(nn.Module):
         self.num_genes = num_genes
         self.num_steps = num_steps
         self.damping_factor = damping_factor
+        self.embed_dim = embed_dim
 
-        # 1. Shared embeddings for all genes in the dataset
+        # Shared embeddings for all genes in the dataset
         self.shared_embedding = nn.Embedding(num_genes, embed_dim)
 
-        # 2. A small, shared MLP to compute a "relatedness" score
-        #    Input: Concatenated embeddings of a (source, target) gene pair
-        #    Output: A single score in [0, 1]
-        self.relatedness_mlp = nn.Sequential(
-            nn.Linear(2 * embed_dim, hidden_dim),
+        # Head to predict gene-specific knockdown effectiveness
+        self.effectiveness_head = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
             nn.Sigmoid()
         )
 
-        # MLP to learn perturbation effectiveness
-        self.effectiveness_head = nn.Sequential(
-            nn.Linear(embed_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid() # Output a value between 0 and 1 (knockdown percentage)
-        )
-
+        # --- NEW: Linear layers for Query and Key projections ---
+        # The input to these will be the gene's contextual state (embedding + delta)
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.message_proj = nn.Linear(embed_dim, 1, bias=False)
 
     def forward(self, pert_idx: torch.Tensor, control_expr_at_pert: torch.Tensor) -> torch.Tensor:
-            """
-            Predicts the full delta vector by simulating effect propagation.
+        """
+        Predicts the full delta vector by simulating effect propagation with attention.
+        """
+        B = pert_idx.shape[0]
+        device = pert_idx.device
+        G = self.num_genes
+        D = self.embed_dim
 
-            Args:
-                pert_idx: (B,) tensor with indices of the perturbed genes.
-                control_expr_at_pert: (B,) tensor with the control expression
-                                    of the specific gene being perturbed.
-            """
-            B = pert_idx.shape[0]
-            device = pert_idx.device
+        # --- Initial State Calculation (same as before) ---
+        pert_emb = self.shared_embedding(pert_idx)
+        knockdown_alpha = self.effectiveness_head(pert_emb).squeeze(-1)
+        initial_effect = -knockdown_alpha * control_expr_at_pert
 
-            # ... (Relatedness Matrix calculation remains the same) ...
-            all_embeddings = self.shared_embedding.weight
-            G, D = all_embeddings.shape
-            source_embs = all_embeddings.repeat(G, 1)
-            target_embs = all_embeddings.repeat_interleave(G, dim=0)
-            embedding_pairs = torch.cat([source_embs, target_embs], dim=1)
-            relatedness_scores = self.relatedness_mlp(embedding_pairs)
-            R = relatedness_scores.view(G, G)
+        delta_state = torch.zeros(B, G, device=device)
+        updates = torch.zeros(B, G, device=device)
+        updates.scatter_(1, pert_idx.unsqueeze(1), initial_effect.unsqueeze(1))
+        delta_state = delta_state + updates
+        
+        # Expand embeddings for batch operations
+        all_embeddings = self.shared_embedding.weight.unsqueeze(0).expand(B, -1, -1)
 
-            # --- Calculate the initial perturbation effect ---
-            # Get the embedding for the perturbed gene
-            pert_emb = self.shared_embedding(pert_idx)
-            
-            # Predict the knockdown effectiveness (alpha)
-            knockdown_alpha = self.effectiveness_head(pert_emb).squeeze(-1) # Shape: (B,)
-            
-            # Calculate the initial effect: knockdown % * baseline expression
-            # The effect is negative for knockdown.
-            initial_effect = -knockdown_alpha * control_expr_at_pert
+        # --- Propagation Loop with Dynamic Attention ---
+        for _ in range(self.num_steps):
+            # 1. Create a contextual state representation for each gene
+            # Combine the gene's fixed identity (embedding) with its dynamic state (delta)
+            # Shape: (B, G, D)
+            current_state_repr = all_embeddings + delta_state.unsqueeze(-1)
 
-            # --- Initialize the Propagation State ---
-            delta_state = torch.zeros(B, G, device=device)
-            updates = torch.zeros(B, G, device=device)
+            # 2. Project to Query, Key, and VALUE vectors
+            Q = self.q_proj(current_state_repr)
+            K = self.k_proj(current_state_repr)
+            # V represents the learnable MESSAGE each gene sends out
+            V = self.v_proj(current_state_repr)
+
+            # 3. Calculate attention scores and weights
+            attn_scores = (Q @ K.transpose(-2, -1)) / math.sqrt(D)
+            attn_weights = torch.softmax(attn_scores, dim=-1)
+
+            # 4. Aggregate the high-dimensional Value vectors using attention
+            # attn_weights @ V -> (B, G, G) @ (B, G, D) -> (B, G, D)
+            messages_high_dim = attn_weights @ V
+
+            # 5. Project the high-dimensional messages down to a 1D update signal
+            # (B, G, D) -> (B, G, 1) -> (B, G)
+            messages_1d = self.message_proj(messages_high_dim).squeeze(-1)
+
+            # 6. Update state and set the new "wave"
+            delta_state = delta_state + self.damping_factor * messages_1d
+            updates = self.damping_factor * messages_1d
             
-            # The initial "wave" is the calculated effect
-            updates.scatter_(1, pert_idx.unsqueeze(1), initial_effect.unsqueeze(1))
-            
-            delta_state = delta_state + updates
-            
-            # --- Run the Propagation Loop (same as before) ---
-            for _ in range(self.num_steps):
-                messages = (R @ updates.t()).t()
-                delta_state = delta_state + self.damping_factor * messages
-                updates = self.damping_factor * messages
-                
-            return delta_state
+        return delta_state
 
 class PerturbationAutoencoder(torch.nn.Module):
     """
