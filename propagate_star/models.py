@@ -45,58 +45,70 @@ class CausalGNN(nn.Module):
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.message_proj = nn.Linear(embed_dim, 1, bias=False)
 
-    def forward(self, pert_idx: torch.Tensor, control_expr_at_pert: torch.Tensor) -> torch.Tensor:
-        """
-        Predicts the full delta vector by simulating effect propagation with attention.
-        """
-        B = pert_idx.shape[0]
-        device = pert_idx.device
-        G = self.num_genes
-        D = self.embed_dim
-
-        # --- Initial State Calculation (same as before) ---
-        pert_emb = self.shared_embedding(pert_idx)
-        knockdown_alpha = self.effectiveness_head(pert_emb).squeeze(-1)
-        initial_effect = -knockdown_alpha * control_expr_at_pert
-
-        delta_state = torch.zeros(B, G, device=device)
-        updates = torch.zeros(B, G, device=device)
-        updates.scatter_(1, pert_idx.unsqueeze(1), initial_effect.unsqueeze(1))
-        delta_state = delta_state + updates
+        # The GRUCell will update the multi-dimensional hidden state of each gene
+        self.gru_cell = nn.GRUCell(input_size=embed_dim, hidden_size=embed_dim)
         
-        # Expand embeddings for batch operations
-        all_embeddings = self.shared_embedding.weight.unsqueeze(0).expand(B, -1, -1)
+        # The readout head projects the final hidden state to a 1D delta value
+        self.readout_head = nn.Linear(embed_dim, 1)
 
-        # --- Propagation Loop with Dynamic Attention ---
-        for _ in range(self.num_steps):
-            # 1. Create a contextual state representation for each gene
-            # Combine the gene's fixed identity (embedding) with its dynamic state (delta)
-            # Shape: (B, G, D)
-            current_state_repr = all_embeddings + delta_state.unsqueeze(-1)
+    def forward(self, pert_idx: torch.Tensor, control_expr_at_pert: torch.Tensor) -> torch.Tensor:
+            """
+            Predicts the full delta vector by simulating effect propagation with attention and GRU.
+            """
+            B = pert_idx.shape[0]
+            device = pert_idx.device
+            G = self.num_genes
+            D = self.embed_dim
 
-            # 2. Project to Query, Key, and VALUE vectors
-            Q = self.q_proj(current_state_repr)
-            K = self.k_proj(current_state_repr)
-            # V represents the learnable MESSAGE each gene sends out
-            V = self.v_proj(current_state_repr)
-
-            # 3. Calculate attention scores and weights
-            attn_scores = (Q @ K.transpose(-2, -1)) / math.sqrt(D)
-            attn_weights = torch.softmax(attn_scores, dim=-1)
-
-            # 4. Aggregate the high-dimensional Value vectors using attention
-            # attn_weights @ V -> (B, G, G) @ (B, G, D) -> (B, G, D)
-            messages_high_dim = attn_weights @ V
-
-            # 5. Project the high-dimensional messages down to a 1D update signal
-            # (B, G, D) -> (B, G, 1) -> (B, G)
-            messages_1d = self.message_proj(messages_high_dim).squeeze(-1)
-
-            # 6. Update state and set the new "wave"
-            delta_state = delta_state + self.damping_factor * messages_1d
-            updates = self.damping_factor * messages_1d
+            # --- Initial State Calculation ---
+            pert_emb = self.shared_embedding(pert_idx)
+            knockdown_alpha = self.effectiveness_head(pert_emb).squeeze(-1)
+            initial_effect_scalar = -knockdown_alpha * control_expr_at_pert
             
-        return delta_state
+            # The initial state is zero for all genes except the perturbed one.
+            # The perturbed gene's state is its scaled embedding.
+            hidden_state = torch.zeros(B, G, D, device=device)
+            # Scale the embedding by the initial effect scalar
+            initial_state = pert_emb * initial_effect_scalar.unsqueeze(-1)
+            hidden_state.scatter_(1, pert_idx.view(B, 1, 1).expand(-1, -1, D), initial_state.unsqueeze(1))
+
+            all_embeddings = self.shared_embedding.weight.unsqueeze(0).expand(B, -1, -1)
+
+            # --- Propagation Loop with GRU Update ---
+            for _ in range(self.num_steps):
+                # 1. Create a contextual state representation
+                # Combine the gene's fixed identity (embedding) with its dynamic hidden state
+                current_state_repr = all_embeddings + hidden_state
+
+                # 2. Project to Q, K, V for attention
+                Q = self.q_proj(current_state_repr)
+                K = self.k_proj(current_state_repr)
+                V = self.v_proj(current_state_repr)
+
+                # 3. Calculate attention weights and aggregate messages
+                attn_scores = (Q @ K.transpose(-2, -1)) / math.sqrt(D)
+                attn_weights = torch.softmax(attn_scores, dim=-1)
+                messages = attn_weights @ V # Shape: (B, G, D)
+
+                # We apply damping to the incoming messages before the GRU update
+                damped_messages = messages * self.damping_factor
+                
+                # The GRUCell expects inputs of shape (num_samples, input_dim),
+                # so we reshape our tensors.
+                # (B, G, D) -> (B*G, D)
+                new_hidden_state = self.gru_cell(
+                    damped_messages.reshape(-1, D),
+                    hidden_state.reshape(-1, D)
+                )
+                
+                # Reshape back to (B, G, D)
+                hidden_state = new_hidden_state.view(B, G, D)
+                
+            # --- Final Readout ---
+            # After all propagation steps, project the final hidden state to a 1D delta
+            final_delta_state = self.readout_head(hidden_state).squeeze(-1)
+                
+            return final_delta_state
 
 class PerturbationAutoencoder(torch.nn.Module):
     """
