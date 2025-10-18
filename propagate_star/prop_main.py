@@ -29,6 +29,8 @@ def parse_arguments():
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--out_influence_csv", type=str, default="",
                     help="If set, write a CSV with directed influence scores for each gene pair.")
+    ap.add_argument("--out_relatedness_csv", type=str, default="",
+                        help="If set, write the CausalGNN's full (G,G) relatedness matrix to a CSV.")
     
     # masked model options
     ap.add_argument("--model_type", type=str, default="linear_mgm", 
@@ -252,6 +254,42 @@ def print_causal_gnn_diagnostics(
     print(f"  - Max predicted alpha:  {effectiveness.max().item():.3f}")
     print("="*25 + "\n")
 
+@torch.no_grad()
+def write_relatedness_csv(
+    model: 'CausalGNN',
+    adata: ad.AnnData,
+    output_path: str,
+):
+    """
+    Computes the full (G, G) relatedness matrix from the CausalGNN
+    and saves it to a pandas-readable CSV file.
+    """
+    print(f"\n💾 Writing full relatedness matrix to {output_path}...")
+    model.eval()
+
+    # Re-compute the (G, G) relatedness matrix R
+    all_embeddings = model.shared_embedding.weight
+    G, D = all_embeddings.shape
+    source_embs = all_embeddings.repeat(G, 1)
+    target_embs = all_embeddings.repeat_interleave(G, dim=0)
+    embedding_pairs = torch.cat([source_embs, target_embs], dim=1)
+    relatedness_scores = model.relatedness_mlp(embedding_pairs)
+    R = relatedness_scores.view(G, G) # R_ij is relatedness of source j to target i
+
+    # Convert to a labeled pandas DataFrame
+    R_numpy = R.cpu().numpy()
+    df = pd.DataFrame(
+        R_numpy,
+        index=adata.var_names,   # Rows are targets
+        columns=adata.var_names, # Columns are sources
+    )
+    df.index.name = "TargetGene"
+    df.columns.name = "SourceGene"
+
+    # Save to CSV
+    df.to_csv(output_path)
+    print(f"   ...Done. Matrix of shape {df.shape} saved.")
+
 def run_causal_gnn_flow(args, adata_train: ad.AnnData, adata_test: ad.AnnData):
     """Orchestrates the training and prediction for the CausalGNN model."""
     if not args.use_pseudobulk:
@@ -282,6 +320,8 @@ def run_causal_gnn_flow(args, adata_train: ad.AnnData, adata_test: ad.AnnData):
     model = train_causal_gnn(delta_vectors, pert_indices, control_vec_tensor, model, args)
 
     print_causal_gnn_diagnostics(model, adata_train, args)
+    if args.out_relatedness_csv:
+            write_relatedness_csv(model, adata_train, args.out_relatedness_csv)
 
     if adata_test is not None:
         pred_bundle = predict_with_causal_gnn(model, adata_train, adata_test, args)
