@@ -86,6 +86,30 @@ def calculate_reconstruction_r2(model, dataloader, device):
     print(f"\n--- Validation Metric: Reconstruction R^2 ---")
     print(f"Mean R^2 (variance-weighted): {r2:.4f}")
 
+def calculate_pseudobulk_r2(model, dataloader, device):
+    """Calculates the R^2 score on the pseudobulked profiles."""
+    model.eval()
+    all_original = []
+    all_reconstructed = []
+    with torch.no_grad():
+        for data_batch, in dataloader:
+            data_batch = data_batch.to(device)
+            x_hat, _, _ = model(data_batch)
+            all_original.append(data_batch.cpu().numpy())
+            all_reconstructed.append(x_hat.cpu().numpy())
+    
+    # Create full matrices from batches
+    original_matrix = np.concatenate(all_original, axis=0)
+    reconstructed_matrix = np.concatenate(all_reconstructed, axis=0)
+    
+    # Create pseudobulk profiles by summing over cells
+    original_pseudobulk = original_matrix.sum(axis=0)
+    reconstructed_pseudobulk = reconstructed_matrix.sum(axis=0)
+    
+    # Calculate R^2 on the pseudobulk vectors
+    r2 = r2_score(original_pseudobulk, reconstructed_pseudobulk)
+    print(f"Pseudobulk R^2: {r2:.4f}")
+
 def plot_latent_umap(model, dataloader, device, plot_file):
     """
     Generates a UMAP comparing the latent space of original vs. reconstructed data.
@@ -242,6 +266,7 @@ def main(args):
     # --- 1.3: Validation Metrics ---
     # Use the validation set for R^2 calculation
     calculate_reconstruction_r2(model, val_loader, DEVICE)
+    calculate_pseudobulk_r2(model, val_loader, DEVICE)
     
     # Use the validation set for UMAP visualization
     plot_latent_umap(model, val_loader, DEVICE, args.umap_plot_file)
