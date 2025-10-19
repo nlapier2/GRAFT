@@ -11,7 +11,7 @@ import os
 import pandas as pd
 from sklearn.metrics import r2_score
 
-from models import VAE, FlowModel
+from models import *
 
 def vae_loss_function(x_hat, x, mu, log_var, beta):
     """
@@ -162,10 +162,10 @@ def main(args):
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, num_workers=4, pin_memory=True)
 
-    # --- 1.2: VAE Training ---
-    print("\n--- Phase 1.2: Training VAE ---")
+    # --- 2.1: VAE + Flow Model Training ---
+    print("\n--- Phase 2.1: Training VAE + Flow Model ---")
     n_genes = data_tensor.shape[1]
-    model = VAE(n_genes=n_genes, n_latent=args.n_latent, n_hidden=args.n_hidden).to(DEVICE)
+    model = VAEFlowModel(n_genes=n_genes, n_latent=args.n_latent, n_hidden=args.n_hidden).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     train_losses = []
@@ -175,37 +175,62 @@ def main(args):
         # --- Training Step ---
         model.train()
         running_train_loss = 0.0
+        running_train_vae_loss = 0.0
+        running_train_flow_loss = 0.0
         for data_batch, in train_loader:
             data_batch = data_batch.to(DEVICE)
 
             # Forward pass
             x_hat, mu, log_var = model(data_batch)
-            loss = vae_loss_function(x_hat, data_batch, mu, log_var, args.beta)
+
+            # Calculate individual losses
+            vae_loss = calculate_vae_loss(x_hat, data_batch, mu, log_var, args.beta)
+            # We use mu as z1, the stable center of the encoded distribution
+            flow_loss = calculate_flow_matching_loss(model.flow_model, mu)
+
+            # Combine into a single loss
+            total_loss = calculate_composite_loss(vae_loss, flow_loss, args.gamma)
 
             # Backward pass and optimization
             optimizer.zero_grad()
-            loss.backward()
+            total_loss.backward()
             optimizer.step()
 
-            running_train_loss += loss.item()
+            running_train_loss += total_loss.item()
+            running_train_vae_loss += vae_loss.item()
+            running_train_flow_loss += flow_loss.item()
 
         avg_train_loss = running_train_loss / len(train_loader)
+        avg_train_vae_loss = running_train_vae_loss / len(train_loader)
+        avg_train_flow_loss = running_train_flow_loss / len(train_loader)
         train_losses.append(avg_train_loss)
 
         # --- Validation Step ---
         model.eval()
         running_val_loss = 0.0
+        running_val_vae_loss = 0.0
+        running_val_flow_loss = 0.0
         with torch.no_grad():
             for data_batch, in val_loader:
                 data_batch = data_batch.to(DEVICE)
                 x_hat, mu, log_var = model(data_batch)
-                loss = vae_loss_function(x_hat, data_batch, mu, log_var, args.beta)
-                running_val_loss += loss.item()
+
+                # Calculate individual losses for validation
+                vae_loss = calculate_vae_loss(x_hat, data_batch, mu, log_var, args.beta)
+                flow_loss = calculate_flow_matching_loss(model.flow_model, mu)
+                total_loss = calculate_composite_loss(vae_loss, flow_loss, args.gamma)
+
+                running_val_loss += total_loss.item()
+                running_val_vae_loss += vae_loss.item()
+                running_val_flow_loss += flow_loss.item()
 
         avg_val_loss = running_val_loss / len(val_loader)
+        avg_val_vae_loss = running_val_vae_loss / len(val_loader)
+        avg_val_flow_loss = running_val_flow_loss / len(val_loader)
         val_losses.append(avg_val_loss)
 
-        print(f"Epoch [{epoch+1}/{args.epochs}], Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        print(f"Epoch [{epoch+1}/{args.epochs}], Train Total: {avg_train_loss:.4f} (VAE: {avg_train_vae_loss:.4f}, Flow: {avg_train_flow_loss:.4f}), "
+              f"Val Total: {avg_val_loss:.4f} (VAE: {avg_val_vae_loss:.4f}, Flow: {avg_val_flow_loss:.4f})")
 
     # --- Plotting and Saving Loss Curves ---
     print(f"\nTraining complete. Saving loss curves to '{args.plot_file}'...")
@@ -248,7 +273,8 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size for training.')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate for the Adam optimizer.')
     parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs.')
-    parser.add_argument('--beta', type=float, default=0.0005, help='Weight for the KL divergence term in the VAE loss.')
-    
+    parser.add_argument('--beta', type=float, default=1e-5, help='Weight for the KL divergence term in the VAE loss.')
+    parser.add_argument('--gamma', type=float, default=1.0, help='Weight for the Flow Matching loss term.')
+
     args = parser.parse_args()
     main(args)
