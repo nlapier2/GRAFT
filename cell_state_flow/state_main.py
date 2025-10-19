@@ -1,3 +1,5 @@
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,6 +12,8 @@ import argparse
 import os
 import pandas as pd
 from sklearn.metrics import r2_score
+from torchdiffeq import odeint
+from scipy.stats import pearsonr
 
 from models import *
 
@@ -112,6 +116,64 @@ def plot_latent_umap(model, dataloader, device, plot_file):
     plt.savefig(plot_file)
     plt.close(fig)
     print(f"UMAP plot saved to '{plot_file}'")
+
+def generate_samples(model, n_samples, device):
+    """Generates new cell samples using the trained flow model."""
+    model.eval()
+    with torch.no_grad():
+        # 1. Sample z0 from the prior (Gaussian noise)
+        # Infer n_latent from the model architecture
+        n_latent = model.flow_model.net[0].in_features - model.flow_model.time_embed.dim
+        z0 = torch.randn(n_samples, n_latent).to(device)
+
+        # Define the ODE function for the solver, which expects inputs (t, z)
+        def ode_func(t, z):
+            # Our model expects a batch of t values, so we expand the scalar t
+            t_batch = t.expand(z.size(0))
+            return model.flow_model(z, t_batch)
+
+        # 2. Integrate from t=0 to t=1 to generate z1
+        t_span = torch.tensor([0.0, 1.0], device=device)
+        z1 = odeint(ode_func, z0, t_span, method='dopri5')[1] # We only need the final state at t=1
+
+        # 3. Decode z1 to get the generated cell expression
+        x_fake = model.decoder(z1)
+
+    return x_fake.cpu().numpy()
+
+def validate_generative_quality(model, adata_control, device, plot_file):
+    """Performs visual and quantitative checks on the generative quality."""
+    print("\n--- Phase 2.2: Validating Generative Quality ---")
+    n_samples = adata_control.n_obs
+
+    # 1. Generate fake samples
+    fake_data = generate_samples(model, n_samples, device)
+
+    # 2. Visual Check: UMAP
+    if hasattr(adata_control.X, "toarray"):
+        real_data = adata_control.X.toarray()
+    else:
+        real_data = adata_control.X
+
+    combined_data = np.concatenate([real_data, fake_data], axis=0)
+    source_labels = ['Real'] * n_samples + ['Generated'] * n_samples
+    adata_combined = anndata.AnnData(combined_data, obs={'source': pd.Categorical(source_labels)})
+
+    sc.pp.neighbors(adata_combined, use_rep='X')
+    sc.tl.umap(adata_combined)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    sc.pl.umap(adata_combined, color='source', ax=ax, show=False, title="Generative Quality: Real vs. Generated Cells")
+    plt.tight_layout()
+    plt.savefig(plot_file)
+    plt.close(fig)
+    print(f"Generative UMAP plot saved to '{plot_file}'")
+
+    # 3. Quantitative Check: Gene-Gene Correlation
+    real_corr = np.corrcoef(real_data, rowvar=False)
+    fake_corr = np.corrcoef(fake_data, rowvar=False)
+    corr_score, _ = pearsonr(real_corr[np.triu_indices_from(real_corr, k=1)], fake_corr[np.triu_indices_from(fake_corr, k=1)])
+    print(f"Gene-Gene Correlation Score (Pearson R): {corr_score:.4f}")
 
 def main(args):
     """
@@ -252,7 +314,10 @@ def main(args):
     
     # Use the validation set for UMAP visualization
     plot_latent_umap(model, val_loader, DEVICE, args.umap_plot_file)
-    
+
+    # --- 2.2: Generative Quality Validation ---
+    validate_generative_quality(model, control_adata, DEVICE, args.generative_plot_file)
+
     print("Done.")
 
 
@@ -265,6 +330,7 @@ if __name__ == '__main__':
     # Optional Arguments
     parser.add_argument('--plot_file', type=str, default='loss_curves.png', help='Path to save the output loss curve plot.')
     parser.add_argument('--umap_plot_file', type=str, default='umap.png', help='Path to save the output UMAP plot.')
+    parser.add_argument('--generative_plot_file', type=str, default='generative_umap.png', help='Path to save the generative quality UMAP plot.')
     parser.add_argument('--target_label', type=str, default='target_gene', help='The column name in adata.obs that contains perturbation information.')
     parser.add_argument('--control_label', type=str, default='non-targeting', help='The value in the target_label column that indicates a control cell.')
     parser.add_argument('--train_split', type=float, default=0.8, help='Fraction of the data to use for the training set.')
