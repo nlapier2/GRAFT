@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import argparse
 import os
 import pandas as pd
+from sklearn.metrics import r2_score
 
 # --- 1.2: VAE Model Architecture ---
 
@@ -65,6 +66,71 @@ def vae_loss_function(x_hat, x, mu, log_var, beta):
     kl_divergence /= x.size(0)
 
     return reconstruction_loss + beta * kl_divergence
+
+def calculate_reconstruction_r2(model, dataloader, device):
+    """Calculates the gene-wise R^2 score for the model's reconstructions."""
+    model.eval()
+    all_original = []
+    all_reconstructed = []
+    with torch.no_grad():
+        for data_batch, in dataloader:
+            data_batch = data_batch.to(device)
+            x_hat, _, _ = model(data_batch)
+            all_original.append(data_batch.cpu().numpy())
+            all_reconstructed.append(x_hat.cpu().numpy())
+    
+    original_matrix = np.concatenate(all_original, axis=0)
+    reconstructed_matrix = np.concatenate(all_reconstructed, axis=0)
+    
+    r2 = r2_score(original_matrix, reconstructed_matrix, multioutput='variance_weighted')
+    print(f"\n--- Validation Metric: Reconstruction R^2 ---")
+    print(f"Mean R^2 (variance-weighted): {r2:.4f}")
+
+def plot_latent_umap(model, dataloader, device, plot_file):
+    """
+    Generates a UMAP comparing the latent space of original vs. reconstructed data.
+    """
+    model.eval()
+    print(f"\n--- Validation Plot: Generating UMAP ---")
+    all_original_z = []
+    all_reconstructed_z = []
+    
+    with torch.no_grad():
+        for data_batch, in dataloader:
+            data_batch = data_batch.to(device)
+            
+            # Get reconstructions
+            x_hat, _, _ = model(data_batch)
+            
+            # Encode original and reconstructed data to get their latent representations
+            mu_original, _ = torch.chunk(model.encoder(data_batch), 2, dim=-1)
+            mu_reconstructed, _ = torch.chunk(model.encoder(x_hat), 2, dim=-1)
+            
+            all_original_z.append(mu_original.cpu().numpy())
+            all_reconstructed_z.append(mu_reconstructed.cpu().numpy())
+
+    # Concatenate all batches
+    original_z = np.concatenate(all_original_z, axis=0)
+    reconstructed_z = np.concatenate(all_reconstructed_z, axis=0)
+    
+    # Combine for UMAP
+    combined_z = np.concatenate([original_z, reconstructed_z], axis=0)
+    
+    # Create an anndata object for UMAP
+    n_obs = original_z.shape[0]
+    source_labels = ['Original'] * n_obs + ['Reconstructed'] * n_obs
+    latent_adata = anndata.AnnData(combined_z, obs={'source': pd.Categorical(source_labels)})
+
+    # Compute and plot UMAP
+    sc.pp.neighbors(latent_adata, use_rep='X')
+    sc.tl.umap(latent_adata)
+    
+    fig, ax = plt.subplots(figsize=(8, 6))
+    sc.pl.umap(latent_adata, color='source', ax=ax, show=False, title="Latent Space UMAP: Original vs. Reconstructed")
+    plt.tight_layout()
+    plt.savefig(plot_file)
+    plt.close(fig)
+    print(f"UMAP plot saved to '{plot_file}'")
 
 def main(args):
     """
@@ -172,6 +238,14 @@ def main(args):
     plt.grid(True)
     plt.savefig(args.plot_file)
     plt.close()
+
+    # --- 1.3: Validation Metrics ---
+    # Use the validation set for R^2 calculation
+    calculate_reconstruction_r2(model, val_loader, DEVICE)
+    
+    # Use the validation set for UMAP visualization
+    plot_latent_umap(model, val_loader, DEVICE, args.umap_plot_file)
+    
     print("Done.")
 
 
@@ -183,6 +257,7 @@ if __name__ == '__main__':
     
     # Optional Arguments
     parser.add_argument('--plot_file', type=str, default='loss_curves.png', help='Path to save the output loss curve plot.')
+    parser.add_argument('--umap_plot_file', type=str, default='umap.png', help='Path to save the output UMAP plot.')
     parser.add_argument('--target_label', type=str, default='target_gene', help='The column name in adata.obs that contains perturbation information.')
     parser.add_argument('--control_label', type=str, default='non-targeting', help='The value in the target_label column that indicates a control cell.')
     parser.add_argument('--train_split', type=float, default=0.8, help='Fraction of the data to use for the training set.')
