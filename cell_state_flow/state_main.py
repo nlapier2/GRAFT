@@ -11,50 +11,7 @@ import os
 import pandas as pd
 from sklearn.metrics import r2_score
 
-# --- 1.2: VAE Model Architecture ---
-
-class VAE(nn.Module):
-    """A Variational Autoencoder implemented in vanilla PyTorch."""
-    def __init__(self, n_genes, n_latent=128, n_hidden=512):
-        super(VAE, self).__init__()
-
-        # Encoder
-        self.encoder = nn.Sequential(
-            nn.Linear(n_genes, n_hidden),
-            nn.ReLU(),
-            nn.Linear(n_hidden, n_latent * 2) # Outputs mu and log_var
-        )
-
-        # Decoder
-        self.decoder = nn.Sequential(
-            nn.Linear(n_latent, n_hidden),
-            nn.ReLU(),
-            nn.Linear(n_hidden, n_genes)
-        )
-
-    def reparameterize(self, mu, log_var):
-        """
-        Performs the reparameterization trick to allow for backpropagation.
-        """
-        std = torch.exp(0.5 * log_var)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-    def forward(self, x):
-        """
-        Defines the forward pass of the VAE.
-        """
-        # Encode
-        encoded = self.encoder(x)
-        mu, log_var = torch.chunk(encoded, 2, dim=-1)
-
-        # Reparameterize
-        z = self.reparameterize(mu, log_var)
-
-        # Decode
-        x_hat = self.decoder(z)
-
-        return x_hat, mu, log_var
+from models import VAE, FlowModel
 
 def vae_loss_function(x_hat, x, mu, log_var, beta):
     """
