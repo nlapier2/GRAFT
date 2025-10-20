@@ -291,6 +291,51 @@ def plot_latent_generative_umap(model, dataloader, device, plot_file):
     plt.close(fig)
     print(f"Latent generative UMAP plot saved to '{plot_file}'")
 
+def test_decoder_sensitivity(model, dataloader, device, noise_level=0.1):
+    """
+    Temporary diagnostic test to check the decoder's sensitivity to small
+    perturbations in the latent space.
+    """
+    model.eval()
+    print(f"\n--- Diagnostic Test: Decoder Sensitivity (Noise Level: {noise_level}) ---")
+    all_decoded_real = []
+    all_decoded_noisy = []
+
+    with torch.no_grad():
+        for data_batch, in dataloader:
+            data_batch = data_batch.to(device)
+
+            # 1. Encode real data to get the "on-manifold" latent representation
+            mu_real, _ = torch.chunk(model.encoder(data_batch), 2, dim=-1)
+
+            # 2. Create a slightly perturbed "off-manifold" version
+            noise = torch.randn_like(mu_real) * noise_level
+            mu_noisy = mu_real + noise
+
+            # 3. Decode both sets of latent vectors
+            x_decoded_real = model.decoder(mu_real)
+            x_decoded_noisy = model.decoder(mu_noisy)
+
+            all_decoded_real.append(x_decoded_real.cpu().numpy())
+            all_decoded_noisy.append(x_decoded_noisy.cpu().numpy())
+
+    decoded_real = np.concatenate(all_decoded_real, axis=0)
+    decoded_noisy = np.concatenate(all_decoded_noisy, axis=0)
+
+    combined_x = np.concatenate([decoded_real, decoded_noisy], axis=0)
+    source_labels = ['Decoded Real'] * len(decoded_real) + ['Decoded Noisy'] * len(decoded_noisy)
+    adata_sensitivity = anndata.AnnData(combined_x, obs={'source': pd.Categorical(source_labels)})
+
+    sc.pp.neighbors(adata_sensitivity, use_rep='X')
+    sc.tl.umap(adata_sensitivity)
+
+    plot_file = "decoder_sensitivity_umap.png"
+    fig, ax = plt.subplots(figsize=(8, 6))
+    sc.pl.umap(adata_sensitivity, color='source', ax=ax, show=False, title=f"Decoder Sensitivity Test (Noise Level: {noise_level})")
+    plt.savefig(plot_file)
+    plt.close(fig)
+    print(f"Decoder sensitivity UMAP plot saved to '{plot_file}'")
+
 def main(args):
     """
     Main function to run the VAE training pipeline.
@@ -445,6 +490,8 @@ def main(args):
     validate_generative_quality(model, control_adata, DEVICE, args.generative_plot_file)
     # Add the call to the new diagnostic plot function
     plot_latent_generative_umap(model, val_loader, DEVICE, args.latent_generative_plot_file)
+
+    test_decoder_sensitivity(model, val_loader, DEVICE, noise_level=0.1)
 
     print("Done.")
 
