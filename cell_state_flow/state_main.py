@@ -363,11 +363,14 @@ def main(args):
 
             # Calculate individual losses
             vae_loss = calculate_vae_loss(x_hat, data_batch, mu, log_var, args.beta)
-            # We use mu as z1, the stable center of the encoded distribution
-            flow_loss = calculate_flow_matching_loss(model.flow_model, mu)
-
-            # Combine into a single loss
-            total_loss = calculate_composite_loss(vae_loss, flow_loss, args.gamma)
+            if epoch < args.vae_warmup_epochs:
+                total_loss = vae_loss
+                flow_loss = torch.tensor(0.0) # For logging purposes
+            else:
+                # We use mu as z1, the stable center of the encoded distribution
+                flow_loss = calculate_flow_matching_loss(model.flow_model, mu)
+                # Combine into a single loss
+                total_loss = calculate_composite_loss(vae_loss, flow_loss, args.gamma)
 
             # Backward pass and optimization
             optimizer.zero_grad()
@@ -395,8 +398,12 @@ def main(args):
 
                 # Calculate individual losses for validation
                 vae_loss = calculate_vae_loss(x_hat, data_batch, mu, log_var, args.beta)
-                flow_loss = calculate_flow_matching_loss(model.flow_model, mu)
-                total_loss = calculate_composite_loss(vae_loss, flow_loss, args.gamma)
+                if epoch < args.vae_warmup_epochs:
+                    total_loss = vae_loss
+                    flow_loss = torch.tensor(0.0)
+                else:
+                    flow_loss = calculate_flow_matching_loss(model.flow_model, mu)
+                    total_loss = calculate_composite_loss(vae_loss, flow_loss, args.gamma)
 
                 running_val_loss += total_loss.item()
                 running_val_vae_loss += vae_loss.item()
@@ -407,7 +414,9 @@ def main(args):
         avg_val_flow_loss = running_val_flow_loss / len(val_loader)
         val_losses.append(avg_val_loss)
 
-        print(f"Epoch [{epoch+1}/{args.epochs}], Train Total: {avg_train_loss:.4f} (VAE: {avg_train_vae_loss:.4f}, Flow: {avg_train_flow_loss:.4f}), "
+        stage = "Warm-up" if epoch < args.vae_warmup_epochs else "Joint"
+        print(f"Epoch [{epoch+1}/{args.epochs}, {stage}], "
+              f"Train Total: {avg_train_loss:.4f} (VAE: {avg_train_vae_loss:.4f}, Flow: {avg_train_flow_loss:.4f}), "
               f"Val Total: {avg_val_loss:.4f} (VAE: {avg_val_vae_loss:.4f}, Flow: {avg_val_flow_loss:.4f})")
 
     # --- Plotting and Saving Loss Curves ---
@@ -460,6 +469,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size for training.')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate for the Adam optimizer.')
     parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs.')
+    parser.add_argument('--vae_warmup_epochs', type=int, default=25, help='Number of epochs to train only the VAE before joint training.')
     parser.add_argument('--beta', type=float, default=1e-5, help='Weight for the KL divergence term in the VAE loss.')
     parser.add_argument('--gamma', type=float, default=1.0, help='Weight for the Flow Matching loss term.')
 
