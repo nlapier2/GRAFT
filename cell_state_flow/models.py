@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from torchdiffeq import odeint
 
 class PositionalEmbedding(nn.Module):
     """Simple sinusoidal time embedding."""
@@ -163,3 +164,88 @@ def calculate_composite_loss(vae_loss, flow_loss, gamma):
     Combines the VAE and flow matching losses.
     """
     return vae_loss + gamma * flow_loss
+
+# --- The Main "Autoencoding Flow" Model ---
+
+class VAEFlowModel(nn.Module):
+    """
+    A joint model implementing the "Autoencoding Flow" objective.
+    The forward pass performs a full generation from noise to a reconstructed cell.
+    """
+    def __init__(self, n_genes, n_latent=128, n_hidden=512):
+        super().__init__()
+
+        # VAE Components
+        self.encoder = nn.Sequential(
+            nn.Linear(n_genes, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_latent * 2) # Outputs mu and log_var
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(n_latent, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_genes)
+        )
+        
+        # Flow Model Component
+        self.flow_model = FlowModel(n_latent, n_hidden)
+
+    def reparameterize(self, mu, log_var):
+        """Performs the reparameterization trick."""
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def forward(self, x, device):
+        """
+        Defines the full end-to-end forward pass for the Autoencoding Flow.
+        """
+        # 1. Encode the real data to get the target latent vector
+        mu_real, log_var_real = torch.chunk(self.encoder(x), 2, dim=-1)
+        z_real = self.reparameterize(mu_real, log_var_real)
+
+        # 2. Sample a corresponding noise vector from the prior
+        z_noise = torch.randn_like(z_real)
+
+        # 3. Define the ODE function for the solver, which expects inputs (t, z)
+        def ode_func(t, z):
+            # Our model expects a batch of t values, so we expand the scalar t
+            t_batch = t.expand(z.size(0))
+            return self.flow_model(z, t_batch)
+
+        # 4. Integrate from t=0 to t=1 to generate the predicted latent vector
+        t_span = torch.tensor([0.0, 1.0], device=device)
+        # We only need the final state at t=1
+        z_pred = odeint(ode_func, z_noise, t_span, method='dopri5')[1]
+
+        # 5. Decode the prediction to get the final "fake" cell for comparison
+        x_fake = self.decoder(z_pred)
+
+        # Return all necessary components for the loss calculation
+        return x_fake, z_pred, z_real, mu_real, log_var_real
+
+    def reconstruct(self, x):
+        """
+        Performs a simple VAE reconstruction (encode -> decode).
+        This is used for validation, separate from the main forward pass.
+        """
+        mu, log_var = torch.chunk(self.encoder(x), 2, dim=-1)
+        z = self.reparameterize(mu, log_var)
+        x_hat = self.decoder(z)
+        return x_hat
+
+
+# --- Loss Functions for the New Objective ---
+
+def calculate_autoencoding_flow_loss(x_fake, x_real, z_pred, z_real, gamma):
+    """
+    Calculates the composite loss for the Autoencoding Flow model.
+    """
+    # 1. The final reconstruction loss in gene space
+    reconstruction_loss = F.mse_loss(x_fake, x_real)
+    
+    # 2. The flow matching loss in latent space
+    flow_loss = F.mse_loss(z_pred, z_real)
+    
+    # 3. Return the weighted composite loss
+    return reconstruction_loss + gamma * flow_loss
