@@ -219,45 +219,6 @@ def plot_latent_generative_umap(model, dataloader, device, plot_file):
     plt.close(fig)
     print(f"Latent generative UMAP plot saved to '{plot_file}'")
 
-    print(f"\n--- Diagnostic Plot: Generating Latent Space Generative UMAP ---")
-
-    # 1. Generate latent vectors from the flow model (z_gen)
-    n_samples = sum(len(batch[0]) for batch in dataloader)
-    # Infer n_latent robustly from the encoder's output size
-    n_latent = model.encoder[-1].out_features // 2
-
-    def ode_func(t, z):
-        t_batch = t.expand(z.size(0))
-        return model.flow_model(z, t_batch)
-
-    t_span = torch.tensor([0.0, 1.0], device=device)
-    with torch.no_grad():
-        z0 = torch.randn(n_samples, n_latent).to(device)
-        z_gen = odeint(ode_func, z0, t_span, method='dopri5', rtol=1e-5, atol=1e-5)[1].cpu().numpy()
-
-    # 2. Get latent vectors from real data (z_real)
-    all_real_z = []
-    with torch.no_grad():
-        for data_batch, in dataloader:
-            data_batch = data_batch.to(device)
-            mu_real, _ = torch.chunk(model.encoder(data_batch), 2, dim=-1)
-            all_real_z.append(mu_real.cpu().numpy())
-    z_real = np.concatenate(all_real_z, axis=0)
-
-    # 3. Combine, create AnnData, and plot UMAP
-    combined_z = np.concatenate([z_real, z_gen], axis=0)
-    source_labels = ['Real Latent'] * len(z_real) + ['Generated Latent'] * len(z_gen)
-    adata_latent_gen = anndata.AnnData(combined_z, obs={'source': pd.Categorical(source_labels)})
-
-    sc.pp.neighbors(adata_latent_gen, use_rep='X')
-    sc.tl.umap(adata_latent_gen)
-
-    fig, ax = plt.subplots(figsize=(8, 6))
-    sc.pl.umap(adata_latent_gen, color='source', ax=ax, show=False, title="Latent Space Diagnostic: Real vs. Generated")
-    plt.savefig(plot_file)
-    plt.close(fig)
-    print(f"Latent generative UMAP plot saved to '{plot_file}'")
-
 def test_decoder_sensitivity(model, dataloader, device, noise_level=0.1):
     """
     Temporary diagnostic test to check the decoder's sensitivity to small
@@ -355,7 +316,7 @@ def main(args):
     # --- 2.1: VAE + Flow Model Training ---
     print("\n--- Phase 2.1: Training VAE + Flow Model ---")
     n_genes = data_tensor.shape[1]
-    model = VAEFlowModel(n_genes=n_genes, n_latent=args.n_latent, n_hidden=args.n_hidden).to(DEVICE)
+    model = AutoFlowModel(n_genes=n_genes, n_latent=args.n_latent, n_hidden=args.n_hidden).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     train_losses = []
@@ -369,7 +330,7 @@ def main(args):
             data_batch = data_batch.to(DEVICE)
 
             if epoch < args.vae_warmup_epochs:
-                x_hat, mu, log_var = model(data_batch, DEVICE)
+                x_hat, mu, log_var = model.forward_vae(data_batch)
                 total_loss = calculate_vae_loss(x_hat, data_batch, mu, log_var, args.beta)
                 flow_loss = torch.tensor(0.0) # For logging purposes
             else:
