@@ -23,6 +23,36 @@ class PositionalEmbedding(nn.Module):
         freq = torch.exp(torch.arange(half_dim, device=device) * -freq)
         phase = t[:, None] * freq[None, :]
         return torch.cat((phase.sin(), phase.cos()), dim=-1)
+    
+class ConditionalFlowModel(nn.Module):
+    """
+    Single conditional velocity field v(z,t | p) with learned perturbation embeddings.
+    Conditioning is done by concatenation: [z, t_embed, e_p] -> MLP -> v.
+    Keeps defaults similar to FlowModel (time_emb_dim=32).
+    """
+    def __init__(self, n_latent=128, n_hidden=512, n_perts=1, emb_dim=64, time_emb_dim=32):
+        super().__init__()
+        self.n_latent = n_latent
+        self.time_embed = PositionalEmbedding(time_emb_dim)
+        self.pert_embed = nn.Embedding(num_embeddings=n_perts, embedding_dim=emb_dim)
+        self.net = nn.Sequential(
+            nn.Linear(n_latent + time_emb_dim + emb_dim, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_latent)
+        )
+
+    def forward(self, z, t, p_idx):
+        """
+        z: (B, L) latent
+        t: (B,) or (B,1) time scalars
+        p_idx: (B,) int64 indices of perturbations
+        """
+        t_emb = self.time_embed(t)          # (B, T)
+        e_p   = self.pert_embed(p_idx)      # (B, E)
+        zt = torch.cat([z, t_emb, e_p], dim=1)
+        return self.net(zt)
 
 class FlowModel(nn.Module):
     """A simple MLP that predicts the velocity vector for flow matching."""
