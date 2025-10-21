@@ -15,6 +15,8 @@ from sklearn.decomposition import PCA
 from torchdiffeq import odeint
 from sklearn.metrics import r2_score
 from scipy.stats import pearsonr
+from sklearn.neighbors import NearestNeighbors
+from scipy.optimize import linear_sum_assignment
 
 # --- Import from your existing models file ---
 from models import FlowModel
@@ -87,7 +89,12 @@ def main(args):
         pca.fit(train_data)
         train_latent = pca.transform(train_data)
         print(f"Data transformed to PCA space. Explained variance: {pca.explained_variance_ratio_.sum():.4f}")
-    
+        # --- Whiten PCA latents (mean/std on TRAIN only) ---
+        mu = train_latent.mean(axis=0, keepdims=True)
+        std = train_latent.std(axis=0, keepdims=True)
+        std = np.where(std < 1e-8, 1e-8, std)
+        train_latent = (train_latent - mu) / std
+
     # Convert to PyTorch Tensor for training
     train_dataset = TensorDataset(torch.tensor(train_latent, dtype=torch.float32))
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
@@ -127,22 +134,49 @@ def main(args):
     calculate_pca_metrics(pca, val_data)
     flow_model.eval()
     with torch.no_grad():
-        # Generate samples in the latent space
-        z0_gen = torch.randn(val_data.shape[0], args.n_latent).to(DEVICE)
+        # Generate an oversampled pool in WHITENED latent space
+        n_val = val_data.shape[0]
+        n_gen = int(max(1, args.oversample_factor) * n_val)
+        z0_gen = torch.randn(n_gen, args.n_latent).to(DEVICE)
         
         def ode_func(t, z):
             t_batch = t.expand(z.size(0))
             return flow_model(z, t_batch)
         
         t_span = torch.tensor([0.0, 1.0], device=DEVICE)
-        z1_gen = odeint(ode_func, z0_gen, t_span, method='dopri5')[1]
-        
-        # "Decode" the generated latent vectors back to gene space using PCA
-        generated_cells = pca.inverse_transform(z1_gen.cpu().numpy())
+        z1_gen_w = odeint(ode_func, z0_gen, t_span, method='dopri5')[1]
+        # Unwhiten to PCA space, then inverse PCA to gene space
+        z1_gen = z1_gen_w.cpu().numpy()
+        generated_cells = pca.inverse_transform(z1_gen * std + mu)
 
-    # Quantitative Check: R^2 of generated cells vs real cells
-    r2_per_cell_gen = r2_score(val_data, generated_cells, multioutput='variance_weighted')
-    print(f"Generative R^2 (per-cell, variance-weighted): {r2_per_cell_gen:.4f}")
+    # (1) Rowwise (reference only, usually negative). Slice because we oversampled.
+    n_val = val_data.shape[0]
+    r2_per_cell_gen = r2_score(val_data, generated_cells[:n_val], multioutput='variance_weighted')
+
+    # (2) kNN-matched R^2 in WHITENED PCA space (many-to-one)
+    real_lat = pca.transform(val_data)
+    real_lat_w = (real_lat - mu) / std
+    gen_lat_w  = z1_gen  # already in whitened space
+    nn = NearestNeighbors(n_neighbors=1).fit(gen_lat_w)
+    dist, idx = nn.kneighbors(real_lat_w)
+    gen_matched_knn = generated_cells[idx[:,0]]
+    r2_matched_knn = r2_score(val_data, gen_matched_knn, multioutput='variance_weighted')
+    print(f"Generative R^2 (per-cell, variance-weighted) [kNN-matched]: {r2_matched_knn:.4f}")
+
+    # (3) One-to-one assignment (Hungarian) in WHITENED PCA space
+    #     To keep memory bounded with oversampling, use only the nearest n_val generated points
+    #     (optional refinement; keeps the spirit of 1-1 matching)
+    nearest_cols = idx[:,0]                      # best candidate per real cell
+    unique_cols = np.unique(nearest_cols)        # prune to unique candidates
+    gen_sub = generated_cells[unique_cols]
+    gen_sub_w = gen_lat_w[unique_cols]
+    # Build cost between all real and pruned generated set
+    cost = ((real_lat_w[:,None,:] - gen_sub_w[None,:,:])**2).sum(axis=2)
+    row_ind, col_ind = linear_sum_assignment(cost)
+    gen_matched_hungarian = gen_sub[col_ind]
+    r2_matched_h = r2_score(val_data[row_ind], gen_matched_hungarian, multioutput='variance_weighted')
+    print(f"Generative R^2 (per-cell, variance-weighted) [Hungarian 1-1]: {r2_matched_h:.4f}")
+
 
     # Calculate pseudobulk R^2 for generated cells
     real_pseudobulk = val_data.sum(axis=0)
@@ -157,9 +191,31 @@ def main(args):
     corr_score, _ = pearsonr(real_corr[np.triu_indices_from(real_corr, k=1)], fake_corr[np.triu_indices_from(fake_corr, k=1)])
     print(f"Generative Gene-Gene Correlation Score (Pearson R): {corr_score:.4f}")
 
+    # (4) Distributional sanity: MMD on PCA latents (RBF kernel)
+    def _rbf(x, y, gamma):
+        # x: (n,d), y: (m,d)
+        xx = (x**2).sum(1, keepdims=True)
+        yy = (y**2).sum(1, keepdims=True)
+        xy = x @ y.T
+        d2 = xx - 2*xy + yy.T
+        return np.exp(-gamma * d2)
+    # median heuristic for gamma
+    # Use same whitened spaces for MMD
+    sub = min(2048, real_lat_w.shape[0], gen_lat_w.shape[0])
+    pair_d2 = np.sum((real_lat_w[:sub] - gen_lat_w[:sub])**2, axis=1)
+    median_d2 = np.median(pair_d2)
+    gamma = 1.0 / (median_d2 + 1e-8)
+    Kxx = _rbf(real_lat_w, real_lat_w, gamma)
+    Kyy = _rbf(gen_lat_w,  gen_lat_w,  gamma)
+    Kxy = _rbf(real_lat_w, gen_lat_w,  gamma)
+    mmd2 = Kxx.mean() + Kyy.mean() - 2*Kxy.mean()
+    print(f"MMD^2 (whitened PCA latent, RBF kernel): {mmd2:.6f}")
+
     # Create UMAP
-    combined_data = np.concatenate([val_data, generated_cells], axis=0)
-    source_labels = ['Real'] * val_data.shape[0] + ['Generated'] * generated_cells.shape[0]
+    # For UMAP, subsample generated cells to match #real (for a balanced plot)
+    gen_for_plot = generated_cells[:val_data.shape[0]]
+    combined_data = np.concatenate([val_data, gen_for_plot], axis=0)
+    source_labels = ['Real'] * val_data.shape[0] + ['Generated'] * gen_for_plot.shape[0]
     adata_combined = anndata.AnnData(combined_data, obs={'source': pd.Categorical(source_labels)})
     
     sc.pp.neighbors(adata_combined, use_rep='X')
@@ -201,6 +257,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate for the Adam optimizer.')
     parser.add_argument('--epochs', type=int, default=150, help='Number of training epochs.')
     parser.add_argument('--train_split', type=float, default=0.8, help="Fraction of data to use for training (0.0 to 1.0).")
+    parser.add_argument('--oversample_factor', type=float, default=1.0, help='How many generated samples relative to #val cells.')
     # I/O Arguments
     parser.add_argument('--plot_file', type=str, default='pca_flow_umap.png', help='Path to save the output generative UMAP plot.')
     parser.add_argument('--output_h5ad', type=str, default=None, help='Path to save an anndata file with generated cells for inspection.')
