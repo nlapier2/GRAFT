@@ -256,16 +256,7 @@ def main(args):
         X_gen_all = np.vstack(X_gen_all) if len(X_gen_all) else np.empty((0, adata.n_vars), dtype=float)
         obs_gen = pd.DataFrame(obs_rows, index=[f'gen_{i}' for i in range(X_gen_all.shape[0])])
 
-        # ORIGINAL (same order as input)
-        X_orig = full_data_matrix.toarray() if hasattr(full_data_matrix, "toarray") else np.asarray(full_data_matrix)
-        X_orig = np.maximum(X_orig, 0.0)
-        obs_orig = adata.obs[[args.target_label]].copy()
-        obs_orig['source'] = pd.Categorical(['Original'] * adata.n_obs)
-
-        # Stack and write one file
-        X_stack = np.vstack([X_orig, X_gen_all])
-        obs_stack = pd.concat([obs_orig.reset_index(drop=True), obs_gen.reset_index(drop=True)], axis=0, ignore_index=True)
-        out = anndata.AnnData(X=X_stack, obs=obs_stack, var=adata.var.copy())
+        out = anndata.AnnData(X=X_gen_all, obs=obs_gen, var=adata.var.copy())
         out.write_h5ad(args.output_h5ad)
         print("Saved.")
 
