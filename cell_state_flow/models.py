@@ -11,13 +11,18 @@ class PositionalEmbedding(nn.Module):
         self.dim = dim
 
     def forward(self, t):
+        # Accept t as (B,) or (B,1); coerce to (B,)
+        if t.dim() == 2 and t.size(1) == 1:
+            t = t.squeeze(1)
+        elif t.dim() != 1:
+            t = t.reshape(-1)
+
         device = t.device
         half_dim = self.dim // 2
-        embeddings = math.log(10000) / (half_dim - 1)
-        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
-        embeddings = t[:, None] * embeddings[None, :]
-        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
-        return embeddings
+        freq = math.log(10000) / (half_dim - 1)
+        freq = torch.exp(torch.arange(half_dim, device=device) * -freq)
+        phase = t[:, None] * freq[None, :]
+        return torch.cat((phase.sin(), phase.cos()), dim=-1)
 
 class FlowModel(nn.Module):
     """A simple MLP that predicts the velocity vector for flow matching."""
@@ -338,3 +343,41 @@ class LinearAutoFlowModel(nn.Module):
         z = self.reparameterize(mu, log_var)
         x_hat = self.decoder(z)
         return x_hat, mu, log_var
+
+def _encode_mu(model, x):
+    mu, _ = torch.chunk(model.encoder(x), 2, dim=-1)
+    return mu
+
+def latent_cycle_consistency(model, data_batch):
+    with torch.no_grad():
+        mu_real = _encode_mu(model, data_batch)    # target detached
+    x_rec = model.decoder(mu_real)
+    mu_rec = _encode_mu(model, x_rec)
+    return torch.mean((mu_rec - mu_real)**2)
+
+def integrate_flow_to_one(model, z0):
+    device = z0.device
+    def ode_func(t, z):
+        t_batch = t.expand(z.size(0))
+        return model.flow_model(z, t_batch)
+    t_span = torch.tensor([0.0, 1.0], device=device)
+    return odeint(ode_func, z0, t_span, method='dopri5')[1]
+
+def pushforward_consistency(model, batch_size, device):
+    z0 = torch.randn(batch_size, model.latent_dim, device=device)
+    z1 = integrate_flow_to_one(model, z0)          # flow output at t=1
+    x_gen = model.decoder(z1)
+    mu_gen = _encode_mu(model, x_gen)
+    return torch.mean((mu_gen - z1.detach())**2)
+
+def corr_loss(x, xhat, n_genes_sub=256):
+    if x.size(1) > n_genes_sub:
+        idx = torch.randperm(x.size(1), device=x.device)[:n_genes_sub]
+        x, xhat = x[:, idx], xhat[:, idx]
+    x     = x - x.mean(0, keepdim=True)
+    xhat  = xhat - xhat.mean(0, keepdim=True)
+    x     = x / (x.std(0, keepdim=True) + 1e-6)
+    xhat  = xhat / (xhat.std(0, keepdim=True) + 1e-6)
+    C     = (x.T @ x) / (x.size(0) - 1)
+    Chat  = (xhat.T @ xhat) / (xhat.size(0) - 1)
+    return torch.mean((C - Chat)**2)

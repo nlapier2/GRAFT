@@ -122,7 +122,7 @@ def generate_samples(model, n_samples, device):
     with torch.no_grad():
         # 1. Sample z0 from the prior (Gaussian noise)
         # Infer n_latent from the model architecture
-        n_latent = model.encoder[-1].out_features // 2
+        n_latent = model.latent_dim
         z0 = torch.randn(n_samples, n_latent).to(device)
 
         # Define the ODE function for the solver, which expects inputs (t, z)
@@ -186,7 +186,7 @@ def plot_latent_generative_umap(model, dataloader, device, plot_file):
     n_samples = sum(len(batch[0]) for batch in dataloader)
     with torch.no_grad():
         # Infer n_latent from the model architecture
-        n_latent = model.encoder[-1].out_features // 2
+        n_latent = model.latent_dim
         z0 = torch.randn(n_samples, n_latent).to(device)
 
         def ode_func(t, z):
@@ -339,8 +339,34 @@ def main(args):
                 
                 # The new loss has two main components
                 autoencoding_loss = calculate_autoencoding_flow_loss(x_fake, data_batch, z_pred, z_real, args.gamma)
-                kl_loss = -0.5 * torch.sum(1 + log_var_real - mu_real.pow(2) - log_var_real.exp()) / data_batch.size(0)
-                total_loss = autoencoding_loss + args.beta * kl_loss
+                kl = -0.5 * torch.sum(1 + log_var_real - mu_real.pow(2) - log_var_real.exp()) / data_batch.size(0)
+
+                # --- add classic FM (straight-path) in latent space ---
+                with torch.no_grad():
+                    z1 = mu_real
+                    z0 = torch.randn_like(z1)
+                    t  = torch.rand(z1.size(0), device=z1.device)         # (B,)
+                    zt = (1 - t.unsqueeze(-1)) * z0 + t.unsqueeze(-1) * z1
+                    v_target = z1 - z0
+
+                v_pred = model.flow_model(zt, t)  # t is (B,), OK
+                fm_loss = torch.mean((v_pred - v_target)**2)
+
+                # --- bridge terms (very small weights) ---
+                cy_loss = latent_cycle_consistency(model, data_batch)
+                pf_loss = pushforward_consistency(model, data_batch.size(0), data_batch.device)
+                # tiny correlation-structure regularizer (cheap)
+                c_loss  = corr_loss(data_batch, x_fake, n_genes_sub=384)
+
+                # Compose final loss; keep recon dominant, FM modest, bridges tiny
+                total_loss = (
+                    autoencoding_loss
+                    + args.beta * kl
+                    + args.gamma * fm_loss
+                    + args.w_cy * cy_loss
+                    + args.w_pf * pf_loss
+                    + args.w_corr * c_loss
+                )
 
             # Backward pass and optimization
             optimizer.zero_grad()
@@ -360,14 +386,37 @@ def main(args):
                 data_batch = data_batch.to(DEVICE)
 
                 if epoch < args.vae_warmup_epochs:
-                    x_hat, mu, log_var = model(data_batch, DEVICE)
+                    x_hat, mu, log_var = model.forward_vae(data_batch)
                     total_loss = calculate_vae_loss(x_hat, data_batch, mu, log_var, args.beta)
                 else:
                     x_fake, z_pred, z_real, mu_real, log_var_real = model(data_batch, DEVICE)
                     autoencoding_loss = calculate_autoencoding_flow_loss(x_fake, data_batch, z_pred, z_real, args.gamma)
-                    kl_loss = -0.5 * torch.sum(1 + log_var_real - mu_real.pow(2) - log_var_real.exp()) / data_batch.size(0)
-                    total_loss = autoencoding_loss + args.beta * kl_loss
+                    kl = -0.5 * torch.sum(1 + log_var_real - mu_real.pow(2) - log_var_real.exp()) / data_batch.size(0)
 
+                    # --- add classic FM (straight-path) in latent space ---
+                    with torch.no_grad():
+                        z1 = mu_real
+                        z0 = torch.randn_like(z1)
+                        t  = torch.rand(z1.size(0), device=z1.device)         # (B,)
+                        zt = (1 - t.unsqueeze(-1)) * z0 + t.unsqueeze(-1) * z1
+                        v_target = z1 - z0
+
+                    v_pred = model.flow_model(zt, t)  # t is (B,), OK
+                    fm_loss = torch.mean((v_pred - v_target)**2)
+
+                    # bridge + corr terms in val for apples-to-apples logging
+                    cy_loss = latent_cycle_consistency(model, data_batch)
+                    pf_loss = pushforward_consistency(model, data_batch.size(0), data_batch.device)
+                    c_loss  = corr_loss(data_batch, x_fake, n_genes_sub=384)
+
+                    total_loss = (
+                        autoencoding_loss
+                        + args.beta * kl
+                        + args.gamma * fm_loss
+                        + args.w_cy * cy_loss
+                        + args.w_pf * pf_loss
+                        + args.w_corr * c_loss
+                    )
                 running_val_loss += total_loss.item()
 
         avg_val_loss = running_val_loss / len(val_loader)
@@ -426,6 +475,9 @@ if __name__ == '__main__':
     parser.add_argument('--vae_warmup_epochs', type=int, default=25, help='Number of epochs to train only the VAE before joint training.')
     parser.add_argument('--beta', type=float, default=1e-5, help='Weight for the KL divergence term in the VAE loss.')
     parser.add_argument('--gamma', type=float, default=1.0, help='Weight for the Flow Matching loss term.')
+    parser.add_argument('--w_cy', type=float, default=0.05, help='Weight for latent cycle consistency loss.')
+    parser.add_argument('--w_pf', type=float, default=0.05, help='Weight for pushforward consistency loss.')
+    parser.add_argument('--w_corr', type=float, default=0.05, help='Weight for correlation-structure regularizer.')
 
     args = parser.parse_args()
     main(args)
