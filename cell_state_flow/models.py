@@ -68,7 +68,8 @@ class VAE(nn.Module):
         self.decoder = nn.Sequential(
             nn.Linear(n_latent, n_hidden),
             nn.ReLU(),
-            nn.Linear(n_hidden, n_genes)
+            nn.Linear(n_hidden, n_genes),
+            nn.Softplus(beta=1.0)  # ensure outputs ≥ 0 in log1p domain
         )
 
     def reparameterize(self, mu, log_var):
@@ -109,7 +110,8 @@ class VAEFlowModel(nn.Module):
         self.decoder = nn.Sequential(
             nn.Linear(n_latent, n_hidden),
             nn.ReLU(),
-            nn.Linear(n_hidden, n_genes)
+            nn.Linear(n_hidden, n_genes),
+            nn.Softplus(beta=1.0)  # ensure outputs ≥ 0 in log1p domain
         )
         
         # --- Flow Model Component ---
@@ -189,7 +191,8 @@ class AutoFlowModel(nn.Module):
         self.decoder = nn.Sequential(
             nn.Linear(n_latent, n_hidden),
             nn.ReLU(),
-            nn.Linear(n_hidden, n_genes)
+            nn.Linear(n_hidden, n_genes),
+            nn.Softplus(beta=1.0)  # ensure outputs ≥ 0 in log1p domain
         )
         
         # Flow Model Component

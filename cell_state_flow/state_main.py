@@ -336,6 +336,76 @@ def test_decoder_sensitivity(model, dataloader, device, noise_level=0.1):
     plt.close(fig)
     print(f"Decoder sensitivity UMAP plot saved to '{plot_file}'")
 
+def calculate_generative_r2_and_bulk(model, val_loader, device):
+    """
+    Computes generative R^2 (per-cell, rowwise) and pseudobulk R^2 using
+    samples drawn from the flow (same N as validation set), decoded to gene space.
+    """
+    model.eval()
+    # Collect the validation (original) matrix in the same order as val_loader
+    all_original = []
+    with torch.no_grad():
+        for (data_batch,) in val_loader:
+            all_original.append(data_batch.numpy() if not torch.is_tensor(data_batch) else data_batch.cpu().numpy())
+    original_matrix = np.concatenate(all_original, axis=0)  # (N_val, G)
+
+    # Generate exactly N_val flow samples and decode
+    n_val = original_matrix.shape[0]
+    fake_matrix = generate_samples(model, n_val, device)    # (N_val, G)
+    # Safety: clamp to >= 0 (log1p domain)
+    fake_matrix = np.maximum(fake_matrix, 0.0)
+
+    # Per-cell (rowwise) R^2 and pseudobulk R^2
+    r2_cells = r2_score(original_matrix, fake_matrix, multioutput='variance_weighted')
+    r2_bulk  = r2_score(original_matrix.mean(axis=0), fake_matrix.mean(axis=0))
+
+    print("\n--- Generative Metrics (validation-sized sample) ---")
+    print(f"Generative R^2 (per-cell, variance-weighted) [rowwise]: {r2_cells:.4f}")
+    print(f"Generative R^2 (pseudobulk): {r2_bulk:.4f}")
+    return original_matrix, fake_matrix
+
+def write_predictions_h5ad(model, val_loader, control_adata, device, out_path):
+    """
+    Writes an .h5ad with three blocks stacked row-wise:
+      - Original (validation subset)
+      - VAE-reconstructed (same cells, same order)
+      - Flow-generated (N = #val)
+    Columns (genes) match control_adata.var; obs['source'] labels each block.
+    """
+    model.eval()
+    all_original, all_vae = [], []
+    with torch.no_grad():
+        for (data_batch,) in val_loader:
+            x = data_batch.to(device)
+            x_hat, _, _ = model(x)
+            all_original.append(data_batch.cpu().numpy())
+            all_vae.append(x_hat.cpu().numpy())
+    original = np.concatenate(all_original, axis=0)
+    vae_recon = np.concatenate(all_vae, axis=0)
+    # Safety clamp (log1p domain should be >=0)
+    vae_recon = np.maximum(vae_recon, 0.0)
+
+    # Flow-generated (same N as validation)
+    flow_gen = generate_samples(model, original.shape[0], device)
+    flow_gen = np.maximum(flow_gen, 0.0)
+
+    combined = np.concatenate([original, vae_recon, flow_gen], axis=0)
+    labels = (['Original'] * original.shape[0]
+              + ['VAE'] * vae_recon.shape[0]
+              + ['Flow'] * flow_gen.shape[0])
+    # Build AnnData; reuse var from controls to preserve gene names/metadata
+    var_df = control_adata.var.copy()
+    if var_df.shape[0] != combined.shape[1]:
+        # Fallback: make a minimal var if shapes disagree
+        var_df = pd.DataFrame(index=[f'g{i}' for i in range(combined.shape[1])])
+    out_adata = anndata.AnnData(
+        X=combined,
+        obs=pd.DataFrame({'source': pd.Categorical(labels)}),
+        var=var_df
+    )
+    out_adata.write_h5ad(out_path)
+    print(f"Predictions written to '{out_path}'")
+
 def main(args):
     """
     Main function to run the VAE training pipeline.
@@ -493,6 +563,13 @@ def main(args):
 
     test_decoder_sensitivity(model, val_loader, DEVICE, noise_level=0.1)
 
+    # --- Generative R^2 / Pseudobulk on validation-sized sample ---
+    _, _ = calculate_generative_r2_and_bulk(model, val_loader, DEVICE)
+
+    # --- Write predictions for manual inspection ---
+    if args.predictions_out:
+        write_predictions_h5ad(model, val_loader, control_adata, DEVICE, args.predictions_out)
+
     print("Done.")
 
 
@@ -519,6 +596,7 @@ if __name__ == '__main__':
     parser.add_argument('--vae_warmup_epochs', type=int, default=25, help='Number of epochs to train only the VAE before joint training.')
     parser.add_argument('--beta', type=float, default=1e-5, help='Weight for the KL divergence term in the VAE loss.')
     parser.add_argument('--gamma', type=float, default=1.0, help='Weight for the Flow Matching loss term.')
+    parser.add_argument('--predictions_out', type=str, default='predictions_val.h5ad', help='Path to write stacked predictions (Original/VAE/Flow) for validation cells.')
 
     args = parser.parse_args()
     main(args)
