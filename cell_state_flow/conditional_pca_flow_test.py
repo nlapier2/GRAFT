@@ -106,6 +106,13 @@ def main(args):
         val_latent_w = (pca.transform(val_data) - mu) / std
         mu_all, std_all = mu.copy(), std.copy()  # for all later unwhitening
 
+    # Torch versions for differentiable inverse transform (on DEVICE)
+    mu_t  = torch.tensor(mu,  dtype=torch.float32, device=DEVICE)   # (1, L)
+    std_t = torch.tensor(std, dtype=torch.float32, device=DEVICE)   # (1, L)
+    # sklearn PCA inverse: X = Z @ components_ + mean_
+    pca_comp_t = torch.tensor(pca.components_, dtype=torch.float32, device=DEVICE)  # (L, G)
+    pca_mean_t = torch.tensor(pca.mean_,       dtype=torch.float32, device=DEVICE)  # (G,)
+
     # ---------------------------
     # Global label vocabulary (train ∪ test) so unseen perts have embeddings
     # ---------------------------
@@ -126,6 +133,64 @@ def main(args):
     )
     p_idx_train = p_idx_all_train[train_indices]
     p_idx_val   = p_idx_all_train[val_indices]
+
+    # ---------------------------
+    # Target-gene indices & empirical target deltas from TRAIN (pseudobulk)
+    # ---------------------------
+    # Map label name -> var index (target gene index in expression)
+    gene_to_var = {g:i for i,g in enumerate(adata_full.var_names.tolist())}
+    idx_to_label = {v:k for k,v in label_to_idx.items()}
+    # Control pseudobulk on TRAIN
+    ctrl_mask_tr = adata_train.obs[args.target_label].astype(str).values == args.control_label
+    ctrl_mean_tr = to_numpy(adata_train.X[ctrl_mask_tr]).mean(axis=0).astype(np.float32)
+    ctrl_mean_tr_t = torch.tensor(ctrl_mean_tr, dtype=torch.float32, device=DEVICE)  # (G,)
+    # Empirical per-label target delta on TRAIN (pseudobulk difference at target gene)
+    emp_target_delta = {}  # label_name -> float
+    labels_train = adata_train.obs[args.target_label].astype(str).values
+    for lab in sorted(set(labels_train)):
+        if lab == args.control_label: 
+            continue
+        mask = labels_train == lab
+        if not np.any(mask):
+            continue
+        mu_lab = to_numpy(adata_train.X[mask]).mean(axis=0).astype(np.float32)
+        g_idx = gene_to_var.get(lab, None)
+        if g_idx is None:
+            continue
+        emp_target_delta[lab] = float(mu_lab[g_idx] - ctrl_mean_tr[g_idx])
+    print(f"[TargetΔ] computed empirical target deltas for {len(emp_target_delta)} train labels.")
+
+    # ---------------------------
+    # Compute GLOBAL average knockdown efficiency \in [0,1] at the target gene (TRAIN)
+    # eff(p) = ((ctrl_mean - pert_mean) / max(ctrl_mean, eps)) clipped to [0,1]
+    # ---------------------------
+    labels_train = adata_train.obs[args.target_label].astype(str).values
+    gene_to_var = {g:i for i,g in enumerate(adata_full.var_names.tolist())}
+    effs = []
+    eps_ctrl = 1e-6
+    for lab in sorted(set(labels_train)):
+        if lab == args.control_label:
+            continue
+        g_idx = gene_to_var.get(lab, None)
+        if g_idx is None:
+            continue
+        mask = (labels_train == lab)
+        if not np.any(mask):
+            continue
+        mu_lab = to_numpy(adata_train.X[mask]).mean(axis=0).astype(np.float32)
+        ctrl_g = float(ctrl_mean_tr[g_idx])
+        pert_g = float(mu_lab[g_idx])
+        denom = max(ctrl_g, eps_ctrl)
+        eff = (ctrl_g - pert_g) / denom
+        eff = float(np.clip(eff, 0.0, 1.0))
+        effs.append(eff)
+    if len(effs) == 0:
+        print("[TargetEff-AVG] WARNING: no target efficiencies found; setting eff_avg = 0.")
+        eff_avg = 0.0
+    else:
+        eff_avg = float(np.mean(effs))
+    eff_avg_t = torch.tensor(eff_avg, dtype=torch.float32, device=DEVICE)
+    print(f"[TargetEff-AVG] Average knockdown efficiency across TRAIN perts: {eff_avg:.4f}")
 
     # ---------------------------
     # Pathway → gene-feature matrix → compressed gene embeddings (ALL genes)
@@ -200,6 +265,14 @@ def main(args):
     # ).to(DEVICE)
     optimizer = torch.optim.Adam(flow_model.parameters(), lr=args.lr)
 
+    # ---- Minimal target-self-effect training knobs (no CLI, safe defaults)
+    TARGET_LOSS_EVERY = 25           # every K steps, add small target loss
+    TARGET_LABELS_PER_STEP = 4       # how many distinct labels per target-loss step
+    TARGET_SAMPLES_PER_LABEL = 16    # generated samples per label for pseudobulk
+    TARGET_LOSS_WEIGHT = 0.5         # weight for MSE on target gene pseudobulk Δ
+    T_EULER = 0.8                    # t at which we evaluate & take one Euler step to approximate endpoint
+    PRINT_EVERY = 50                 # print losses every K steps
+
     # Initialize perturbation embedding table from pathway-derived gene embeddings (if available)
     if per_label_init is not None:
         with torch.no_grad():
@@ -216,9 +289,12 @@ def main(args):
         print("[Init] Perturbation embeddings initialized from pathway features (zeros for control/missing).")
 
     train_losses = []
+    global_step = 0
+    target_loss_val_for_logging = None  # cache for printing
     for epoch in range(args.epochs):
         flow_model.train()
         running_train_loss = 0.0
+        running_target_loss = 0.0
         for z1_batch, p_batch in train_loader:
             z1_batch = z1_batch.to(DEVICE)           # (B, L)
             p_batch  = p_batch.to(DEVICE)            # (B,)
@@ -228,18 +304,77 @@ def main(args):
             t = torch.rand(z1_batch.size(0), device=DEVICE)
             zt_batch = (1 - t.unsqueeze(1)) * z0_batch + t.unsqueeze(1) * z1_batch
             v_target = z1_batch - z0_batch
-            v_pred = flow_model(zt_batch, t, p_batch)
-            loss = F.mse_loss(v_pred, v_target)
+            # predict efficacy internally; pass via model forward
+            v_pred = flow_model(zt_batch, t, p_batch, eta=None)
+            loss_fm = F.mse_loss(v_pred, v_target)
+            loss_target = loss_fm
+            loss = loss_fm
+
+
+            # --- Minimal target-gene self-effect loss (periodic, tiny batch ODE) ---
+            if (global_step % TARGET_LOSS_EVERY) == 0 and TARGET_LOSS_WEIGHT > 0.0:
+                # choose up to K labels from this mini-batch (non-control, present in gene_to_var)
+                labs_all = [idx_to_label[int(i)] for i in p_batch.unique().tolist()]
+                labs_all = [lab for lab in labs_all if lab != args.control_label and lab in gene_to_var]
+                labs_in_batch = labs_all[:TARGET_LABELS_PER_STEP]
+                if len(labs_in_batch) > 0:
+                    pid_list = [label_to_idx[lab] for lab in labs_in_batch]
+                    g_idx_list = [gene_to_var[lab] for lab in labs_in_batch]
+                    # For speed, subsample examples for each label from the current minibatch when possible
+                    loss_terms = []
+                    for pid, g_idx, lab in zip(pid_list, g_idx_list, labs_in_batch):
+                        # gather indices in current mini-batch for this label
+                        mask_lab = (p_batch == pid)
+                        idx_lab = torch.nonzero(mask_lab, as_tuple=False).view(-1)
+                        if idx_lab.numel() == 0:
+                            continue
+                        take = min(TARGET_SAMPLES_PER_LABEL, idx_lab.numel())
+                        sel = idx_lab[:take]
+                        # build z0/z1 at a fixed t close to 1 for Euler
+                        Bk = sel.numel()
+                        t_hat = torch.full((Bk,), T_EULER, device=DEVICE)
+                        z1_k  = z1_batch[sel]                                   # (Bk, L)
+                        z0_k  = torch.randn_like(z1_k)                           # new noise for this sub-batch
+                        zt_k  = (1 - t_hat.unsqueeze(1)) * z0_k + t_hat.unsqueeze(1) * z1_k
+                        v_pred_k = flow_model(zt_k, t_hat, torch.full_like(sel, pid), eta=None)
+                        # one-step Euler to approximate endpoint at t=1
+                        z_end_k = zt_k + (1 - t_hat).unsqueeze(1) * v_pred_k     # (Bk, L)
+                        # inverse transform to gene space
+                        z_unw_k = z_end_k * std_t + mu_t                         # (Bk, L)
+                        X_k     = z_unw_k @ pca_comp_t + pca_mean_t              # (Bk, G)
+                        X_k     = F.softplus(X_k)
+                        # predicted pseudobulk delta at target gene vs control
+                        pred_mu = X_k[:, g_idx].mean()                  # scalar
+                        # target level implied by average efficiency: (1 - eff_avg) * ctrl_mean
+                        target_mu = (1.0 - eff_avg_t) * ctrl_mean_tr_t[g_idx]
+                        # penalize deviation from implied target level (efficiency-based, gene-scaled)
+                        loss_terms.append((pred_mu - target_mu) ** 2)
+                    if len(loss_terms) > 0:
+                        loss_target = torch.stack(loss_terms).mean()
+                        loss = loss + TARGET_LOSS_WEIGHT * loss_target
+                        # store a detached scalar for consistent logging on THIS step
+                        target_loss_val_for_logging = float(loss_target.detach().cpu())
             
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
+
+            global_step += 1
+            if (global_step % PRINT_EVERY) == 0:
+                fm_val = float(loss_fm.detach().cpu())
+                tot_val = float(loss.detach().cpu())
+                if target_loss_val_for_logging is not None:
+                    print(f"ep {epoch:03d} step {global_step:06d} | FM: {fm_val:.6f}  Target: {target_loss_val_for_logging:.6f}  Total: {tot_val:.6f}")
+                else:
+                    print(f"ep {epoch:03d} step {global_step:06d} | FM: {fm_val:.6f}  Target: (skipped)  Total: {tot_val:.6f}")
+
             running_train_loss += loss.item()
+            running_target_loss += loss_target.item() if 'loss_target' in locals() else 0.0
             
         avg_train_loss = running_train_loss / len(train_loader)
+        avg_target_loss = running_target_loss / len(train_loader)
         train_losses.append(avg_train_loss)
-        print(f"Epoch [{epoch+1}/{args.epochs}], Flow Loss: {avg_train_loss:.4f}")
+        print(f"Epoch [{epoch+1}/{args.epochs}], Flow Loss: {avg_train_loss:.4f}, Target Loss: {avg_target_loss:.4f}")
 
     # --- 4. Validation: Generative Quality Check ---
     print("\n--- Phase 4: Validating Generative Quality ---")

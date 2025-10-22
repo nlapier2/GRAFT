@@ -35,24 +35,39 @@ class ConditionalFlowModel(nn.Module):
         self.n_latent = n_latent
         self.time_embed = PositionalEmbedding(time_emb_dim)
         self.pert_embed = nn.Embedding(num_embeddings=n_perts, embedding_dim=emb_dim)
+        # Step-0 efficacy head: predicts eta \in [0,1] from embedding
+        self.efficacy_head = nn.Sequential(
+            nn.Linear(emb_dim, emb_dim),
+            nn.ReLU(),
+            nn.Linear(emb_dim, 1),
+            nn.Sigmoid(),
+        )
+        # NOTE: we condition on [z, t_emb, e_p, eta]; eta is scalar appended to embedding
         self.net = nn.Sequential(
-            nn.Linear(n_latent + time_emb_dim + emb_dim, n_hidden),
+            nn.Linear(n_latent + time_emb_dim + emb_dim + 1, n_hidden),
             nn.ReLU(),
             nn.Linear(n_hidden, n_hidden),
             nn.ReLU(),
             nn.Linear(n_hidden, n_latent)
         )
 
-    def forward(self, z, t, p_idx):
+    def forward(self, z, t, p_idx, eta: torch.Tensor = None):
         """
         z: (B, L) latent
         t: (B,) or (B,1) time scalars
         p_idx: (B,) int64 indices of perturbations
+        eta: optional (B,1) or (B,) efficacy in [0,1]; if None, predicted from embedding
         """
-        t_emb = self.time_embed(t)          # (B, T)
-        e_p   = self.pert_embed(p_idx)      # (B, E)
-        zt = torch.cat([z, t_emb, e_p], dim=1)
-        return self.net(zt)
+        t_ = t.view(-1) if t.dim() == 2 else t
+        t_emb = self.time_embed(t_)               # (B, T)
+        e_p   = self.pert_embed(p_idx)            # (B, E)
+        if eta is None:
+            eta = self.efficacy_head(e_p)         # (B,1)
+        else:
+            if eta.dim() == 1:
+                eta = eta.unsqueeze(1)
+        h_in = torch.cat([z, t_emb, e_p, eta], dim=1)   # (B, L+T+E+1)
+        return self.net(h_in)
     
 class ConditionalFlowFiLM(nn.Module):
     """
@@ -68,6 +83,14 @@ class ConditionalFlowFiLM(nn.Module):
         self.pert_embed = nn.Embedding(num_embeddings=n_perts, embedding_dim=emb_dim)
         self.film_on_layers = set(film_on_layers)  # which hidden layers to FiLM (0-based)
 
+        # Step-0 efficacy head
+        self.efficacy_head = nn.Sequential(
+            nn.Linear(emb_dim, emb_dim),
+            nn.ReLU(),
+            nn.Linear(emb_dim, 1),
+            nn.Sigmoid(),
+        )
+
         # Base MLP (3 layers total: in -> h1 -> h2 -> out)
         in_dim = n_latent + time_emb_dim
         self.lin1 = nn.Linear(in_dim, n_hidden)
@@ -77,12 +100,13 @@ class ConditionalFlowFiLM(nn.Module):
 
         # FiLM generators: simple linear maps from e_p to (gamma, beta) for each layer we modulate
         # gamma/beta shape = (n_hidden,)
+        # FiLM generators: input is [embedding, eta] so emb_dim+1
         if 0 in self.film_on_layers:
-            self.film1 = nn.Linear(emb_dim, 2 * n_hidden)
+            self.film1 = nn.Linear(emb_dim + 1, 2 * n_hidden)
         else:
             self.film1 = None
         if 1 in self.film_on_layers:
-            self.film2 = nn.Linear(emb_dim, 2 * n_hidden)
+            self.film2 = nn.Linear(emb_dim + 1, 2 * n_hidden)
         else:
             self.film2 = None
 
@@ -94,24 +118,27 @@ class ConditionalFlowFiLM(nn.Module):
         # Use 1 + gamma to keep identity near zero init
         return h * (1.0 + gamma) + beta  # (B, H)
 
-    def forward(self, z, t, p_idx):
+    def forward(self, z, t, p_idx, eta: torch.Tensor = None):
         """
-        z: (B, L), t: (B,) or (B,1), p_idx: (B,)
+        z: (B, L), t: (B,) or (B,1), p_idx: (B,), eta optional (B,) or (B,1)
         """
-        if t.dim() == 1:
-            t_ = t
-        else:
-            t_ = t.view(-1)
+        t_ = t if t.dim() == 1 else t.view(-1)
         t_emb = self.time_embed(t_)                 # (B, T)
         e_p   = self.pert_embed(p_idx)              # (B, E)
+        if eta is None:
+            eta = self.efficacy_head(e_p)           # (B,1)
+        else:
+            if eta.dim() == 1:
+                eta = eta.unsqueeze(1)
+        e_aug = torch.cat([e_p, eta], dim=1)        # (B, E+1)
 
         h = torch.cat([z, t_emb], dim=1)            # (B, L+T)
         h = self.lin1(h)                            # (B, H)
-        h = self._apply_film(h, self.film1, e_p)
+        h = self._apply_film(h, self.film1, e_aug)
         h = self.act(h)
 
         h = self.lin2(h)                            # (B, H)
-        h = self._apply_film(h, self.film2, e_p)
+        h = self._apply_film(h, self.film2, e_aug)
         h = self.act(h)
 
         return self.lin_out(h)                      # (B, L)
