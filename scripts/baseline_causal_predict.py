@@ -124,6 +124,40 @@ def _skeleton_from_deltas(deltas: dict, genes: list[str], thresh: float) -> np.n
     return A
 
 
+def _skeleton_from_comovement(
+    deltas: dict, genes: list[str], corr_thresh: float = 0.6, min_perts: int = 2, min_std: float = 1e-4
+) -> np.ndarray:
+    """
+    Add undirected edges for pairs (i,j) whose z-mean shifts co-move across train interventions.
+    For each pair, collect vectors [Δ_i(P)]_P and [Δ_j(P)]_P over available perts P and add edge if:
+      - number of perts >= min_perts, and
+      - std of both vectors >= min_std, and
+      - |corr(Δ_i, Δ_j)| >= corr_thresh.
+    """
+    G = len(genes)
+    # Build a matrix M of shape (num_perts, G): row = delta vector for that pert
+    perts = [p for p in deltas.keys() if p in genes]
+    if len(perts) == 0:
+        return np.zeros((G, G), dtype=int)
+    M = np.vstack([deltas[p] for p in perts])  # rows: perts, cols: genes
+    A = np.zeros((G, G), dtype=int)
+    for i in range(G):
+        xi = M[:, i]
+        if np.std(xi) < min_std:
+            continue
+        for j in range(i + 1, G):
+            xj = M[:, j]
+            if np.std(xj) < min_std:
+                continue
+            if len(perts) < min_perts:
+                continue
+            r = np.corrcoef(xi, xj)[0, 1]
+            if np.isfinite(r) and abs(r) >= corr_thresh:
+                A[i, j] = A[j, i] = 1
+    np.fill_diagonal(A, 0)
+    return A
+
+
 def _orient_edges_from_interventions(
     undirected_adj: np.ndarray,
     genes: List[str],
@@ -185,11 +219,70 @@ def _estimate_knockdown_size_from_train_self(deltas: Dict[str, np.ndarray], gene
     return float(np.mean(vals))
 
 
+def _fallback_orient_by_regression(
+    undirected_adj: np.ndarray,
+    genes: List[str],
+    deltas: Dict[str, np.ndarray],
+    Bmask: np.ndarray,
+    coef_thresh: float = 0.05
+) -> np.ndarray:
+    G = len(genes)
+    # Build matrix M: rows = perts in deltas, cols = genes
+    perts = [p for p in deltas.keys() if p in genes]
+    if len(perts) == 0:
+        return Bmask
+    M = np.vstack([deltas[p] for p in perts])  # shape (P, G)
+    name_to_idx = {g:i for i,g in enumerate(genes)}
+
+    # Helper to get neighbors from skeleton (undirected)
+    def neighbors(k: int) -> List[int]:
+        return [j for j in range(G) if j != k and undirected_adj[k, j] == 1]
+
+    for i in range(G):
+        for j in range(i+1, G):
+            if undirected_adj[i, j] == 0:
+                continue
+            # Skip if already oriented
+            if Bmask[i, j] == 1 or Bmask[j, i] == 1:
+                continue
+            # Build two regressions on perts x genes deltas
+            # V ~ U + N(V\U)
+            V = M[:, j]
+            U = M[:, i]
+            Nv = [n for n in neighbors(j) if n != i]
+            X1 = U[:, None]
+            if len(Nv) > 0:
+                X1 = np.hstack([X1, M[:, Nv]])
+            try:
+                reg1 = LinearRegression(fit_intercept=False).fit(X1, V)
+                c_uv = abs(reg1.coef_[0])
+            except Exception:
+                c_uv = 0.0
+            # U ~ V + N(U\V)
+            Nu = [n for n in neighbors(i) if n != j]
+            X2 = V[:, None]
+            if len(Nu) > 0:
+                X2 = np.hstack([X2, M[:, Nu]])
+            try:
+                reg2 = LinearRegression(fit_intercept=False).fit(X2, U)
+                c_vu = abs(reg2.coef_[0])
+            except Exception:
+                c_vu = 0.0
+            # Decide
+            if c_uv > c_vu and c_uv >= coef_thresh:
+                Bmask[i, j] = 1
+            elif c_vu > c_uv and c_vu >= coef_thresh:
+                Bmask[j, i] = 1
+            # else remain undecided
+    return Bmask
+
+
 def _predict_test(
     train: ad.AnnData,
     test: ad.AnnData,
     genes: List[str] = None,
-    thresh: float = 0.25
+    thresh: float = 0.25,
+    corr_thresh: float = 0.6,
 ) -> ad.AnnData:
     if genes is None:
         genes = list(test.var_names.astype(str))
@@ -200,13 +293,15 @@ def _predict_test(
 
     A = _learn_skeleton_glasso(Z_ctrl_train)
     deltas_train = _pseudobulk_deltas(train, mu_train, sd_train)
-    # Fallback / augment: controls are i.i.d. in the simulator, so Glasso may be empty.
+    # Build delta-based and co-movement skeletons, then union with Glasso
     A_from_delta = _skeleton_from_deltas(deltas_train, genes, thresh=thresh)
+    A_comove = _skeleton_from_comovement(deltas_train, genes, corr_thresh=corr_thresh)
     if A.sum() == 0:
-        A = A_from_delta
+        A = ((A_from_delta + A_comove) > 0).astype(int)
     else:
-        A = ((A + A_from_delta) > 0).astype(int)
+        A = ((A + A_from_delta + A_comove) > 0).astype(int)
     Bmask = _orient_edges_from_interventions(A, genes, deltas_train, thresh=thresh)
+    Bmask = _fallback_orient_by_regression(A, genes, deltas_train, Bmask, coef_thresh=0.05)
     B = _fit_linear_sem_controls(Z_ctrl_train, Bmask)
     kd_z = _estimate_knockdown_size_from_train_self(deltas_train, genes)
 
@@ -224,14 +319,18 @@ def _predict_test(
     G = len(genes)
     genes_arr = np.array(genes)
     skel_edges = [(genes_arr[i], genes_arr[j]) for i in range(G) for j in range(i+1, G) if A[i, j] == 1]
+    comove_edges = [(genes[i], genes[j]) for i in range(G) for j in range(i+1, G) if A_comove[i, j] == 1]
     oriented = [(genes_arr[i], genes_arr[j]) for i in range(G) for j in range(G) if Bmask[i, j] == 1]
     learned_log = {
         "genes": list(genes_arr),
         "skeleton_edges": skel_edges,          # undirected pairs from Graphical Lasso
+        "comovement_edges": comove_edges,      # undirected pairs from co-movement test
         "oriented_edges": oriented,            # (parent, child)
         "B_weights": B.tolist(),               # parent->child matrix
         "kd_z": float(kd_z),
         "thresh": float(thresh),
+        "corr_thresh": float(corr_thresh),
+        "fallback_coef_thresh": 0.05,
     }
 
     pred_adatas: List[ad.AnnData] = []
@@ -281,6 +380,7 @@ def main():
     parser.add_argument("--test_h5ad", required=True, help="Path to test AnnData (.h5ad).")
     parser.add_argument("--out_h5ad", required=True, help="Where to write predicted test AnnData (.h5ad).")
     parser.add_argument("--thresh", type=float, default=0.25, help="Z-delta threshold to orient edges.")
+    parser.add_argument("--corr_thresh", type=float, default=0.6, help="Absolute correlation threshold for co-movement skeleton.")
     args = parser.parse_args()
 
     train = ad.read_h5ad(args.train_h5ad)
@@ -295,7 +395,7 @@ def main():
         train = train[:, genes_common].copy()
         test = test[:, genes_common].copy()
 
-    pred = _predict_test(train, test, genes=list(test.var_names.astype(str)), thresh=args.thresh)
+    pred = _predict_test(train, test, genes=list(test.var_names.astype(str)), thresh=args.thresh, corr_thresh=args.corr_thresh)
     # Print a compact log of the learned graph/weights
     lg = pred.uns.get("learned_graph", {})
     if lg:
@@ -305,7 +405,7 @@ def main():
         print(lg.get("oriented_edges", []))
         print("=== B (parent->child) weights ===")
         print(np.array(lg.get("B_weights", [])))
-        print(f"Estimated knockdown (z): {lg.get('kd_z')}  |  orientation threshold: {lg.get('thresh')}")
+        print(f"Estimated knockdown (z): {lg.get('kd_z')}  |  orientation threshold: {lg.get('thresh')}  |  co-move corr thresh: {lg.get('corr_thresh')}")
 
     os.makedirs(os.path.dirname(args.out_h5ad) or ".", exist_ok=True)
     pred.write(args.out_h5ad)
