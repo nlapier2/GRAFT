@@ -53,6 +53,68 @@ class ConditionalFlowModel(nn.Module):
         e_p   = self.pert_embed(p_idx)      # (B, E)
         zt = torch.cat([z, t_emb, e_p], dim=1)
         return self.net(zt)
+    
+class ConditionalFlowFiLM(nn.Module):
+    """
+    Basic FiLM-conditioned flow:
+      v(z,t | p) = MLP(z, t) with FiLM scale/shift on hidden activations
+      where FiLM params are linear functions of the perturbation embedding e_p.
+    No auxiliary losses; drop-in replacement for ConditionalFlowModel.
+    """
+    def __init__(self, n_latent=128, n_hidden=512, n_perts=1, emb_dim=64, time_emb_dim=32, film_on_layers=(0, 1)):
+        super().__init__()
+        self.n_latent = n_latent
+        self.time_embed = PositionalEmbedding(time_emb_dim)
+        self.pert_embed = nn.Embedding(num_embeddings=n_perts, embedding_dim=emb_dim)
+        self.film_on_layers = set(film_on_layers)  # which hidden layers to FiLM (0-based)
+
+        # Base MLP (3 layers total: in -> h1 -> h2 -> out)
+        in_dim = n_latent + time_emb_dim
+        self.lin1 = nn.Linear(in_dim, n_hidden)
+        self.lin2 = nn.Linear(n_hidden, n_hidden)
+        self.lin_out = nn.Linear(n_hidden, n_latent)
+        self.act = nn.ReLU()
+
+        # FiLM generators: simple linear maps from e_p to (gamma, beta) for each layer we modulate
+        # gamma/beta shape = (n_hidden,)
+        if 0 in self.film_on_layers:
+            self.film1 = nn.Linear(emb_dim, 2 * n_hidden)
+        else:
+            self.film1 = None
+        if 1 in self.film_on_layers:
+            self.film2 = nn.Linear(emb_dim, 2 * n_hidden)
+        else:
+            self.film2 = None
+
+    def _apply_film(self, h, film_layer, e_p):
+        if film_layer is None:
+            return h
+        gb = film_layer(e_p)             # (B, 2*H)
+        gamma, beta = gb.chunk(2, dim=-1)
+        # Use 1 + gamma to keep identity near zero init
+        return h * (1.0 + gamma) + beta  # (B, H)
+
+    def forward(self, z, t, p_idx):
+        """
+        z: (B, L), t: (B,) or (B,1), p_idx: (B,)
+        """
+        if t.dim() == 1:
+            t_ = t
+        else:
+            t_ = t.view(-1)
+        t_emb = self.time_embed(t_)                 # (B, T)
+        e_p   = self.pert_embed(p_idx)              # (B, E)
+
+        h = torch.cat([z, t_emb], dim=1)            # (B, L+T)
+        h = self.lin1(h)                            # (B, H)
+        h = self._apply_film(h, self.film1, e_p)
+        h = self.act(h)
+
+        h = self.lin2(h)                            # (B, H)
+        h = self._apply_film(h, self.film2, e_p)
+        h = self.act(h)
+
+        return self.lin_out(h)                      # (B, L)
 
 class FlowModel(nn.Module):
     """A simple MLP that predicts the velocity vector for flow matching."""

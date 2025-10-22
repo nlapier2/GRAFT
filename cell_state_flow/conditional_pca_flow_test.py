@@ -19,7 +19,7 @@ from sklearn.neighbors import NearestNeighbors
 from scipy.optimize import linear_sum_assignment
 
 # --- Import from your existing models file ---
-from models import ConditionalFlowModel
+from models import ConditionalFlowModel, ConditionalFlowFiLM
 from flow_utils import *
 from load_pathways import *
 
@@ -195,6 +195,9 @@ def main(args):
     flow_model = ConditionalFlowModel(
         n_latent=args.n_latent, n_hidden=args.n_hidden, n_perts=n_perts, emb_dim=args.emb_dim
     ).to(DEVICE)
+    # flow_model = ConditionalFlowFiLM(
+    #     n_latent=args.n_latent, n_hidden=args.n_hidden, n_perts=n_perts, emb_dim=args.emb_dim
+    # ).to(DEVICE)
     optimizer = torch.optim.Adam(flow_model.parameters(), lr=args.lr)
 
     # Initialize perturbation embedding table from pathway-derived gene embeddings (if available)
