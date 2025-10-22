@@ -20,6 +20,7 @@ from scipy.optimize import linear_sum_assignment
 
 # --- Import from your existing models file ---
 from models import ConditionalFlowModel
+from flow_utils import *
 
 def calculate_pca_metrics(pca, val_data):
     """
@@ -50,33 +51,30 @@ def main(args):
 
     # --- 1. Data Preparation ---
     print("\n--- Phase 1: Preparing Data ---")
-    adata = sc.read_h5ad(args.input)
-    if args.target_label not in adata.obs:
+    adata_full = sc.read_h5ad(args.input)
+    if args.target_label not in adata_full.obs:
         raise ValueError(f"Column '{args.target_label}' not found in adata.obs")
-    # Use ALL cells (controls + perturbations)
-    sc.pp.normalize_total(adata)
-    sc.pp.log1p(adata)
-    print("Data normalized and log1p-transformed on ALL cells.")
-    full_data_matrix = adata.X.toarray() if hasattr(adata.X, "toarray") else adata.X
-    # Prepare labels as categorical → integer indices
-    pert_series = adata.obs[args.target_label].astype('category')
-    adata.obs[args.target_label] = pert_series
-    pert_categories = pert_series.cat.categories.tolist()
-    p_idx_all = pert_series.cat.codes.to_numpy().astype(np.int64)  # (N,)
-    n_perts = len(pert_categories)
-    print(f"Found {n_perts} perturbation groups (including control label '{args.control_label}').")
-    
-    # Create train/validation split from the numpy matrix
-    train_size = int(args.train_split * len(full_data_matrix))
-    val_size = len(full_data_matrix) - train_size
-    train_indices, val_indices = random_split(range(len(full_data_matrix)), [train_size, val_size])
-    
-    train_idx = np.array(train_indices.indices)
-    val_idx   = np.array(val_indices.indices)
-    train_data = full_data_matrix[train_idx]
-    val_data   = full_data_matrix[val_idx]
-    p_idx_train = p_idx_all[train_idx]
-    p_idx_val   = p_idx_all[val_idx]
+    sc.pp.normalize_total(adata_full, inplace=True)
+    sc.pp.log1p(adata_full)
+    # We don't pseudobulk in this script
+    args.use_pseudobulk = False
+    args.remove_non_gene_perts = False
+    adata_train, adata_test, _ = train_test_split(args, adata_full, pb_target=None)  # uses seed / pct / external test
+    print(f"[Split] train={adata_train.n_obs} rows, test={(adata_test.n_obs if adata_test is not None else 0)} rows.")  # :contentReference[oaicite:2]{index=2}
+    # Matrix views
+    X_train = adata_train.X.toarray() if hasattr(adata_train.X, "toarray") else adata_train.X
+    X_test  = (adata_test.X.toarray()  if (adata_test is not None and hasattr(adata_test.X, "toarray")) else
+               (adata_test.X if adata_test is not None else None))
+
+    n = X_train.shape[0]
+    rng = np.random.default_rng(0)
+    idx = np.arange(n)
+    rng.shuffle(idx)
+    split = int(0.9 * n)
+    train_indices = idx[:split]
+    val_indices   = idx[split:]
+    train_data = X_train[train_indices]
+    val_data   = X_train[val_indices]
 
     if args.no_pca:
         # --- 2. Bypass PCA ---
@@ -105,12 +103,34 @@ def main(args):
         train_latent = (train_latent - mu) / std
         # Whiten VAL using same stats
         val_latent_w = (pca.transform(val_data) - mu) / std
+        mu_all, std_all = mu.copy(), std.copy()  # for all later unwhitening
 
-    # Convert to PyTorch Tensor for training
+    # ---------------------------
+    # Global label vocabulary (train ∪ test) so unseen perts have embeddings
+    # ---------------------------
+    ser_train = adata_train.obs[args.target_label].astype('category')
+    if adata_test is not None:
+        # Build a union of categories deterministically
+        cats = sorted(set(ser_train.astype(str).tolist()) |
+                      set(adata_test.obs[args.target_label].astype(str).tolist()))
+    else:
+        cats = sorted(set(ser_train.astype(str).tolist()))
+    label_to_idx = {lab: i for i, lab in enumerate(cats)}
+    n_perts = len(cats)
+    print(f"[Labels] global vocab size = {n_perts} (includes held-out perts).")
+    # Codes for TRAIN and VAL (TRAIN rows only)
+    p_idx_all_train = np.array(
+        [label_to_idx[s] for s in adata_train.obs[args.target_label].astype(str).values],
+        dtype=np.int64,
+    )
+    p_idx_train = p_idx_all_train[train_indices]
+    p_idx_val   = p_idx_all_train[val_indices]
+
     train_dataset = TensorDataset(
         torch.tensor(train_latent, dtype=torch.float32),
-        torch.tensor(p_idx_train, dtype=torch.long)
+        torch.tensor(p_idx_train, dtype=torch.long),
     )
+
     # Optional: class-balanced sampling could be added later; shuffle is fine to start.
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False)
 
@@ -229,36 +249,75 @@ def main(args):
         print(f"Generative UMAP for PCA baseline saved to '{args.plot_file}'")
 
     # -------------------------
-    # Phase 5: Per-perturbation GENERATION for ALL cells (same counts as original)
+    # Phase 5: EVALUATION on TEST (and optionally TRAIN) using your flow_utils
+    #          + optional predicted/true .h5ads
     # -------------------------
-    if args.output_h5ad:
-        print(f"\n--- Phase 5: Generating per-perturbation samples for ALL cells → '{args.output_h5ad}' ---")
-        # Count per-pert in the FULL dataset (after normalization)
-        counts = pd.Series(p_idx_all).value_counts().sort_index().to_numpy()  # length n_perts
-        X_gen_all = []
-        obs_rows  = []
-        # Generate per group with the same sizes
-        for pid, gname in enumerate(pert_categories):
-            Ng = int(counts[pid])
-            if Ng == 0: 
-                continue
-            with torch.no_grad():
-                z0 = torch.randn(Ng, args.n_latent, device=DEVICE)
-                pids = torch.full((Ng,), pid, dtype=torch.long, device=DEVICE)
-                def ode_func_g(t, z):
-                    return flow_model(z, t.expand(z.size(0)), pids)
-                tspan = torch.tensor([0.0, 1.0], device=DEVICE)
-                z1w = odeint(ode_func_g, z0, tspan, method='dopri5')[1].cpu().numpy()  # (Ng, L)
-                Xg  = pca.inverse_transform(z1w * std + mu)
-                Xg  = np.maximum(Xg, 0.0)
-            X_gen_all.append(Xg)
-            obs_rows.extend([{'source':'Generated', args.target_label: gname}] * Ng)
-        X_gen_all = np.vstack(X_gen_all) if len(X_gen_all) else np.empty((0, adata.n_vars), dtype=float)
-        obs_gen = pd.DataFrame(obs_rows, index=[f'gen_{i}' for i in range(X_gen_all.shape[0])])
+    @torch.no_grad()
+    def predict_for_split(adata_split):
+        """Generate one sample per NON-control row, in the SAME ROW ORDER as adata_split[nonctrl]."""
+        labels = adata_split.obs[args.target_label].astype(str).values
+        nonctrl_mask = labels != args.control_label
+        idx_non = np.nonzero(nonctrl_mask)[0]
+        pert_names = labels[nonctrl_mask].tolist()  # row-aligned list
+        # global control mean from TRAIN (not split)
+        ctrl_mean = to_numpy(adata_train[adata_train.obs[args.target_label]==args.control_label].X).mean(axis=0)
 
-        out = anndata.AnnData(X=X_gen_all, obs=obs_gen, var=adata.var.copy())
-        out.write_h5ad(args.output_h5ad)
-        print("Saved.")
+        N_non = len(idx_non)
+        G = adata_split.n_vars
+        pred_mat = np.empty((N_non, G), dtype=np.float32)
+
+        # iterate labels in order of first appearance among non-controls
+        seen, ordered_labels = set(), []
+        for lab in pert_names:
+            if lab not in seen:
+                seen.add(lab)
+                ordered_labels.append(lab)
+
+        for lab in ordered_labels:
+            # positions within the non-control slice where this label occurs
+            sel = np.where(labels[idx_non] == lab)[0]
+            Ng = sel.size
+            if Ng == 0:
+                continue
+            pid = label_to_idx.get(lab, 0)
+            z0 = torch.randn(Ng, args.n_latent, device=DEVICE)
+            pids = torch.full((Ng,), pid, dtype=torch.long, device=DEVICE)
+            def ode_func_g(t, z):
+                return flow_model(z, t.expand(z.size(0)), pids)
+            tspan = torch.tensor([0.0, 1.0], device=DEVICE)
+            z1w = odeint(ode_func_g, z0, tspan, method='dopri5')[1].cpu().numpy()   # (Ng, L)
+            Xg  = pca.inverse_transform(z1w * std + mu)                              # (Ng, G)
+            Xg  = np.maximum(Xg, 0.0)
+            pred_mat[sel, :] = Xg
+
+        true_mat = to_numpy(adata_split[nonctrl_mask].X).astype(np.float32, copy=False)
+        return (pred_mat, true_mat, pert_names, ctrl_mean)
+
+    if adata_test is not None:
+        print("\n=== Final Evaluation on HELD-OUT TEST perturbations ===")
+        pred_bundle = predict_for_split(adata_test)
+        evaluate_model(adata=adata_test, args=args, pred_bundle=pred_bundle)
+        if args.out_pred_h5ad:
+            print(f"\n💾 Writing TEST predicted+true h5ads → {args.out_pred_h5ad}")
+            adata_test_dense = adata_test.copy()
+            adata_test_dense.X = to_numpy(adata_test_dense.X).astype(np.float32, copy=False)
+            write_pred_true_h5ads(eval_adata=adata_test_dense, pred_bundle=pred_bundle,
+                                  out_pred_h5ad=args.out_pred_h5ad,
+                                  target_label=args.target_label,
+                                  control_label=args.control_label)
+
+    if args.eval_on_train:
+        print("\n=== Evaluation on TRAIN split (fit on TRAIN) ===")
+        pred_bundle_tr = predict_for_split(adata_train)
+        evaluate_model(adata=adata_train, args=args, pred_bundle=pred_bundle_tr)
+        if args.out_pred_h5ad_train:
+            print(f"\n💾 Writing TRAIN predicted+true h5ads → {args.out_pred_h5ad_train}")
+            adata_train_dense = adata_train.copy()
+            adata_train_dense.X = to_numpy(adata_train_dense.X).astype(np.float32, copy=False)
+            write_pred_true_h5ads(eval_adata=adata_train_dense, pred_bundle=pred_bundle_tr,
+                                  out_pred_h5ad=args.out_pred_h5ad_train,
+                                  target_label=args.target_label,
+                                  control_label=args.control_label)
 
     print("Done.")
 
@@ -281,6 +340,12 @@ if __name__ == '__main__':
     parser.add_argument('--output_h5ad', type=str, default='conditional_generated.h5ad', help='ONE .h5ad stacking ORIGINAL and per-perturbation GENERATED cells.')
     parser.add_argument('--target_label', type=str, default='target_gene', help='The column name in adata.obs that contains perturbation information.')
     parser.add_argument('--control_label', type=str, default='non-targeting', help='The value in the target_label column that indicates a control cell.')
-    
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--test_pct_perts', type=float, default=0.0, help='Fraction of *perturbation labels* to hold out (excl. control); 0.0 means no holdout.')
+    parser.add_argument('--test_h5ad', type=str, default='', help='Optional external TEST .h5ad; if set, overrides --test_pct_perts.')
+    parser.add_argument('--eval_on_train', action='store_true', help='Also evaluate on TRAIN split.')
+    parser.add_argument('--out_pred_h5ad', type=str, default='', help='If set, write predicted+true .h5ads for TEST split (pred file and pred.true.h5ad).')
+    parser.add_argument('--out_pred_h5ad_train', type=str, default='', help='If set, also write predicted+true .h5ads for TRAIN split.')
+
     args = parser.parse_args()
     main(args)
