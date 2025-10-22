@@ -21,6 +21,7 @@ from scipy.optimize import linear_sum_assignment
 # --- Import from your existing models file ---
 from models import ConditionalFlowModel
 from flow_utils import *
+from load_pathways import *
 
 def calculate_pca_metrics(pca, val_data):
     """
@@ -126,6 +127,61 @@ def main(args):
     p_idx_train = p_idx_all_train[train_indices]
     p_idx_val   = p_idx_all_train[val_indices]
 
+    # ---------------------------
+    # Pathway → gene-feature matrix → compressed gene embeddings (ALL genes)
+    # ---------------------------
+    gene_names = list(adata_full.var_names)  # reference order for all genes
+    if args.pathway_cfg:
+        print(f"\n--- Loading pathway sources from: {args.pathway_cfg} ---")
+        srcs = load_pathway_sources(args.pathway_cfg)  # dict[name] -> {file,gene_col,pathway_col,format}
+        if not srcs:
+            print("[Pathways] No sources found in YAML; continuing without pathway features.")
+            gene_emb = None
+        else:
+            # Build and concatenate pathway matrices (genes x pathways)
+            mats = []
+            for name, meta in srcs.items():
+                pm = make_pathway_matrix(
+                    file_name=meta['file'],
+                    gene_col=meta['gene_col'],
+                    pathway_col=meta['pathway_col'],
+                    format=meta['format'],
+                    var_names=gene_names,
+                )  # shape: (n_genes, n_feats_name)
+                print(f"[Pathways] Loaded '{name}' with shape {pm.shape}")
+                mats.append(pm)
+            feat_df = pd.concat(mats, axis=1) if len(mats) > 1 else mats[0]
+            # Ensure gene row order matches var_names
+            feat_df = feat_df.loc[gene_names]
+            feat_mat = feat_df.to_numpy(dtype=np.float32)   # (n_genes, n_total_feats)
+            # Compress to emb_dim using PCA over features
+            print(f"[Pathways] Compressing {feat_mat.shape[1]} features → {args.emb_dim} dims via PCA")
+            pca_features = PCA(n_components=min(args.emb_dim, min(feat_mat.shape)-1), random_state=0)
+            gene_emb = pca_features.fit_transform(feat_mat)  # (n_genes, emb_dim_eff)
+            # If emb_dim > computed (edge-case for tiny feats), pad with zeros
+            if gene_emb.shape[1] < args.emb_dim:
+                pad = np.zeros((gene_emb.shape[0], args.emb_dim - gene_emb.shape[1]), dtype=np.float32)
+                gene_emb = np.hstack([gene_emb.astype(np.float32), pad])
+            else:
+                gene_emb = gene_emb.astype(np.float32)
+            print(f"[Pathways] Gene embedding matrix: {gene_emb.shape}")
+    else:
+        print("[Pathways] No --pathway_cfg provided; will initialize embeddings randomly.")
+        gene_emb = None
+
+    # Map perturbation labels (which are target genes) → rows in gene_emb (or zeros)
+    # Ensures **every label** (incl. unseen at train) has an embedding vector.
+    per_label_init = np.zeros((n_perts, args.emb_dim), dtype=np.float32)
+    if gene_emb is not None:
+        gene_to_row = {g:i for i,g in enumerate(gene_names)}
+        for lab, idx_lab in label_to_idx.items():
+            if lab == args.control_label:
+                per_label_init[idx_lab, :] = 0.0  # control embedding = zero
+            else:
+                ridx = gene_to_row.get(lab, None)
+                per_label_init[idx_lab, :] = gene_emb[ridx, :] if ridx is not None else 0.0
+    # If no pathway features loaded, we leave zeros; the embedding layer will remain trainable.
+
     train_dataset = TensorDataset(
         torch.tensor(train_latent, dtype=torch.float32),
         torch.tensor(p_idx_train, dtype=torch.long),
@@ -140,6 +196,21 @@ def main(args):
         n_latent=args.n_latent, n_hidden=args.n_hidden, n_perts=n_perts, emb_dim=args.emb_dim
     ).to(DEVICE)
     optimizer = torch.optim.Adam(flow_model.parameters(), lr=args.lr)
+
+    # Initialize perturbation embedding table from pathway-derived gene embeddings (if available)
+    if per_label_init is not None:
+        with torch.no_grad():
+            init_t = torch.from_numpy(per_label_init).to(flow_model.pert_embed.weight.device)
+            if init_t.shape[1] != flow_model.pert_embed.embedding_dim:
+                # Safety (shouldn’t hit because we used args.emb_dim): project or pad
+                emb_dim = flow_model.pert_embed.embedding_dim
+                if init_t.shape[1] > emb_dim:
+                    init_t = init_t[:, :emb_dim]
+                else:
+                    pad = torch.zeros(init_t.size(0), emb_dim - init_t.size(1), device=init_t.device)
+                    init_t = torch.cat([init_t, pad], dim=1)
+            flow_model.pert_embed.weight.data.copy_(init_t)
+        print("[Init] Perturbation embeddings initialized from pathway features (zeros for control/missing).")
 
     train_losses = []
     for epoch in range(args.epochs):
@@ -334,7 +405,8 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate for the Adam optimizer.')
     parser.add_argument('--epochs', type=int, default=150, help='Number of training epochs.')
     parser.add_argument('--train_split', type=float, default=0.8, help="Fraction of data to use for training (0.0 to 1.0).")
-    parser.add_argument('--emb_dim', type=int, default=64, help='Perturbation embedding dimension for the conditional flow.')
+    parser.add_argument('--emb_dim', type=int, default=256, help='Perturbation embedding dimension for the conditional flow.')
+    parser.add_argument('--pathway_cfg', type=str, default='', help='YAML with pathway sources (file, gene_col, pathway_col, format).')
     # I/O Arguments
     parser.add_argument('--plot_file', type=str, default=None, help='Path to save the output generative UMAP plot.')
     parser.add_argument('--output_h5ad', type=str, default='conditional_generated.h5ad', help='ONE .h5ad stacking ORIGINAL and per-perturbation GENERATED cells.')
