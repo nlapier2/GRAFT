@@ -38,6 +38,15 @@ def parse_arguments():
     ap.add_argument('--eval_on_train', action='store_true', help='Evaluate on training set in addition to test set')
     ap.add_argument('--write_test', action='store_true', help='Write true test set')
 
+    # Method + KRR hyperparams
+    ap.add_argument("--method", type=str, default="krr",
+                    choices=["krr"], help="Which transfer method to run.")
+    ap.add_argument("--krr_lambda", type=float, default=1e-2,
+                    help="Ridge regularization λ for KRR on perturbation kernel.")
+    ap.add_argument("--kernel_metric", type=str, default="corr",
+                    choices=["corr", "cosine"],
+                    help="How to build the perturbation kernel from the external dataset.")
+
     args = ap.parse_args()
     return args
 
@@ -100,6 +109,99 @@ def compute_deltas(adata, target_label, control_label):
         for pert in pert_adata.obs[target_label].unique()
     }
     return deltas, control_mean
+
+def _row_standardize(M: np.ndarray) -> np.ndarray:
+    """Zero-mean, unit-norm per row (safe for sparse/np arrays)."""
+    M = np.asarray(M, dtype=np.float32)
+    M = M - M.mean(axis=1, keepdims=True)
+    denom = np.linalg.norm(M, axis=1, keepdims=True) + 1e-8
+    return M / denom
+
+def _pert_list(adata: ad.AnnData, target_label: str, control_label: str) -> list[str]:
+    perts_all = list(map(str, adata.obs[target_label].values))
+    # If pseudobulked, each row is a single pert; otherwise fallback to unique order.
+    # In either case, we evaluate on NON-control perts only.
+    uniq = list(dict.fromkeys(perts_all))  # stable unique
+    return [p for p in uniq if p != control_label]
+
+def krr_predict_from_external(
+    adata_source: ad.AnnData,
+    adata_train: ad.AnnData,
+    adata_eval: ad.AnnData,
+    target_label: str,
+    control_label: str,
+    krr_lambda: float = 1e-2,
+    kernel_metric: str = "corr",
+    ctrl_mean_target: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[str], np.ndarray]:
+    """
+    KRR over perturbation index with kernel built from EXTERNAL deltas (train+eval perts).
+    Returns the bundle expected by your evaluator: (pred_mat, true_mat, pert_names, ctrl_mean),
+    where **pred_mat and true_mat are EXPRESSION LEVELS**, not deltas.
+    ctrl_mean is the TRAIN-split control mean, matching your evaluation protocol.
+    """
+    G = adata_train.n_vars
+    # ---- use TRAIN control mean (for adding back to deltas & evaluator's baseline) ----
+    if ctrl_mean_target is None:
+        train_mask = np.asarray(adata_train.obs[target_label] == control_label)
+        ctrl_mean_target = np.asarray(adata_train.X)[train_mask].mean(axis=0).reshape(-1)
+
+    # ---- define sets ----
+    O = _pert_list(adata_train, target_label, control_label)  # observed perts
+    U = _pert_list(adata_eval,  target_label, control_label)  # to predict/evaluate
+    perts_all = O + [p for p in U if p not in O]
+    G = adata_train.n_vars
+
+    # ---- external deltas: build kernel K over perts_all ----
+    del_src, _ = compute_deltas(adata_source, target_label, control_label)  # dict: pert -> (1 x G) row
+    # stack rows in perts_all order
+    Delta_src = np.stack([np.asarray(del_src[p]).ravel() for p in perts_all], axis=0)  # (P,G)
+
+    if kernel_metric == "corr":
+        Z = _row_standardize(Delta_src)            # (P,G)
+        K = Z @ Z.T                                # cosine of centered, unit-norm rows = correlation
+    else:  # "cosine"
+        Z = Delta_src / (np.linalg.norm(Delta_src, axis=1, keepdims=True) + 1e-8)
+        K = Z @ Z.T
+    # ensure numerical PSD
+    K = (K + K.T) * 0.5
+    K += np.eye(K.shape[0], dtype=K.dtype) * 1e-6
+
+    # indices for O and U inside perts_all
+    idx = {p: i for i, p in enumerate(perts_all)}
+    iO = np.array([idx[p] for p in O], dtype=int)
+    iU = np.array([idx[p] for p in U], dtype=int)
+
+    KOO = K[np.ix_(iO, iO)]
+    KUO = K[np.ix_(iU, iO)]
+
+    # ---- target deltas: Y_O (|O| x G) and Y_true_U (|U| x G) ----
+    # build deltas against the SAME ctrl_mean_target
+    def _delta_mat(adataX: ad.AnnData, perts: list[str]) -> np.ndarray:
+        rows = []
+        for p in perts:
+            v = adataX[adataX.obs[target_label] == p].X
+            v = np.asarray(v).reshape(-1, G).mean(axis=0)  # pseudobulk row for this pert
+            rows.append(v - ctrl_mean_target)
+        return np.stack(rows, axis=0)
+
+    Y_O = _delta_mat(adata_train, O)   # (|O|, G)
+
+    # ---- KRR: \hat Y_U = K_{UO} (K_{OO} + λI)^{-1} Y_O ----
+    A = np.linalg.solve(KOO + krr_lambda * np.eye(KOO.shape[0], dtype=KOO.dtype),
+                        Y_O)  # (|O|, G)
+    Y_U_hat_delta = KUO @ A  # (|U|, G) deltas
+
+    # ---- Convert to EXPRESSION levels expected by evaluator ----
+    pred_mat = Y_U_hat_delta + ctrl_mean_target[None, :]   # (|U|, G)
+
+    # ---- True expression rows and pert_names from EVAL split (like your example) ----
+    test_pert_mask = adata_eval.obs[target_label].isin(U)
+    true_mat = np.asarray(adata_eval.X)[np.asarray(test_pert_mask)]
+    pert_names = adata_eval.obs.loc[test_pert_mask, target_label].astype(str).tolist()
+
+    # ctrl_mean returned in the bundle = TRAIN control mean (global baseline)
+    return pred_mat, true_mat, pert_names, np.asarray(ctrl_mean_target).ravel()
 
 def evaluate_model(
     adata: ad.AnnData,
@@ -284,7 +386,19 @@ def main():
     # 3. Evaluate on the Test Set
     # ---------------------------
     print("\n=== Evaluation on {} set ===".format("TEST" if adata_test is not None else "TRAIN"))
-    eval_pred_bundle = None  # Placeholder
+    if args.method == "krr":
+        eval_pred_bundle = krr_predict_from_external(
+            adata_source=adata_source,
+            adata_train=adata_train,
+            adata_eval=eval_adata,
+            target_label=args.target_label,
+            control_label=args.control_label,
+            krr_lambda=args.krr_lambda,
+            kernel_metric=args.kernel_metric,
+            ctrl_mean_target=None,
+        )
+    else:
+        raise ValueError(f"Unknown method: {args.method}")
     evaluate_model(adata=eval_adata, args=args, pred_bundle=eval_pred_bundle)
 
     # ---------------------------
@@ -292,7 +406,16 @@ def main():
     # ---------------------------
     if args.eval_on_train and (adata_test is not None):
         print("\n=== Evaluation on TRAIN set ===")
-        train_pred_bundle = None  # Placeholder
+        train_pred_bundle = krr_predict_from_external(
+            adata_source=adata_source,
+            adata_train=adata_train,
+            adata_eval=adata_train,
+            target_label=args.target_label,
+            control_label=args.control_label,
+            krr_lambda=args.krr_lambda,
+            kernel_metric=args.kernel_metric,
+            ctrl_mean_target=None,
+        )
         evaluate_model(adata=adata_train, args=args, pred_bundle=train_pred_bundle)
 
     # ---------------------------
