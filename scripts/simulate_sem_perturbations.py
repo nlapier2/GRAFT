@@ -23,8 +23,10 @@ target has a direct fractional change = -efficiency; others are 0).
 New expression for gene X is:
     X' = X_baseline * (1 + fX) + noise_X
 
-Baseline control expression per cell is drawn i.i.d. Normal(mean, sd), truncated at 0.
-You can tweak means/variances via CLI flags.
+Controls are drawn from the *stationary SEM covariance*:
+   Sigma = (I - B)^{-1} diag(resid_var) (I - B)^{-T},
+then per-cell size factors are added and *Negative Binomial* counts are sampled
+(Gamma–Poisson). Perturbations apply fractional shifts to the *mean* before NB sampling.
 
 Outputs
 -------
@@ -54,33 +56,64 @@ from typing import Dict, Tuple, List
 
 import numpy as np
 import pandas as pd
-try:
-    import anndata as ad
-except Exception as e:
-    raise SystemExit("This script requires the 'anndata' package. Try: pip install anndata") from e
+import anndata as ad
+
+from numpy.linalg import inv
 
 
 GENES = ["A","B","C","D","E"]
 
-def truncated_normal(n: int, mean: float, sd: float, rng: np.random.Generator) -> np.ndarray:
-    """Sample from a Normal(mean, sd) truncated at 0 (no negatives)."""
-    x = rng.normal(loc=mean, scale=sd, size=n)
-    x[x < 0] = 0.0
-    return x
+def _build_B(weights: Dict[Tuple[str,str], float]) -> np.ndarray:
+    """Parent->child weighted adjacency B in the order GENES."""
+    idx = {g:i for i,g in enumerate(GENES)}
+    B = np.zeros((len(GENES), len(GENES)), dtype=float)
+    for (u,v), w in weights.items():
+        if u in idx and v in idx:
+            B[idx[u], idx[v]] = float(w)
+    return B
 
-def sample_controls(n_controls: int, mean: float, var: float, rng: np.random.Generator) -> np.ndarray:
-    """Return (n_controls x 5) baseline expression for A..E."""
-    sd = float(np.sqrt(var))
-    mat = np.stack([truncated_normal(n_controls, mean, sd, rng) for _ in GENES], axis=1)
-    return mat
+def _stationary_cov(B: np.ndarray, resid_var: float) -> np.ndarray:
+    """Sigma = (I-B)^{-1} diag(resid_var) (I-B)^{-T}."""
+    G = B.shape[0]
+    I = np.eye(G)
+    R = np.full(G, float(resid_var), dtype=float)
+    A = inv(I - B)
+    Sigma = A @ np.diag(R) @ A.T
+    return Sigma
+
+def _draw_size_factors(n: int, mu: float, sigma: float, rng: np.random.Generator) -> np.ndarray:
+    """LogNormal size factors (library sizes)."""
+    return rng.lognormal(mean=mu, sigma=sigma, size=n)
+
+def _nb_sample(mu: np.ndarray, phi: float, rng: np.random.Generator) -> np.ndarray:
+    """
+    Negative Binomial via Gamma–Poisson. phi: dispersion (>0).
+    Var = mu + phi * mu^2. Implemented as:
+      lambda ~ Gamma(shape=1/phi, scale=phi*mu) ;  X ~ Poisson(lambda)
+    """
+    mu = np.clip(mu, 1e-8, None)
+    shape = 1.0 / float(phi)
+    scale = float(phi) * mu
+    lam = rng.gamma(shape=shape, scale=scale, size=mu.shape)
+    X = rng.poisson(lam)
+    return X
+
+def _sample_control_means_mvn(n: int, mean: float, Sigma: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """
+    Draw baseline *means* for controls from MVN(mean*1, Sigma). Clip small negatives.
+    Returns (n x G) matrix of mean expression before size factors.
+    """
+    G = len(GENES)
+    mu_vec = np.full(G, float(mean), dtype=float)
+    M = rng.multivariate_normal(mean=mu_vec, cov=Sigma, size=n)
+    return np.clip(M, 1e-6, None)
 
 def propagate_fractional_changes(
-    baseline: np.ndarray,
+    baseline_means: np.ndarray,
     target: str | None,
     efficiency: float,
     w_AD: float, w_BD: float, w_DE: float, w_CE: float,
     rng: np.random.Generator,
-    noise_sd: float
 ) -> np.ndarray:
     """
     Given baseline expression (n_cells x 5) for (A..E), apply a single perturbation label
@@ -92,7 +125,7 @@ def propagate_fractional_changes(
         fE = fE_direct + w_DE * fD + w_CE * fC
     fA, fB, fC are direct only if targeted; otherwise 0.
     """
-    n, g = baseline.shape
+    n, g = baseline_means.shape
     assert g == 5
 
     # Direct fractional changes from knockdown:
@@ -108,13 +141,8 @@ def propagate_fractional_changes(
 
     # All cells share the same fractional changes for a given perturbation condition.
     F = np.tile(np.array([fA, fB, fC, fD, fE], dtype=float), (n,1))
-
-    # Additive Gaussian noise on counts (around the new mean), truncated at 0.
-    noise = rng.normal(loc=0.0, scale=noise_sd, size=baseline.shape)
-
-    X = baseline * (1.0 + F) + noise
-    X[X < 0] = 0.0
-    return X
+    M = baseline_means * (1.0 + F)              # new *means* after perturbation
+    return np.clip(M, 1e-8, None)
 
 def make_adata_from_matrix(X: np.ndarray, target_gene: str) -> 'ad.AnnData':
     adata = ad.AnnData(X=X.astype(np.float32))
@@ -130,7 +158,10 @@ def create_split(
     weights: Dict[Tuple[str,str], float],
     mean: float,
     var: float,
-    rng: np.random.Generator
+    rng: np.random.Generator,
+    sizefactor_mu: float = 0.0,
+    sizefactor_sigma: float = 0.25,
+    phi: float = 0.1,
 ) -> Dict[str, ad.AnnData]:
     """
     Build all condition-specific AnnData objects for each perturbation and combine into
@@ -143,24 +174,30 @@ def create_split(
     w_DE = weights.get(("D","E"), 0.5)
     w_CE = weights.get(("C","E"), 0.5)
 
-    sd = float(np.sqrt(var))
+    # Build SEM covariance for controls
+    B = _build_B({("A","D"):w_AD, ("B","D"):w_BD, ("D","E"):w_DE, ("C","E"):w_CE})
+    Sigma = _stationary_cov(B, resid_var=var)
 
     # Prepare baseline for each perturbation condition
     perts = ["A","B","C","D","E"]
     adatas: Dict[str, ad.AnnData] = {}
 
-    # Controls (shared across all splits)
-    ctrl = make_adata_from_matrix(controls_X, "non-targeting")
+    # Controls (shared across all splits) — resample counts from MVN means + size factors + NB
+    ctrl_means = _sample_control_means_mvn(controls_X.shape[0], mean, Sigma, rng)
+    s_ctrl = _draw_size_factors(ctrl_means.shape[0], mu=sizefactor_mu, sigma=sizefactor_sigma, rng=rng)
+    ctrl_counts = _nb_sample(ctrl_means * s_ctrl[:, None], phi=phi, rng=rng)
+    ctrl = make_adata_from_matrix(ctrl_counts, "non-targeting")
 
     # Per perturbation matrices
     for p in perts:
-        base = sample_controls(n_per_pert, mean, var, rng)
-        Xp = propagate_fractional_changes(
-            baseline=base, target=p, efficiency=efficiency,
-            w_AD=w_AD, w_BD=w_BD, w_DE=w_DE, w_CE=w_CE,
-            rng=rng, noise_sd=sd
+        base_means = _sample_control_means_mvn(n_per_pert, mean, Sigma, rng)
+        Mp = propagate_fractional_changes(
+            baseline_means=base_means, target=p, efficiency=efficiency,
+            w_AD=w_AD, w_BD=w_BD, w_DE=w_DE, w_CE=w_CE, rng=rng
         )
-        adatas[p] = make_adata_from_matrix(Xp, p)
+        s = _draw_size_factors(n_per_pert, mu=sizefactor_mu, sigma=sizefactor_sigma, rng=rng)
+        counts = _nb_sample(Mp * s[:, None], phi=phi, rng=rng)
+        adatas[p] = make_adata_from_matrix(counts, p)
 
     # Assemble splits
     # Hard: train on {A,B,C} (+controls); test on {D,E} (+controls)
@@ -176,7 +213,10 @@ def create_split(
         A.uns["sem_graph"] = {
             "edges": {"A->D": w_AD, "B->D": w_BD, "D->E": w_DE, "C->E": w_CE},
             "efficiency": efficiency,
-            "note": "Fractional-effect SEM; fD = fD_direct + w_AD*fA + w_BD*fB; fE = fE_direct + w_DE*fD + w_CE*fC"
+            "note": "Fractional-effect SEM; fD = fD_direct + w_AD*fA + w_BD*fB; fE = fE_direct + w_DE*fD + w_CE*fC",
+            "covariance": "stationary SEM Sigma = (I-B)^-1 diag(resid_var) (I-B)^-T",
+            "nb_dispersion_phi": float(phi),
+            "sizefactor_lognormal": {"mu": float(sizefactor_mu), "sigma": float(sizefactor_sigma)}
         }
 
     return {
@@ -194,6 +234,9 @@ def main():
     p.add_argument("--n_per_pert", type=int, default=500, help="Number of cells per perturbation condition.")
     p.add_argument("--mean", type=float, default=10000.0, help="Baseline per-gene mean counts for controls.")
     p.add_argument("--var", type=float, default=1000.0, help="Per-gene variance (used for both baseline and additive noise).")
+    p.add_argument("--phi", type=float, default=0.1, help="Negative Binomial dispersion phi (>0): Var=mu+phi*mu^2.")
+    p.add_argument("--sizefactor_mu", type=float, default=0.0, help="LogNormal mean for size factors (log-space).")
+    p.add_argument("--sizefactor_sigma", type=float, default=0.25, help="LogNormal sigma for size factors (log-space).")
     p.add_argument("--efficiency", type=float, default=0.5, help="Knockdown efficiency (fractional), e.g., 0.5 = 50%%.")
     p.add_argument("--w_AD", type=float, default=0.5, help="Fractional-effect weight from A to D.")
     p.add_argument("--w_BD", type=float, default=0.5, help="Fractional-effect weight from B to D.")
@@ -207,8 +250,8 @@ def main():
     os.makedirs(args.outdir, exist_ok=True)
     rng = np.random.default_rng(args.seed)
 
-    # Controls baseline
-    controls_X = sample_controls(args.n_controls, args.mean, args.var, rng)
+    # Placeholder array for control count of rows; values not used after refactor
+    controls_X = np.empty((args.n_controls, len(GENES)), dtype=float)
 
     splits = create_split(
         controls_X=controls_X,
@@ -217,7 +260,10 @@ def main():
         weights={("A","D"):args.w_AD, ("B","D"):args.w_BD, ("D","E"):args.w_DE, ("C","E"):args.w_CE},
         mean=args.mean,
         var=args.var,
-        rng=rng
+        rng=rng,
+        sizefactor_mu=args.sizefactor_mu,
+        sizefactor_sigma=args.sizefactor_sigma,
+        phi=args.phi,
     )
 
     # Save
