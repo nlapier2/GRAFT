@@ -119,14 +119,22 @@ def train_test_split(args, adata):
     # If --test_h5ad is provided, use that file for evaluation and ignore --test_pct_perts.
     # Otherwise, do the leave-perturbations-out split as before.
     # ---------------------------
+    adata_test_orig = None
     if args.test_h5ad:
         print(f"=== Using external TEST set: {args.test_h5ad} (overrides --test_pct_perts) ===")
         adata_train = adata
         adata_test = ad.read_h5ad(args.test_h5ad)
+        adata_test_orig = adata_test.copy()
+        if args.use_pseudobulk:
+            adata_test = collapse_to_pseudobulk(adata_test, args.target_label)
         sc.pp.normalize_total(adata_test, inplace=True)
         sc.pp.log1p(adata_test)
         if sparse.isspmatrix(adata_test.X) and not sparse.isspmatrix_csr(adata_test.X):
             adata_test.X = adata_test.X.tocsr()  # nicer slicing, though we load to numpy anyway
+        sc.pp.normalize_total(adata_test_orig, inplace=True)
+        sc.pp.log1p(adata_test_orig)
+        if sparse.isspmatrix(adata_test_orig.X) and not sparse.isspmatrix_csr(adata_test_orig.X):
+            adata_test_orig.X = adata_test_orig.X.tocsr()  # nicer slicing, though we load to numpy anyway
         # Sanity check: same genes / order (as guaranteed by user)
         assert np.array_equal(adata_train.var_names.values, adata_test.var_names.values), \
             "Train and test var_names differ or are out of order."
@@ -147,7 +155,7 @@ def train_test_split(args, adata):
         if n_test > 0:
             print(f"Test perts: {sorted(test_perts)[:10]}{' ...' if len(test_perts) > 10 else ''}")
         print(f"Train cells: {adata_train.n_obs}, Test cells: {adata_test.n_obs if adata_test is not None else 0}")
-    return adata_train, adata_test
+    return adata_train, adata_test, adata_test_orig
 
 @torch.no_grad()
 def print_edge_weight_stats(model, prefix="edges"):

@@ -48,6 +48,8 @@ def parse_arguments():
                     help="Optional path to a separate test AnnData. If set, overrides --test_pct_perts.")
     ap.add_argument('--eval_on_train', action='store_true', help='Evaluate on training set in addition to test set')
     ap.add_argument('--write_test', action='store_true', help='Write true test set')
+    ap.add_argument("--test_predict_out", type=str, default="",
+                    help="Path to write cell-level predicted test AnnData (.h5ad).")
 
     # Method + KRR hyperparams
     ap.add_argument("--method", type=str, default="krr",
@@ -451,6 +453,113 @@ def krr_predict_from_external(
     # ctrl_mean returned in the bundle = TRAIN control mean (global baseline)
     return pred_mat, true_mat, pert_names, np.asarray(ctrl_mean_target).ravel()
 
+def write_cell_level_predictions(
+    adata_test_orig: ad.AnnData,
+    eval_gene_names,
+    pred_mat_eval: np.ndarray,
+    names_eval: list[str],
+    ctrl_mean_eval: np.ndarray,
+    target_label: str,
+    control_label: str,
+    out_path: str,
+    random_state: int | None = None,
+):
+    """
+    Build a cell-level predicted AnnData for the TEST set by:
+      - Copying control cells from adata_test_orig unchanged.
+      - For each perturbation p in adata_test_orig (excluding control), sampling N_p control cells
+        and subtracting the learned delta vector delta_p = ctrl_mean - pred_expr[p].
+      - Clamping to >= 0 and writing to out_path.
+    The resulting AnnData has (controls + synthesized perts) and matches per-pert cell counts in adata_test_orig.
+    """
+    if out_path is None or out_path == "":
+        return
+    rng = np.random.default_rng(random_state)
+
+    # --- Align gene space: use the evaluation gene order (columns of pred_mat_eval) ---
+    eval_genes = np.array(eval_gene_names, dtype=str)
+    test_genes = np.array(adata_test_orig.var_names, dtype=str)
+    # map eval_genes into adata_test_orig
+    take_idx = pd.Index(test_genes).get_indexer(eval_genes)
+    if np.any(take_idx < 0):
+        # intersect
+        common = np.intersect1d(eval_genes, test_genes)
+        if common.size == 0:
+            raise ValueError("No overlapping genes between eval gene space and adata_test_orig.")
+        print(f"[cells] Restricting to {common.size} common genes for cell-level synthesis.")
+        # remap everything to 'common'
+        # positions in eval
+        pos_eval = pd.Index(eval_genes).get_indexer(common)
+        # positions in test
+        pos_test = pd.Index(test_genes).get_indexer(common)
+        eval_genes = common
+        pred_mat_eval = pred_mat_eval[:, pos_eval]
+        ctrl_mean_eval = ctrl_mean_eval[pos_eval]
+        take_idx = pos_test  # now all >= 0 by construction
+    else:
+        # same order as eval
+        pass
+
+    # Pull the control pool from adata_test_orig (in eval gene order)
+    ctrl_mask = (adata_test_orig.obs[target_label].astype(str) == control_label).values
+    if not ctrl_mask.any():
+        raise ValueError("No control cells found in adata_test_orig; cannot synthesize perts from control pool.")
+    X_ctrl = to_numpy(adata_test_orig.X)[:, take_idx]
+    X_ctrl = X_ctrl[ctrl_mask]  # (n_ctrl, G_eval)
+    n_ctrl, G = X_ctrl.shape
+
+    # Compute per-pert delta vectors from predicted pseudobulk expression (eval space)
+    # delta_p = ctrl_mean - pred_expr[p], so x_pert ≈ x_ctrl - delta_p
+    name_to_row = {p: i for i, p in enumerate(names_eval)}
+
+    # Prepare outputs
+    obs_rows = []
+    X_rows = []
+    var_df = adata_test_orig.var.loc[test_genes[take_idx]].copy()
+    var_df.index = eval_genes  # ensure matching names/order
+
+    # 1) copy original control cells (unaltered) into output
+    ctrl_obs = adata_test_orig.obs.loc[ctrl_mask].copy()
+    X_rows.append(X_ctrl)  # unchanged
+    obs_rows.append(ctrl_obs)
+
+    # 2) for each perturbation present in adata_test_orig, synthesize cells
+    perts_in_test = adata_test_orig.obs[target_label].astype(str).unique().tolist()
+    perts_in_test = [p for p in perts_in_test if p != control_label]
+    for p in perts_in_test:
+        n_p = int((adata_test_orig.obs[target_label].astype(str) == p).sum())
+        if n_p == 0:
+            continue
+        row = name_to_row.get(p, None)
+        if row is None:
+            # No predicted vector for this pert; skip (or you could choose to leave original cells)
+            print(f"[cells] WARNING: no prediction for pert '{p}' in pred_mat_eval; skipping synthesis for this pert.")
+            continue
+        pred_expr = pred_mat_eval[row]          # (G,)
+        delta_p = ctrl_mean_eval - pred_expr    # (G,)
+        # sample control indices (with replacement if needed)
+        replace = n_p > n_ctrl
+        idx = rng.choice(n_ctrl, size=n_p, replace=replace)
+        X_base = X_ctrl[idx]                    # (n_p, G)
+        X_syn = X_base - delta_p[None, :]       # subtract learned delta
+        np.maximum(X_syn, 0.0, out=X_syn)       # clamp
+        # clone obs rows from sampled controls but set pert label to p
+        obs_p = ctrl_obs.iloc[idx].copy()
+        obs_p[target_label] = p
+        X_rows.append(X_syn)
+        obs_rows.append(obs_p)
+
+    # Concatenate
+    X_out = np.vstack(X_rows) if len(X_rows) else np.zeros((0, G), dtype=float)
+    obs_out = pd.concat(obs_rows, axis=0) if len(obs_rows) else adata_test_orig.obs.iloc[:0].copy()
+    obs_out = obs_out.loc[:, ~obs_out.columns.duplicated(keep="first")]
+    # Build AnnData and write
+    ad_out = ad.AnnData(X_out, obs=obs_out, var=var_df.copy())
+    ad_out.layers = {}  # keep minimal; add if you want raw etc.
+    print(f"[cells] Writing synthesized test predictions: {out_path} "
+          f"(controls={ctrl_mask.sum()}, synthesized={X_out.shape[0] - ctrl_mask.sum()}, genes={G})")
+    ad_out.write_h5ad(out_path)
+
 def evaluate_model(
     adata: ad.AnnData,
     args,
@@ -621,7 +730,7 @@ def main():
     ctrl_mean_global = np.asarray(adata_target.X)[ctrl_mask_full].mean(axis=0).reshape(-1)
 
     # Split TARGET into train/test (controls appear in both; controls themselves are never modified)
-    adata_train, adata_test = train_test_split(args, adata_target)
+    adata_train, adata_test, adata_test_orig = train_test_split(args, adata_target)
     if args.test_h5ad != "":  # if external test set provided, merge into overall target dataset
         tmp = adata_test[adata_test.obs[args.target_label] != args.control_label].copy()
         adata_target = ad.concat([adata_train, tmp])
@@ -750,7 +859,24 @@ def main():
             target_label=args.target_label,
             control_label=args.control_label,
         )
-    
+
+    # single cell predictions and output
+    if (args.test_predict_out is not None and args.test_predict_out != "") and (adata_test_orig is not None):
+        # Use the same evaluation gene space that pred_ev uses
+        eval_adata_for_eval = eval_adata_int if args.intersect_genes else eval_adata
+        eval_gene_names = eval_adata_for_eval.var_names
+        write_cell_level_predictions(
+            adata_test_orig=adata_test_orig,
+            eval_gene_names=eval_gene_names,
+            pred_mat_eval=pred_ev,
+            names_eval=names_ev,
+            ctrl_mean_eval=ctrl_mean_global,
+            target_label=args.target_label,
+            control_label=args.control_label,
+            out_path=args.test_predict_out,
+            random_state=getattr(args, "seed", None),
+        )
+
     print("\n✨ Done!")
 
 if __name__ == "__main__":
