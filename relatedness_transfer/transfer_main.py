@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+import warnings
+# Suppress annoying FutureWarning from scanpy
+warnings.filterwarnings('ignore', category=FutureWarning)
 import argparse, math, os
 import numpy as np
 import pandas as pd
@@ -619,6 +622,9 @@ def main():
 
     # Split TARGET into train/test (controls appear in both; controls themselves are never modified)
     adata_train, adata_test = train_test_split(args, adata_target)
+    if args.test_h5ad != "":  # if external test set provided, merge into overall target dataset
+        tmp = adata_test[adata_test.obs[args.target_label] != args.control_label].copy()
+        adata_target = ad.concat([adata_train, tmp])
     eval_adata = adata_test if adata_test is not None else adata_train
 
     # Build AverageKnown baselines and truths BEFORE any intersection
@@ -692,7 +698,6 @@ def main():
     # Evaluate using our assembled bundle (fixed control mean)
     eval_adata_for_eval = eval_adata_int if args.intersect_genes else eval_adata
     evaluate_model(adata=eval_adata_for_eval, args=args, pred_bundle=(pred_ev, true_ev, names_ev, ctrl_mean_global))
-
 
     # ---------------------------
     # (Optional) Evaluate on the Train Set
