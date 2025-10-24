@@ -654,8 +654,8 @@ def evaluate_model(
     # - exclude only the TRUE target gene for expression data, by name
     # - zero-based rank normalized by N (not N-1): PDS_p = 1 - rank/N
     # absolute deltas vs global control mean
-    true_bulk_mat = np.stack([np.abs(true_bulk[p] - ctrl_mean) for p in perts], axis=0)  # (K,G)
-    pred_bulk_mat = np.stack([np.abs(pred_bulk[p] - ctrl_mean) for p in perts], axis=0)  # (K,G)
+    true_bulk_mat = np.stack([true_bulk[p] - ctrl_mean for p in perts], axis=0)  # (K,G)
+    pred_bulk_mat = np.stack([pred_bulk[p] - ctrl_mean for p in perts], axis=0)  # (K,G)
     t_idx_per_pert = {p: t2gi.get(p, -1) for p in perts}
 
     # precompute masks per pair to exclude targets
