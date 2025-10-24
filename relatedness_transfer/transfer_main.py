@@ -12,6 +12,7 @@ from sklearn.linear_model import Ridge
 import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
+from sklearn.isotonic import IsotonicRegression
 
 from utils import *
 from losses import *
@@ -46,6 +47,8 @@ def parse_arguments():
     ap.add_argument("--kernel_metric", type=str, default="corr",
                     choices=["corr", "cosine"],
                     help="How to build the perturbation kernel from the external dataset.")
+    ap.add_argument("--iso_calibrate", action="store_true",
+                        help="Apply isotonic calibration of external similarity to match target similarity on training perts.")
 
     args = ap.parse_args()
     return args
@@ -117,6 +120,36 @@ def _row_standardize(M: np.ndarray) -> np.ndarray:
     denom = np.linalg.norm(M, axis=1, keepdims=True) + 1e-8
     return M / denom
 
+def _fit_isotonic_on_pairs(S_ext_OO: np.ndarray, Y_O: np.ndarray) -> "IsotonicRegression|None":
+    """
+    Fit isotonic regression mapping external similarity -> target similarity,
+    using only training perts (O). Returns a fitted IsotonicRegression or None.
+    """
+    # target similarity among O (using correlation-style similarity of DELTAS)
+    Zt = _row_standardize(Y_O)  # (|O|, G)
+    S_tgt_OO = Zt @ Zt.T
+    # take off-diagonal upper triangle pairs
+    iu, ju = np.triu_indices(S_ext_OO.shape[0], k=1)
+    x = S_ext_OO[iu, ju].astype(np.float64)
+    y = S_tgt_OO[iu, ju].astype(np.float64)
+    # Guard against degenerate cases
+    if np.allclose(x, x[0]) or np.allclose(y, y[0]):
+        print("[iso] Degenerate pairwise similarities; skipping isotonic calibration.")
+        return None
+    iso = IsotonicRegression(y_min=-1.0, y_max=1.0, increasing=True, out_of_bounds="clip")
+    iso.fit(x, y)
+    return iso
+
+def _apply_isotonic_matrix(iso: "IsotonicRegression|None", S: np.ndarray) -> np.ndarray:
+    """Apply fitted isotonic regressor elementwise to a similarity matrix; symmetrize and fix diag."""
+    if iso is None:
+        return S
+    S_flat = S.ravel()
+    S_cal = iso.predict(S_flat).reshape(S.shape)
+    S_cal = 0.5 * (S_cal + S_cal.T)
+    np.fill_diagonal(S_cal, 1.0)
+    return S_cal
+
 def _pert_list(adata: ad.AnnData, target_label: str, control_label: str) -> list[str]:
     perts_all = list(map(str, adata.obs[target_label].values))
     # If pseudobulked, each row is a single pert; otherwise fallback to unique order.
@@ -133,6 +166,7 @@ def krr_predict_from_external(
     krr_lambda: float = 1e-2,
     kernel_metric: str = "corr",
     ctrl_mean_target: np.ndarray | None = None,
+    iso_calibrate: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, list[str], np.ndarray]:
     """
     KRR over perturbation index with kernel built from EXTERNAL deltas (train+eval perts).
@@ -152,28 +186,10 @@ def krr_predict_from_external(
     perts_all = O + [p for p in U if p not in O]
     G = adata_train.n_vars
 
-    # ---- external deltas: build kernel K over perts_all ----
-    del_src, _ = compute_deltas(adata_source, target_label, control_label)  # dict: pert -> (1 x G) row
-    # stack rows in perts_all order
-    Delta_src = np.stack([np.asarray(del_src[p]).ravel() for p in perts_all], axis=0)  # (P,G)
-
-    if kernel_metric == "corr":
-        Z = _row_standardize(Delta_src)            # (P,G)
-        K = Z @ Z.T                                # cosine of centered, unit-norm rows = correlation
-    else:  # "cosine"
-        Z = Delta_src / (np.linalg.norm(Delta_src, axis=1, keepdims=True) + 1e-8)
-        K = Z @ Z.T
-    # ensure numerical PSD
-    K = (K + K.T) * 0.5
-    K += np.eye(K.shape[0], dtype=K.dtype) * 1e-6
-
     # indices for O and U inside perts_all
     idx = {p: i for i, p in enumerate(perts_all)}
     iO = np.array([idx[p] for p in O], dtype=int)
     iU = np.array([idx[p] for p in U], dtype=int)
-
-    KOO = K[np.ix_(iO, iO)]
-    KUO = K[np.ix_(iU, iO)]
 
     # ---- target deltas: Y_O (|O| x G) and Y_true_U (|U| x G) ----
     # build deltas against the SAME ctrl_mean_target
@@ -186,6 +202,35 @@ def krr_predict_from_external(
         return np.stack(rows, axis=0)
 
     Y_O = _delta_mat(adata_train, O)   # (|O|, G)
+
+
+    # ---- external deltas & similarity over ALL perts (O∪U) ----
+    del_src, _ = compute_deltas(adata_source, target_label, control_label)  # pert -> delta row
+    Delta_src = np.stack([np.asarray(del_src[p]).ravel() for p in perts_all], axis=0)  # (P,G)
+    if kernel_metric == "corr":
+        Z = _row_standardize(Delta_src)
+        S_ext = Z @ Z.T
+    else:  # "cosine"
+        Z = Delta_src / (np.linalg.norm(Delta_src, axis=1, keepdims=True) + 1e-8)
+        S_ext = Z @ Z.T
+    S_ext = 0.5 * (S_ext + S_ext.T)
+    np.fill_diagonal(S_ext, 1.0)
+
+    # ---- isotonic calibration on training pairs (O×O) ----
+    if iso_calibrate:
+        print("[iso] Fitting isotonic calibration on training perts...")
+        iso = _fit_isotonic_on_pairs(S_ext[np.ix_(iO, iO)], Y_O)
+        S_cal = _apply_isotonic_matrix(iso, S_ext)
+    else:
+        S_cal = S_ext
+
+    # ---- build kernel K from calibrated similarity ----
+    K = S_cal
+    K = 0.5 * (K + K.T)
+    K += np.eye(K.shape[0], dtype=K.dtype) * 1e-6  # nudge toward PSD
+
+    KOO = K[np.ix_(iO, iO)]
+    KUO = K[np.ix_(iU, iO)]
 
     # ---- KRR: \hat Y_U = K_{UO} (K_{OO} + λI)^{-1} Y_O ----
     A = np.linalg.solve(KOO + krr_lambda * np.eye(KOO.shape[0], dtype=KOO.dtype),
@@ -396,6 +441,7 @@ def main():
             krr_lambda=args.krr_lambda,
             kernel_metric=args.kernel_metric,
             ctrl_mean_target=None,
+            iso_calibrate=args.iso_calibrate,
         )
     else:
         raise ValueError(f"Unknown method: {args.method}")
@@ -415,6 +461,7 @@ def main():
             krr_lambda=args.krr_lambda,
             kernel_metric=args.kernel_metric,
             ctrl_mean_target=None,
+            iso_calibrate=args.iso_calibrate,
         )
         evaluate_model(adata=adata_train, args=args, pred_bundle=train_pred_bundle)
 
