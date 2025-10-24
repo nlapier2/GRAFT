@@ -30,6 +30,8 @@ def parse_arguments():
     ap.add_argument("--control_label", default="non-targeting", help="label value for control cells.")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--epochs", type=int, default=10)
+    ap.add_argument("--intersect_genes", action="store_true", default=False,
+                    help="If set, intersect genes across source and target. Otherwise, only intersect perts (default).")
 
     # Train/test split and eval options
     ap.add_argument("--test_pct_perts", type=float, default=0.0,
@@ -63,7 +65,7 @@ def parse_arguments():
     args = ap.parse_args()
     return args
 
-def intersect_datasets(adata_source, adata_target, target_label, control_label):
+def intersect_datasets(adata_source, adata_target, target_label, control_label, intersect_genes=False):
     """
     Subsets two AnnData objects to their common genes and perturbations.
 
@@ -72,16 +74,12 @@ def intersect_datasets(adata_source, adata_target, target_label, control_label):
         adata_target: The target AnnData object.
         target_label: The obs column containing perturbation labels.
         control_label: The label for control samples.
+        intersect_genes: If True, intersect genes across datasets; else only perts.
 
     Returns:
         A tuple of (subsetted source AnnData, subsetted target AnnData).
     """
     print("Finding intersection of genes and perturbations...")
-    # First, get a list of valid genes from the source (not all NaN), then intersect.
-    common_genes = np.intersect1d(
-        adata_source.var_names[~np.isnan(to_numpy(adata_source.X)).all(axis=0)],
-        adata_target.var_names
-    )
 
     source_perts = set(adata_source.obs[target_label].unique())
     target_perts = set(adata_target.obs[target_label].unique())
@@ -92,11 +90,29 @@ def intersect_datasets(adata_source, adata_target, target_label, control_label):
         if control_label in source_perts and control_label in target_perts:
             common_perts.append(control_label)
     
-    print(f"  Found {len(common_genes)} common genes.")
+    if intersect_genes:
+        # First, get a list of valid genes from the source (not all NaN), then intersect.
+        common_genes = np.intersect1d(
+            adata_source.var_names[~np.isnan(to_numpy(adata_source.X)).all(axis=0)],
+            adata_target.var_names
+        )
+        print(f"  Found {len(common_genes)} common genes.")
+    else:
+        common_genes = None
     print(f"  Found {len(common_perts) - 1} common perturbations (plus control).")
 
-    adata_source_sub = adata_source[adata_source.obs[target_label].isin(common_perts), common_genes].copy()
-    adata_target_sub = adata_target[adata_target.obs[target_label].isin(common_perts), common_genes].copy()
+    if common_genes is None:
+        # Intersect perts only; keep original gene spaces
+        adata_source_sub = adata_source[adata_source.obs[target_label].isin(common_perts), :].copy()
+        adata_target_sub = adata_target[adata_target.obs[target_label].isin(common_perts), :].copy()
+    else:
+        # Intersect both perts and genes
+        adata_source_sub = adata_source[adata_source.obs[target_label].isin(common_perts), common_genes].copy()
+        adata_target_sub = adata_target[adata_target.obs[target_label].isin(common_perts), common_genes].copy()
+
+    # Remove columns in source with all-NaN values (genes not in its dataset)
+    if not intersect_genes:
+        adata_source_sub = adata_source_sub[:, ~np.isnan(to_numpy(adata_source_sub.X)).all(axis=0)].copy()
 
     return adata_source_sub, adata_target_sub
 
@@ -122,6 +138,42 @@ def compute_deltas(adata, target_label, control_label):
         for pert in pert_adata.obs[target_label].unique()
     }
     return deltas, control_mean
+
+def _compute_avg_kd_efficiencies(
+    adata_train: ad.AnnData,
+    O: list[str],
+    target_label: str,
+    control_label: str,
+    ctrl_mean_target: np.ndarray,
+) -> tuple[float, dict[str, float]]:
+    """
+    Estimate knockdown efficiency e in [0,1] from TRAIN perts:
+      e = clip((ctrl - pert_expr) / max(ctrl, eps), 0, 1)
+    Returns (global_avg, per_gene_avg).
+    If a gene never appears as a target in O, fall back to global_avg.
+    """
+    G = adata_train.n_vars
+    var_to_idx = {g: i for i, g in enumerate(adata_train.var_names.astype(str))}
+    effs_by_gene: dict[str, list[float]] = {}
+    eps = 1e-8
+    for p in O:
+        g = str(p)  # assume pert name equals target gene symbol
+        if g not in var_to_idx:
+            continue
+        gi = var_to_idx[g]
+        v = adata_train[adata_train.obs[target_label] == p].X
+        v = np.asarray(v).reshape(-1, G).mean(axis=0)
+        ctrl = float(ctrl_mean_target[gi])
+        if ctrl <= eps:
+            continue
+        eff = (ctrl - float(v[gi])) / max(ctrl, eps)
+        eff = float(np.clip(eff, 0.0, 1.0))
+        effs_by_gene.setdefault(g, []).append(eff)
+    # per-gene and global averages
+    per_gene_avg = {g: float(np.mean(vals)) for g, vals in effs_by_gene.items()}
+    all_effs = [e for vals in effs_by_gene.values() for e in vals]
+    global_avg = float(np.mean(all_effs)) if all_effs else 0.5  # sensible fallback
+    return global_avg, per_gene_avg
 
 def _row_standardize(M: np.ndarray) -> np.ndarray:
     """Zero-mean, unit-norm per row (safe for sparse/np arrays)."""
@@ -299,6 +351,24 @@ def krr_predict_from_external(
     # ---- Convert to EXPRESSION levels expected by evaluator ----
     pred_mat = Y_U_hat_delta + ctrl_mean_target[None, :]   # (|U|, G)
 
+    # --- Target gene overwrite using avg KD efficiency from TRAIN perts ---
+    var_to_idx = {g: i for i, g in enumerate(adata_train.var_names.astype(str))}
+    global_eff, per_gene_eff = _compute_avg_kd_efficiencies(
+        adata_train=adata_train, O=O, target_label=target_label,
+        control_label=control_label, ctrl_mean_target=ctrl_mean_target
+    )
+    for row, pert in enumerate(U):
+        g = str(pert)
+        gi = var_to_idx.get(g, None)
+        if gi is None:
+            continue
+        eff = per_gene_eff.get(g, global_eff)  # [0,1]
+        # predicted target-gene expression = ctrl_mean * (1 - eff)
+        pred_mat[row, gi] = ctrl_mean_target[gi] * (1.0 - eff)
+
+    # --- Non-negativity clamp: no expression should be < 0 ---
+    np.maximum(pred_mat, 0.0, out=pred_mat)
+
     # ---- True expression rows and pert_names from EVAL split (like your example) ----
     test_pert_mask = adata_eval.obs[target_label].isin(U)
     true_mat = np.asarray(adata_eval.X)[np.asarray(test_pert_mask)]
@@ -468,7 +538,7 @@ def main():
 
     # Subset both datasets to their intersection of genes and perturbations
     adata_source, adata_target = intersect_datasets(
-        adata_source, adata_target, args.target_label, args.control_label
+        adata_source, adata_target, args.target_label, args.control_label, args.intersect_genes
     )
 
     # Process and pseudobulk both datasets
