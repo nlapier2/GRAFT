@@ -32,6 +32,11 @@ def parse_arguments():
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--intersect_genes", action="store_true", default=False,
                     help="If set, intersect genes across source and target. Otherwise, only intersect perts (default).")
+    ap.add_argument("--already_logged", action="store_true", 
+                    help="Set if inputs are already log1p-normalized; otherwise apply log1p to raw counts.")
+    ap.add_argument("--keep_oov_perts", action="store_true", 
+                    help="If set, keep perts that are not in the source∩target intersection (left as AverageKnown baseline). "
+                         "If unset, drop those rows before evaluation/output.")
 
     # Train/test split and eval options
     ap.add_argument("--test_pct_perts", type=float, default=0.0,
@@ -64,6 +69,73 @@ def parse_arguments():
 
     args = ap.parse_args()
     return args
+
+def build_truth_bundle(adata_split: ad.AnnData, target_label: str, control_label: str):
+    """
+    Returns (true_mat, pert_names) for this split.
+    true_mat rows match pert_names order; controls excluded.
+    """
+    G = adata_split.n_vars
+    perts = list(dict.fromkeys(map(str, adata_split.obs[target_label].values)))
+    perts = [p for p in perts if p != control_label]
+    rows = []
+    for p in perts:
+        m = (adata_split.obs[target_label] == p).values
+        rows.append(np.asarray(adata_split.X)[m].reshape(-1, G).mean(axis=0))
+    true_mat = np.stack(rows, axis=0) if rows else np.zeros((0, adata_split.n_vars))
+    return true_mat, perts
+
+def build_average_known_baseline(
+    adata_train: ad.AnnData,
+    adata_eval: ad.AnnData,
+    target_label: str,
+    control_label: str,
+    ctrl_mean_global: np.ndarray,
+):
+    """
+    Build AverageKnown predictions for TRAIN & EVAL:
+      1) Compute TRAIN mean delta vs GLOBAL control mean.
+      2) For each split, pred_mat_split := ctrl_mean_global - mean_delta_train (broadcasted).
+    Returns:
+      (pred_train, true_train, names_train), (pred_eval, true_eval, names_eval)
+    """
+    # TRAIN truths / names
+    true_train, names_train = build_truth_bundle(adata_train, target_label, control_label)
+    # EVAL truths / names
+    true_eval, names_eval = build_truth_bundle(adata_eval, target_label, control_label)
+    # Mean TRAIN delta vs global ctrl
+    if true_train.shape[0] > 0:
+        mean_delta_train = (true_train - ctrl_mean_global[None, :]).mean(axis=0, keepdims=True)
+    else:
+        mean_delta_train = np.zeros((1, ctrl_mean_global.shape[0]), dtype=float)
+    # Broadcast to splits (expression space)
+    pred_train = np.repeat(ctrl_mean_global[None, :] - mean_delta_train, repeats=len(names_train), axis=0) \
+                 if len(names_train) else mean_delta_train[:0]
+    pred_eval = np.repeat(ctrl_mean_global[None, :] - mean_delta_train, repeats=len(names_eval), axis=0) \
+                if len(names_eval) else mean_delta_train[:0]
+    return (pred_train, true_train, names_train), (pred_eval, true_eval, names_eval)
+
+def apply_target_overwrite_and_clamp(
+    pred_mat: np.ndarray,
+    pert_names: list[str],
+    adata_train: ad.AnnData,
+    target_label: str,
+    control_label: str,
+    ctrl_mean_global: np.ndarray,
+):
+    """Overwrite target gene expression via avg KD efficiency from TRAIN; then clamp >=0."""
+    var_to_idx = {g: i for i, g in enumerate(adata_train.var_names.astype(str))}
+    global_eff, per_gene_eff = _compute_avg_kd_efficiencies(
+        adata_train=adata_train, O=_pert_list(adata_train, target_label, control_label),
+        target_label=target_label, control_label=control_label, ctrl_mean_target=ctrl_mean_global
+    )
+    for row, pert in enumerate(pert_names):
+        gi = var_to_idx.get(pert, None)  # assume pert name equals target gene name when present
+        if gi is None:
+            continue
+        eff = per_gene_eff.get(pert, global_eff)
+        pred_mat[row, gi] = ctrl_mean_global[gi] * (1.0 - eff)
+    np.maximum(pred_mat, 0.0, out=pred_mat)
 
 def intersect_datasets(adata_source, adata_target, target_label, control_label, intersect_genes=False):
     """
@@ -309,7 +381,6 @@ def krr_predict_from_external(
 
     Y_O = _delta_mat(adata_train, O)   # (|O|, G)
 
-
     # ---- external deltas & similarity over ALL perts (O∪U) ----
     del_src, _ = compute_deltas(adata_source, target_label, control_label)  # pert -> delta row
     Delta_src = np.stack([np.asarray(del_src[p]).ravel() for p in perts_all], axis=0)  # (P,G)
@@ -530,86 +601,146 @@ def main():
     args.use_pseudobulk = True
 
     # ---------------------------
-    # 1. Read and Prepare Data
+    # Read and Prepare Data
     # ---------------------------
     print("Reading and preparing data...")
     adata_target = ad.read_h5ad(args.in_h5ad)
     adata_source = ad.read_h5ad(args.external_h5ad)
+    adata_source = adata_source[:, ~np.isnan(to_numpy(adata_source.X)).all(axis=0)].copy()  # filter all-NaN genes
+    if not args.already_logged:
+        sc.pp.normalize_total(adata_target, inplace=True)
+        sc.pp.log1p(adata_target)
+        sc.pp.normalize_total(adata_source, inplace=True)
+        sc.pp.log1p(adata_source)
 
-    # Subset both datasets to their intersection of genes and perturbations
-    adata_source, adata_target = intersect_datasets(
-        adata_source, adata_target, args.target_label, args.control_label, args.intersect_genes
-    )
+    # Compute a SINGLE global control mean from ALL target controls (fixed across splits)
+    ctrl_mask_full = (adata_target.obs[args.target_label] == args.control_label).values
+    ctrl_mean_global = np.asarray(adata_target.X)[ctrl_mask_full].mean(axis=0).reshape(-1)
 
-    # Process and pseudobulk both datasets
-    for adata in [adata_source, adata_target]:
-        # Normalize and log1p. We assume source is already pseudobulked.
-        sc.pp.normalize_total(adata, inplace=True)
-        sc.pp.log1p(adata)
-    
-    # Pseudobulk the target data if it's not already
-    if adata_target.n_obs > len(adata_target.obs[args.target_label].unique()):
-        print("Collapsing target data to pseudobulk...")
-        adata_target = collapse_to_pseudobulk(adata_target, args.target_label)
-
-    # Split the TARGET data into train/test sets
+    # Split TARGET into train/test (controls appear in both; controls themselves are never modified)
     adata_train, adata_test = train_test_split(args, adata_target)
     eval_adata = adata_test if adata_test is not None else adata_train
 
-    # ---------------------------
-    # 3. Evaluate on the Test Set
-    # ---------------------------
-    print("\n=== Evaluation on {} set ===".format("TEST" if adata_test is not None else "TRAIN"))
-    if args.method == "krr":
-        eval_pred_bundle = krr_predict_from_external(
-            adata_source=adata_source,
-            adata_train=adata_train,
-            adata_eval=eval_adata,
-            target_label=args.target_label,
-            control_label=args.control_label,
-            krr_lambda=args.krr_lambda,
-            kernel_metric=args.kernel_metric,
-            ctrl_mean_target=None,
-            iso_calibrate=args.iso_calibrate,
-            kernel_gamma=args.kernel_gamma,
-            topk=args.topk,
-            boost_pcs=args.boost_pcs,
-            boost_gamma=args.boost_gamma,
-        )
-    else:
-        raise ValueError(f"Unknown method: {args.method}")
-    evaluate_model(adata=eval_adata, args=args, pred_bundle=eval_pred_bundle)
+    # Build AverageKnown baselines and truths BEFORE any intersection
+    (pred_tr, true_tr, names_tr), (pred_ev, true_ev, names_ev) = build_average_known_baseline(
+        adata_train, eval_adata, args.target_label, args.control_label, ctrl_mean_global
+    )
+
+    # Now intersect datasets (perts always; genes optional). This will also strip all-NaN external genes if needed.
+    adata_source, adata_target_int = intersect_datasets(
+        adata_source, adata_target, args.target_label, args.control_label, intersect_genes=args.intersect_genes
+    )
+    # Keep split views in intersected target
+    adata_train_int = adata_target_int[adata_target_int.obs.index.isin(adata_train.obs.index)].copy()
+    eval_adata_int  = adata_target_int[adata_target_int.obs.index.isin(eval_adata.obs.index)].copy()
+
+    # If genes were intersected, align baseline tensors and ctrl_mean to the intersected gene order
+    if args.intersect_genes:
+        gene_order = adata_target_int.var_names
+        idx_in_full = pd.Index(adata_target.var_names).get_indexer(gene_order)
+        # Slice baselines and truths to intersected genes
+        if pred_tr.shape[0] > 0:
+            pred_tr  = pred_tr[:, idx_in_full]
+            true_tr  = true_tr[:, idx_in_full]
+        if pred_ev.shape[0] > 0:
+            pred_ev  = pred_ev[:, idx_in_full]
+            true_ev  = true_ev[:, idx_in_full]
+        # Slice the global control mean as well
+        ctrl_mean_global = ctrl_mean_global[idx_in_full]
 
     # ---------------------------
-    # 4. (Optional) Evaluate on the Train Set
+    # Evaluate on the Test Set
+    # ---------------------------
+    print("\n=== Evaluation on {} set ===".format("TEST" if adata_test is not None else "TRAIN"))
+    if args.method != "krr":
+        raise ValueError(f"Unknown method: {args.method}")
+    # Run KRR ONLY on the intersected views; get predictions for intersected perts
+    pred_krr_ev, _true_krr_ev, names_krr_ev, _ctrl_ignored = krr_predict_from_external(
+        adata_source=adata_source,
+        adata_train=adata_train_int,
+        adata_eval=eval_adata_int,
+        target_label=args.target_label,
+        control_label=args.control_label,
+        krr_lambda=args.krr_lambda,
+        kernel_metric=args.kernel_metric,
+        ctrl_mean_target=ctrl_mean_global,  # fixed control mean
+        iso_calibrate=args.iso_calibrate,
+        kernel_gamma=args.kernel_gamma,
+        topk=args.topk,
+        boost_pcs=args.boost_pcs,
+        boost_gamma=args.boost_gamma,
+    )
+    # Overwrite rows (by pert name) into the AverageKnown baseline (eval split)
+    name2row_ev = {p: i for i, p in enumerate(names_ev)}
+    for j, p in enumerate(names_krr_ev):
+        if p in name2row_ev:
+            pred_ev[name2row_ev[p], :] = pred_krr_ev[j, :]
+    # Optionally DROP OOV perts (not present in intersection)
+    if not args.keep_oov_perts:
+        keep = np.array([p in set(names_krr_ev) for p in names_ev])
+        pred_ev, true_ev = pred_ev[keep], true_ev[keep]
+        names_ev = [p for (p, k) in zip(names_ev, keep) if k]
+    # Use the AnnData with matching gene space for target overwrite indexing
+    ad_train_for_eff = adata_train_int if args.intersect_genes else adata_train
+    # Post-processing on the FULL eval predictions (target overwrite + clamp)
+    apply_target_overwrite_and_clamp(
+        pred_mat=pred_ev, pert_names=names_ev,
+        adata_train=ad_train_for_eff,  # efficiencies from TRAIN perts
+        target_label=args.target_label, control_label=args.control_label,
+        ctrl_mean_global=ctrl_mean_global
+    )
+    # Evaluate using our assembled bundle (fixed control mean)
+    eval_adata_for_eval = eval_adata_int if args.intersect_genes else eval_adata
+    evaluate_model(adata=eval_adata_for_eval, args=args, pred_bundle=(pred_ev, true_ev, names_ev, ctrl_mean_global))
+
+
+    # ---------------------------
+    # (Optional) Evaluate on the Train Set
     # ---------------------------
     if args.eval_on_train and (adata_test is not None):
         print("\n=== Evaluation on TRAIN set ===")
-        train_pred_bundle = krr_predict_from_external(
+        pred_krr_tr, _true_krr_tr, names_krr_tr, _ = krr_predict_from_external(
             adata_source=adata_source,
-            adata_train=adata_train,
-            adata_eval=adata_train,
+            adata_train=adata_train_int,
+            adata_eval=adata_train_int,
             target_label=args.target_label,
             control_label=args.control_label,
             krr_lambda=args.krr_lambda,
             kernel_metric=args.kernel_metric,
-            ctrl_mean_target=None,
+            ctrl_mean_target=ctrl_mean_global,
             iso_calibrate=args.iso_calibrate,
             kernel_gamma=args.kernel_gamma,
             topk=args.topk,
             boost_pcs=args.boost_pcs,
             boost_gamma=args.boost_gamma,
         )
-        evaluate_model(adata=adata_train, args=args, pred_bundle=train_pred_bundle)
+        # Overwrite into train baseline
+        name2row_tr = {p: i for i, p in enumerate(names_tr)}
+        for j, p in enumerate(names_krr_tr):
+            if p in name2row_tr:
+                pred_tr[name2row_tr[p], :] = pred_krr_tr[j, :]
+        if not args.keep_oov_perts:
+            keep = np.array([p in set(names_krr_tr) for p in names_tr])
+            pred_tr, true_tr = pred_tr[keep], true_tr[keep]
+            names_tr = [p for (p, k) in zip(names_tr, keep) if k]
+        # Use the AnnData with matching gene space for target overwrite indexing
+        ad_train_for_eff = adata_train_int if args.intersect_genes else adata_train
+        apply_target_overwrite_and_clamp(
+            pred_mat=pred_tr, pert_names=names_tr,
+            adata_train=ad_train_for_eff, target_label=args.target_label,
+            control_label=args.control_label, ctrl_mean_global=ctrl_mean_global
+        )
+        train_adata_for_eval = adata_train_int if args.intersect_genes else adata_train
+        evaluate_model(adata=train_adata_for_eval, args=args, pred_bundle=(pred_tr, true_tr, names_tr, ctrl_mean_global))
 
     # ---------------------------
-    # 5. (Optional) Write Output Files
+    # (Optional) Write Output Files
     # ---------------------------
     if args.out_pred_h5ad:
         print(f"\nWriting prediction outputs to {args.out_pred_h5ad}...")
         write_pred_true_h5ads(
-            eval_adata=eval_adata,
-            pred_bundle=eval_pred_bundle,
+            eval_adata=(eval_adata_int if args.intersect_genes else eval_adata),
+            pred_bundle=(pred_ev, true_ev, names_ev, ctrl_mean_global),
             out_pred_h5ad=args.out_pred_h5ad,
             target_label=args.target_label,
             control_label=args.control_label,
