@@ -49,6 +49,16 @@ def parse_arguments():
                     help="How to build the perturbation kernel from the external dataset.")
     ap.add_argument("--iso_calibrate", action="store_true",
                         help="Apply isotonic calibration of external similarity to match target similarity on training perts.")
+    # Neighbor sharpening (perturbation-space)
+    ap.add_argument("--kernel_gamma", type=float, default=1.0,
+                    help="Power sharpening for K_UO rows; >1 sharpens (e.g., 1.4). 1.0 disables.")
+    ap.add_argument("--topk", type=int, default=0,
+                    help="Keep only top-k neighbors per row of K_UO; 0 disables.")
+    # Subspace boosting (gene-space)
+    ap.add_argument("--boost_pcs", type=int, default=0,
+                    help="Number of PCA components (from Y_O) to boost in predictions; 0 disables.")
+    ap.add_argument("--boost_gamma", type=float, default=0.6,
+                    help="Boost strength along PCA subspace (e.g., 0.3–1.0).")
 
     args = ap.parse_args()
     return args
@@ -157,6 +167,46 @@ def _pert_list(adata: ad.AnnData, target_label: str, control_label: str) -> list
     uniq = list(dict.fromkeys(perts_all))  # stable unique
     return [p for p in uniq if p != control_label]
 
+def _sharpen_neighbors(K_UO: np.ndarray, tau: float = 1.0, topk: int = 0) -> np.ndarray:
+    """
+    A4: Neighbor sharpening. Elementwise power on similarities then optional top-k per row.
+    Operates ONLY on K_UO (cross block) to avoid changing the fit on O.
+    """
+    if tau <= 1.0 and (topk is None or topk <= 0):
+        return K_UO
+    Kp = np.maximum(K_UO, 0.0).astype(np.float32)
+    if tau > 1.0:
+        Kp = np.power(Kp, tau, dtype=np.float32)
+    if topk and topk > 0:
+        topk = min(topk, Kp.shape[1])
+        # threshold each row to its k-th largest value
+        part = np.partition(Kp, Kp.shape[1] - topk, axis=1)
+        thresh = part[:, Kp.shape[1] - topk : Kp.shape[1] - topk + 1]
+        Kp[Kp < thresh] = 0.0
+    Kp_sum = Kp.sum(axis=1, keepdims=True) + 1e-8
+    Kp /= Kp_sum
+    return Kp
+
+def _subspace_boost(Y_U_hat_delta: np.ndarray, Y_O_delta: np.ndarray, k: int, gamma: float) -> np.ndarray:
+    """
+    A3: Subspace boosting in gene space. Boost components along the top-k PCs
+    computed from training deltas Y_O (|O| x G). Uses SVD to avoid extra deps.
+    """
+    if k <= 0 or gamma <= 0:
+        return Y_U_hat_delta
+    k = min(k, min(Y_O_delta.shape[0], Y_O_delta.shape[1]))
+    # Center across perts before SVD to focus on between-pert variation
+    Yc = Y_O_delta - Y_O_delta.mean(axis=0, keepdims=True)
+    # thin SVD: Yc = U S Vt ; Vt is (G x G) truncated to k
+    try:
+        U, S, Vt = np.linalg.svd(Yc, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return Y_U_hat_delta  # fall back safely if SVD fails
+    P = Vt[:k, :].T  # G x k
+    proj = (Y_U_hat_delta @ P) @ P.T  # project into top-k subspace
+    boosted = Y_U_hat_delta + gamma * proj
+    return boosted
+
 def krr_predict_from_external(
     adata_source: ad.AnnData,
     adata_train: ad.AnnData,
@@ -167,6 +217,10 @@ def krr_predict_from_external(
     kernel_metric: str = "corr",
     ctrl_mean_target: np.ndarray | None = None,
     iso_calibrate: bool = False,
+    kernel_gamma: float = 1.0,
+    topk: int = 0,
+    boost_pcs: int = 0,
+    boost_gamma: float = 0.6,
 ) -> tuple[np.ndarray, np.ndarray, list[str], np.ndarray]:
     """
     KRR over perturbation index with kernel built from EXTERNAL deltas (train+eval perts).
@@ -233,9 +287,14 @@ def krr_predict_from_external(
     KUO = K[np.ix_(iU, iO)]
 
     # ---- KRR: \hat Y_U = K_{UO} (K_{OO} + λI)^{-1} Y_O ----
-    A = np.linalg.solve(KOO + krr_lambda * np.eye(KOO.shape[0], dtype=KOO.dtype),
-                        Y_O)  # (|O|, G)
-    Y_U_hat_delta = KUO @ A  # (|U|, G) deltas
+    A = np.linalg.solve(KOO + krr_lambda * np.eye(KOO.shape[0], dtype=KOO.dtype), Y_O)  # (|O|, G)
+    # sharpen neighbor mixing at prediction time
+    KUO_sharp = _sharpen_neighbors(KUO, tau=kernel_gamma, topk=topk)
+    Y_U_hat_delta = KUO_sharp @ A  # (|U|, G)
+
+    # subspace boosting along perturbation-contrast directions from Y_O
+    if boost_pcs and boost_pcs > 0 and boost_gamma > 0:
+        Y_U_hat_delta = _subspace_boost(Y_U_hat_delta, Y_O, k=boost_pcs, gamma=boost_gamma)
 
     # ---- Convert to EXPRESSION levels expected by evaluator ----
     pred_mat = Y_U_hat_delta + ctrl_mean_target[None, :]   # (|U|, G)
@@ -442,6 +501,10 @@ def main():
             kernel_metric=args.kernel_metric,
             ctrl_mean_target=None,
             iso_calibrate=args.iso_calibrate,
+            kernel_gamma=args.kernel_gamma,
+            topk=args.topk,
+            boost_pcs=args.boost_pcs,
+            boost_gamma=args.boost_gamma,
         )
     else:
         raise ValueError(f"Unknown method: {args.method}")
@@ -462,6 +525,10 @@ def main():
             kernel_metric=args.kernel_metric,
             ctrl_mean_target=None,
             iso_calibrate=args.iso_calibrate,
+            kernel_gamma=args.kernel_gamma,
+            topk=args.topk,
+            boost_pcs=args.boost_pcs,
+            boost_gamma=args.boost_gamma,
         )
         evaluate_model(adata=adata_train, args=args, pred_bundle=train_pred_bundle)
 
