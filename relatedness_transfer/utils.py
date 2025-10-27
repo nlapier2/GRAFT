@@ -127,11 +127,11 @@ def train_test_split(args, adata):
         adata_test_orig = adata_test.copy()
         if args.use_pseudobulk:
             adata_test = collapse_to_pseudobulk(adata_test, args.target_label)
-        sc.pp.normalize_total(adata_test, inplace=True)
+        sc.pp.normalize_total(adata_test, target_sum=56903, inplace=True)
         sc.pp.log1p(adata_test)
         if sparse.isspmatrix(adata_test.X) and not sparse.isspmatrix_csr(adata_test.X):
             adata_test.X = adata_test.X.tocsr()  # nicer slicing, though we load to numpy anyway
-        sc.pp.normalize_total(adata_test_orig, inplace=True)
+        sc.pp.normalize_total(adata_test_orig, target_sum=56903, inplace=True)
         sc.pp.log1p(adata_test_orig)
         if sparse.isspmatrix(adata_test_orig.X) and not sparse.isspmatrix_csr(adata_test_orig.X):
             adata_test_orig.X = adata_test_orig.X.tocsr()  # nicer slicing, though we load to numpy anyway
