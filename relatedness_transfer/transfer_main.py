@@ -71,6 +71,22 @@ def parse_arguments():
                     help="Number of PCA components (from Y_O) to boost in predictions; 0 disables.")
     ap.add_argument("--boost_gamma", type=float, default=0.6,
                     help="Boost strength along PCA subspace (e.g., 0.3–1.0).")
+    # PDS sharpening (post-processing on predicted effects)
+    ap.add_argument("--pds_sharpen", type=str, default="none",
+                    choices=["none", "power", "topk", "sigmoid"],
+                    help="Post-process predicted effects to boost large signals and shrink small ones.")
+    ap.add_argument("--pds_gamma", type=float, default=1.5,
+                    help="Exponent for power mode (>|1| boosts large |Δ|, shrinks small).")
+    ap.add_argument("--pds_topk_frac", type=float, default=0.1,
+                    help="Fraction (0-1) of largest-|Δ| genes to inflate in topk mode.")
+    ap.add_argument("--pds_alpha", type=float, default=0.3,
+                    help="Inflation factor for topk mode (Δ_topk *= (1+alpha)).")
+    ap.add_argument("--pds_beta", type=float, default=0.2,
+                    help="Shrink factor for non-topk in topk mode (Δ_else *= (1-beta)).")
+    ap.add_argument("--pds_sigmoid_B", type=float, default=0.7,
+                    help="Slope B in Δ' = A*tanh(B*Δ). A is auto-scaled to preserve a high-percentile.")
+    ap.add_argument("--pds_preserve_quantile", type=float, default=0.95,
+                    help="Quantile of |Δ| whose magnitude is preserved by the transform.")
 
     args = ap.parse_args()
     return args
@@ -335,6 +351,63 @@ def _subspace_boost(Y_U_hat_delta: np.ndarray, Y_O_delta: np.ndarray, k: int, ga
     proj = (Y_U_hat_delta @ P) @ P.T  # project into top-k subspace
     boosted = Y_U_hat_delta + gamma * proj
     return boosted
+
+def _sharpen_effects(
+    pred_mat: np.ndarray,
+    ctrl_mean: np.ndarray,
+    mode: str,
+    gamma: float = 1.5,
+    topk_frac: float = 0.1,
+    alpha: float = 0.3,
+    beta: float = 0.2,
+    sigmoid_B: float = 0.7,
+    preserve_q: float = 0.95,
+):
+    """
+    Post-process predicted effects Δ = pred - ctrl, apply a monotone sharpening, then
+    reconstruct predictions pred' = ctrl + Δ'. Operates in-place on a copy and returns it.
+    """
+    if mode == "none":
+        return pred_mat
+    pred = pred_mat.copy()
+    # Effects (same shape as pred)
+    delta = pred - ctrl_mean[None, :]
+    A = np.abs(delta)
+    sign = np.sign(delta)
+
+    if mode == "power":
+        # Δ' = sign(Δ) * |Δ|^γ ; then rescale to preserve the chosen quantile magnitude
+        Dp = (A ** max(gamma, 1.0000001))
+        # scale to preserve q-th abs magnitude (per-row)
+        q_old = np.quantile(A, preserve_q, axis=1, keepdims=True)
+        q_new = np.quantile(Dp, preserve_q, axis=1, keepdims=True) + 1e-12
+        scale = np.where(q_new > 0, q_old / q_new, 1.0)
+        delta_sharp = sign * (Dp * scale)
+
+    elif mode == "topk":
+        # Inflate top-k% |Δ| by (1+alpha), shrink others by (1-beta)
+        P, G = delta.shape
+        k = np.maximum(1, (topk_frac * G).astype(int) if isinstance(topk_frac, np.ndarray) else int(round(topk_frac * G)))
+        delta_sharp = delta.copy()
+        for i in range(P):
+            idx = np.argpartition(A[i], G - k)[-k:]
+            not_idx = np.setdiff1d(np.arange(G), idx, assume_unique=False)
+            delta_sharp[i, idx] *= (1.0 + alpha)
+            delta_sharp[i, not_idx] *= (1.0 - beta)
+
+    elif mode == "sigmoid":
+        # Δ' = A * tanh(B * Δ), with A chosen so that q-th |Δ| is preserved
+        B = sigmoid_B
+        T = np.tanh(B * delta)
+        q_old = np.quantile(A, preserve_q, axis=1, keepdims=True)
+        q_new = np.quantile(np.abs(T), preserve_q, axis=1, keepdims=True) + 1e-12
+        Arow = np.where(q_new > 0, q_old / q_new, 1.0)
+        delta_sharp = Arow * T
+    else:
+        return pred_mat
+
+    pred_sharp = ctrl_mean[None, :] + delta_sharp
+    return pred_sharp
 
 def krr_predict_from_external(
     adata_source: ad.AnnData,
@@ -797,6 +870,16 @@ def main():
         names_ev = [p for (p, k) in zip(names_ev, keep) if k]
     # Use the AnnData with matching gene space for target overwrite indexing
     ad_train_for_eff = adata_train_int if args.intersect_genes else adata_train
+
+    # Optional PDS sharpening in effect space (pred → Δ → sharpen → pred)
+    if args.pds_sharpen != "none" and pred_ev.shape[0] > 0:
+        pred_ev = _sharpen_effects(
+            pred_mat=pred_ev, ctrl_mean=ctrl_mean_global, mode=args.pds_sharpen,
+            gamma=args.pds_gamma, topk_frac=args.pds_topk_frac,
+            alpha=args.pds_alpha, beta=args.pds_beta,
+            sigmoid_B=args.pds_sigmoid_B, preserve_q=args.pds_preserve_quantile
+        )
+
     # Post-processing on the FULL eval predictions (target overwrite + clamp)
     apply_target_overwrite_and_clamp(
         pred_mat=pred_ev, pert_names=names_ev,
@@ -839,6 +922,16 @@ def main():
             names_tr = [p for (p, k) in zip(names_tr, keep) if k]
         # Use the AnnData with matching gene space for target overwrite indexing
         ad_train_for_eff = adata_train_int if args.intersect_genes else adata_train
+
+        # Optional sharpening for train split too (so metrics are consistent if you eval on train)
+        if args.pds_sharpen != "none" and pred_tr.shape[0] > 0:
+            pred_tr = _sharpen_effects(
+                pred_mat=pred_tr, ctrl_mean=ctrl_mean_global, mode=args.pds_sharpen,
+                gamma=args.pds_gamma, topk_frac=args.pds_topk_frac,
+                alpha=args.pds_alpha, beta=args.pds_beta,
+                sigmoid_B=args.pds_sigmoid_B, preserve_q=args.pds_preserve_quantile
+            )
+
         apply_target_overwrite_and_clamp(
             pred_mat=pred_tr, pert_names=names_tr,
             adata_train=ad_train_for_eff, target_label=args.target_label,
