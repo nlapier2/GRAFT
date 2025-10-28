@@ -29,38 +29,6 @@ def build_target_to_gene_index(adata: ad.AnnData, target_label: str) -> Dict[str
             t2i[t] = int(np.where(adata.var_names == t)[0][0])
     return t2i
 
-def make_base_adjacency(G: int, self_loops: bool = True) -> torch.Tensor:
-    """
-    Dense fully-connected adjacency (uniform), normalized row-wise.
-    We'll mask rows per-sample to forbid inbound messages to the target.
-    """
-    A = torch.ones(G, G)
-    if not self_loops:
-        A.fill_diagonal_(0.0)
-    # row-normalize so each node aggregates an average of neighbors
-    A = A / (A.sum(dim=1, keepdim=True) + 1e-8)
-    return A
-
-def make_adjacency_prior(W_meta: np.ndarray, meta_topk: int, G: int, device: str) -> torch.Tensor:
-    # build kNN in prior space (cosine), symmetric, row-normalized
-    Wm = W_meta.astype(np.float32)  # (R,G)
-    # cosine over columns
-    V = Wm.T  # (G,R)
-    Vn = V / (np.linalg.norm(V, axis=1, keepdims=True) + 1e-8)
-    S = Vn @ Vn.T  # (G,G) cosine similarity
-    # for each row, keep top-k (including self), set others to 0
-    k = min(meta_topk, G)
-    A = np.zeros_like(S, dtype=np.float32)
-    idx = np.argpartition(-S, kth=k-1, axis=1)[:, :k]
-    rows = np.repeat(np.arange(G)[:, None], k, axis=1)
-    A[rows, idx] = S[rows, idx]
-    # symmetrize by max
-    A = np.maximum(A, A.T)
-    # row-normalize
-    A = A / (A.sum(axis=1, keepdims=True) + 1e-8)
-    A_base = torch.from_numpy(A).to(device)
-    return A_base, k
-
 def prep_external_data(pb: ad.AnnData, target_label: str, control_label: str, adata_train: ad.AnnData, remove_non_genes: bool) -> ad.AnnData:
     if 'target_present' in pb.obs.columns and remove_non_genes:
         pb = pb[pb.obs["target_present"] | (pb.obs[target_label] == control_label), :].copy()
@@ -156,62 +124,6 @@ def train_test_split(args, adata):
             print(f"Test perts: {sorted(test_perts)[:10]}{' ...' if len(test_perts) > 10 else ''}")
         print(f"Train cells: {adata_train.n_obs}, Test cells: {adata_test.n_obs if adata_test is not None else 0}")
     return adata_train, adata_test, adata_test_orig
-
-@torch.no_grad()
-def print_edge_weight_stats(model, prefix="edges"):
-    """
-    Prints mean/std/min/max for learned edge weights.
-    - For sparse SpMM: over E stored edges (CSR).
-    - For dense learned edges: over all GxG entries.
-
-    It prints both raw probabilities (sigmoid(logit)) and the row-normalized version
-    that the layer actually uses in forward.
-    """
-    printed_any = False
-
-    # --- Sparse SpMM weights (E edges) ---
-    if hasattr(model, "edge_logit") and model.edge_logit is not None:
-        logits = model.edge_logit
-        G = int(model.csr_rowptr.numel() - 1)
-        E = int(logits.numel())
-        w = torch.sigmoid(logits)  # (E,)
-
-        # row-normalize like in forward
-        rows = model.csr_rows
-        row_sums = torch.zeros(G, dtype=w.dtype, device=w.device)
-        row_sums.index_add_(0, rows, w)
-        w_norm = w / row_sums[rows].clamp_min(1e-8)
-
-        def _stats(x):
-            return (x.mean().item(), x.std(unbiased=False).item(),
-                    x.min().item(), x.max().item())
-
-        m, s, mn, mx = _stats(w)
-        mN, sN, mnN, mxN = _stats(w_norm)
-
-        print(f"[{prefix}:sparse] G={G}  E={E}")
-        print(f"  raw    σ(logit): mean={m:.5f}  std={s:.5f}  min={mn:.3e}  max={mx:.5f}")
-        print(f"  row-norm used : mean={mN:.5f} std={sN:.5f} min={mnN:.3e} max={mxN:.5f}")
-        printed_any = True
-
-    # --- Dense learned weights (GxG) ---
-    if hasattr(model, "dense_edge_logit") and model.dense_edge_logit is not None:
-        W_raw = torch.sigmoid(model.dense_edge_logit)   # (G,G)
-        # row-normalize
-        W = W_raw / W_raw.sum(dim=1, keepdim=True).clamp_min(1e-8)
-
-        def _stats2(x):
-            return (x.mean().item(), x.std(unbiased=False).item(),
-                    x.amin().item(), x.amax().item())
-
-        m, s, mn, mx = _stats2(W_raw)
-        mN, sN, mnN, mxN = _stats2(W)
-
-        G = W_raw.shape[0]
-        print(f"[{prefix}:dense ] G={G}  entries={G*G}")
-        print(f"  raw    σ(logit): mean={m:.5f}  std={s:.5f}  min={mn:.3e}  max={mx:.5f}")
-        print(f"  row-norm used : mean={mN:.5f} std={sN:.5f} min={mnN:.3e} max={mxN:.5f}")
-        printed_any = True
 
 
 def write_pred_true_h5ads(
@@ -342,3 +254,194 @@ def sample_cell_level_deltas(mean_delta_vec: np.ndarray,
         size=(n_cells, mean_delta_vec.shape[0]),
     )
     return deltas
+
+def compute_avg_kd_efficiencies(
+    adata_train: ad.AnnData,
+    O: list[str],
+    target_label: str,
+    control_label: str,
+    ctrl_mean_target: np.ndarray,
+) -> tuple[float, dict[str, float]]:
+    """
+    Estimate knockdown efficiency e in [0,1] from TRAIN perts:
+      e = clip((ctrl - pert_expr) / max(ctrl, eps), 0, 1)
+    Returns (global_avg, per_gene_avg).
+    If a gene never appears as a target in O, fall back to global_avg.
+    """
+    G = adata_train.n_vars
+    var_to_idx = {g: i for i, g in enumerate(adata_train.var_names.astype(str))}
+    effs_by_gene: dict[str, list[float]] = {}
+    eps = 1e-8
+    for p in O:
+        g = str(p)  # assume pert name equals target gene symbol
+        if g not in var_to_idx:
+            continue
+        gi = var_to_idx[g]
+        v = adata_train[adata_train.obs[target_label] == p].X
+        v = np.asarray(v).reshape(-1, G).mean(axis=0)
+        ctrl = float(ctrl_mean_target[gi])
+        if ctrl <= eps:
+            continue
+        eff = (ctrl - float(v[gi])) / max(ctrl, eps)
+        eff = float(np.clip(eff, 0.0, 1.0))
+        effs_by_gene.setdefault(g, []).append(eff)
+    # per-gene and global averages
+    per_gene_avg = {g: float(np.mean(vals)) for g, vals in effs_by_gene.items()}
+    all_effs = [e for vals in effs_by_gene.values() for e in vals]
+    global_avg = float(np.mean(all_effs)) if all_effs else 0.5  # sensible fallback
+    return global_avg, per_gene_avg
+
+def pert_list(adata: ad.AnnData, target_label: str, control_label: str) -> list[str]:
+    perts_all = list(map(str, adata.obs[target_label].values))
+    # If pseudobulked, each row is a single pert; otherwise fallback to unique order.
+    # In either case, we evaluate on NON-control perts only.
+    uniq = list(dict.fromkeys(perts_all))  # stable unique
+    return [p for p in uniq if p != control_label]
+
+def build_truth_bundle(adata_split: ad.AnnData, target_label: str, control_label: str):
+    """
+    Returns (true_mat, pert_names) for this split.
+    true_mat rows match pert_names order; controls excluded.
+    """
+    G = adata_split.n_vars
+    perts = list(dict.fromkeys(map(str, adata_split.obs[target_label].values)))
+    perts = [p for p in perts if p != control_label]
+    rows = []
+    for p in perts:
+        m = (adata_split.obs[target_label] == p).values
+        rows.append(np.asarray(adata_split.X)[m].reshape(-1, G).mean(axis=0))
+    true_mat = np.stack(rows, axis=0) if rows else np.zeros((0, adata_split.n_vars))
+    return true_mat, perts
+
+def build_average_known_baseline(
+    adata_train: ad.AnnData,
+    adata_eval: ad.AnnData,
+    target_label: str,
+    control_label: str,
+    ctrl_mean_global: np.ndarray,
+):
+    """
+    Build AverageKnown predictions for TRAIN & EVAL:
+      1) Compute TRAIN mean delta vs GLOBAL control mean.
+      2) For each split, pred_mat_split := ctrl_mean_global - mean_delta_train (broadcasted).
+    Returns:
+      (pred_train, true_train, names_train), (pred_eval, true_eval, names_eval)
+    """
+    # TRAIN truths / names
+    true_train, names_train = build_truth_bundle(adata_train, target_label, control_label)
+    # EVAL truths / names
+    true_eval, names_eval = build_truth_bundle(adata_eval, target_label, control_label)
+    # Mean TRAIN delta vs global ctrl
+    if true_train.shape[0] > 0:
+        mean_delta_train = (true_train - ctrl_mean_global[None, :]).mean(axis=0, keepdims=True)
+    else:
+        mean_delta_train = np.zeros((1, ctrl_mean_global.shape[0]), dtype=float)
+    # Broadcast to splits (expression space)
+    pred_train = np.repeat(ctrl_mean_global[None, :] - mean_delta_train, repeats=len(names_train), axis=0) \
+                 if len(names_train) else mean_delta_train[:0]
+    pred_eval = np.repeat(ctrl_mean_global[None, :] - mean_delta_train, repeats=len(names_eval), axis=0) \
+                if len(names_eval) else mean_delta_train[:0]
+    return (pred_train, true_train, names_train), (pred_eval, true_eval, names_eval)
+
+def apply_target_overwrite_and_clamp(
+    pred_mat: np.ndarray,
+    pert_names: list[str],
+    adata_train: ad.AnnData,
+    target_label: str,
+    control_label: str,
+    ctrl_mean_global: np.ndarray,
+):
+    """Overwrite target gene expression via avg KD efficiency from TRAIN; then clamp >=0."""
+    var_to_idx = {g: i for i, g in enumerate(adata_train.var_names.astype(str))}
+    global_eff, per_gene_eff = compute_avg_kd_efficiencies(
+        adata_train=adata_train, O=pert_list(adata_train, target_label, control_label),
+        target_label=target_label, control_label=control_label, ctrl_mean_target=ctrl_mean_global
+    )
+    for row, pert in enumerate(pert_names):
+        gi = var_to_idx.get(pert, None)  # assume pert name equals target gene name when present
+        if gi is None:
+            continue
+        eff = per_gene_eff.get(pert, global_eff)
+        pred_mat[row, gi] = ctrl_mean_global[gi] * (1.0 - eff)
+    np.maximum(pred_mat, 0.0, out=pred_mat)
+
+def intersect_datasets(adata_source, adata_target, target_label, control_label, intersect_genes=False):
+    """
+    Subsets two AnnData objects to their common genes and perturbations.
+
+    Args:
+        adata_source: The source (external) AnnData object.
+        adata_target: The target AnnData object.
+        target_label: The obs column containing perturbation labels.
+        control_label: The label for control samples.
+        intersect_genes: If True, intersect genes across datasets; else only perts.
+
+    Returns:
+        A tuple of (subsetted source AnnData, subsetted target AnnData).
+    """
+    print("Finding intersection of genes and perturbations...")
+
+    source_perts = set(adata_source.obs[target_label].unique())
+    target_perts = set(adata_target.obs[target_label].unique())
+    common_perts = sorted(list(source_perts.intersection(target_perts)))
+
+    # Ensure the control label is always kept, even if it's not in the intersection
+    if control_label not in common_perts:
+        if control_label in source_perts and control_label in target_perts:
+            common_perts.append(control_label)
+    
+    if intersect_genes:
+        # First, get a list of valid genes from the source (not all NaN), then intersect.
+        common_genes = np.intersect1d(
+            adata_source.var_names[~np.isnan(to_numpy(adata_source.X)).all(axis=0)],
+            adata_target.var_names
+        )
+        print(f"  Found {len(common_genes)} common genes.")
+    else:
+        common_genes = None
+    print(f"  Found {len(common_perts) - 1} common perturbations (plus control).")
+
+    if common_genes is None:
+        # Intersect perts only; keep original gene spaces
+        adata_source_sub = adata_source[adata_source.obs[target_label].isin(common_perts), :].copy()
+        adata_target_sub = adata_target[adata_target.obs[target_label].isin(common_perts), :].copy()
+    else:
+        # Intersect both perts and genes
+        adata_source_sub = adata_source[adata_source.obs[target_label].isin(common_perts), common_genes].copy()
+        adata_target_sub = adata_target[adata_target.obs[target_label].isin(common_perts), common_genes].copy()
+
+    # Remove columns in source with all-NaN values (genes not in its dataset)
+    if not intersect_genes:
+        adata_source_sub = adata_source_sub[:, ~np.isnan(to_numpy(adata_source_sub.X)).all(axis=0)].copy()
+
+    return adata_source_sub, adata_target_sub
+
+def compute_deltas(adata, target_label, control_label):
+    """
+    Computes the delta (perturbation - control) vectors for a pseudobulked dataset.
+
+    Args:
+        adata: A pseudobulked AnnData object.
+        target_label: The obs column containing perturbation labels.
+        control_label: The label for control samples.
+
+    Returns:
+        A dictionary mapping perturbation labels to their delta vectors.
+    """
+    control_mask = adata.obs[target_label] == control_label
+    control_mean = adata[control_mask].X.mean(axis=0)
+
+    pert_adata = adata[~control_mask]
+    
+    deltas = {
+        pert: pert_adata[pert_adata.obs[target_label] == pert].X.flatten() - control_mean
+        for pert in pert_adata.obs[target_label].unique()
+    }
+    return deltas, control_mean
+
+def row_standardize(M: np.ndarray) -> np.ndarray:
+    """Zero-mean, unit-norm per row (safe for sparse/np arrays)."""
+    M = np.asarray(M, dtype=np.float32)
+    M = M - M.mean(axis=1, keepdims=True)
+    denom = np.linalg.norm(M, axis=1, keepdims=True) + 1e-8
+    return M / denom

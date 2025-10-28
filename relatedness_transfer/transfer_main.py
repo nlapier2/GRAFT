@@ -19,6 +19,7 @@ from sklearn.isotonic import IsotonicRegression
 
 from utils import *
 from losses import *
+from transforms import *
 
 
 def parse_arguments():
@@ -109,324 +110,6 @@ def parse_arguments():
     args = ap.parse_args()
     return args
 
-def build_truth_bundle(adata_split: ad.AnnData, target_label: str, control_label: str):
-    """
-    Returns (true_mat, pert_names) for this split.
-    true_mat rows match pert_names order; controls excluded.
-    """
-    G = adata_split.n_vars
-    perts = list(dict.fromkeys(map(str, adata_split.obs[target_label].values)))
-    perts = [p for p in perts if p != control_label]
-    rows = []
-    for p in perts:
-        m = (adata_split.obs[target_label] == p).values
-        rows.append(np.asarray(adata_split.X)[m].reshape(-1, G).mean(axis=0))
-    true_mat = np.stack(rows, axis=0) if rows else np.zeros((0, adata_split.n_vars))
-    return true_mat, perts
-
-def build_average_known_baseline(
-    adata_train: ad.AnnData,
-    adata_eval: ad.AnnData,
-    target_label: str,
-    control_label: str,
-    ctrl_mean_global: np.ndarray,
-):
-    """
-    Build AverageKnown predictions for TRAIN & EVAL:
-      1) Compute TRAIN mean delta vs GLOBAL control mean.
-      2) For each split, pred_mat_split := ctrl_mean_global - mean_delta_train (broadcasted).
-    Returns:
-      (pred_train, true_train, names_train), (pred_eval, true_eval, names_eval)
-    """
-    # TRAIN truths / names
-    true_train, names_train = build_truth_bundle(adata_train, target_label, control_label)
-    # EVAL truths / names
-    true_eval, names_eval = build_truth_bundle(adata_eval, target_label, control_label)
-    # Mean TRAIN delta vs global ctrl
-    if true_train.shape[0] > 0:
-        mean_delta_train = (true_train - ctrl_mean_global[None, :]).mean(axis=0, keepdims=True)
-    else:
-        mean_delta_train = np.zeros((1, ctrl_mean_global.shape[0]), dtype=float)
-    # Broadcast to splits (expression space)
-    pred_train = np.repeat(ctrl_mean_global[None, :] - mean_delta_train, repeats=len(names_train), axis=0) \
-                 if len(names_train) else mean_delta_train[:0]
-    pred_eval = np.repeat(ctrl_mean_global[None, :] - mean_delta_train, repeats=len(names_eval), axis=0) \
-                if len(names_eval) else mean_delta_train[:0]
-    return (pred_train, true_train, names_train), (pred_eval, true_eval, names_eval)
-
-def apply_target_overwrite_and_clamp(
-    pred_mat: np.ndarray,
-    pert_names: list[str],
-    adata_train: ad.AnnData,
-    target_label: str,
-    control_label: str,
-    ctrl_mean_global: np.ndarray,
-):
-    """Overwrite target gene expression via avg KD efficiency from TRAIN; then clamp >=0."""
-    var_to_idx = {g: i for i, g in enumerate(adata_train.var_names.astype(str))}
-    global_eff, per_gene_eff = _compute_avg_kd_efficiencies(
-        adata_train=adata_train, O=_pert_list(adata_train, target_label, control_label),
-        target_label=target_label, control_label=control_label, ctrl_mean_target=ctrl_mean_global
-    )
-    for row, pert in enumerate(pert_names):
-        gi = var_to_idx.get(pert, None)  # assume pert name equals target gene name when present
-        if gi is None:
-            continue
-        eff = per_gene_eff.get(pert, global_eff)
-        pred_mat[row, gi] = ctrl_mean_global[gi] * (1.0 - eff)
-    np.maximum(pred_mat, 0.0, out=pred_mat)
-
-def intersect_datasets(adata_source, adata_target, target_label, control_label, intersect_genes=False):
-    """
-    Subsets two AnnData objects to their common genes and perturbations.
-
-    Args:
-        adata_source: The source (external) AnnData object.
-        adata_target: The target AnnData object.
-        target_label: The obs column containing perturbation labels.
-        control_label: The label for control samples.
-        intersect_genes: If True, intersect genes across datasets; else only perts.
-
-    Returns:
-        A tuple of (subsetted source AnnData, subsetted target AnnData).
-    """
-    print("Finding intersection of genes and perturbations...")
-
-    source_perts = set(adata_source.obs[target_label].unique())
-    target_perts = set(adata_target.obs[target_label].unique())
-    common_perts = sorted(list(source_perts.intersection(target_perts)))
-
-    # Ensure the control label is always kept, even if it's not in the intersection
-    if control_label not in common_perts:
-        if control_label in source_perts and control_label in target_perts:
-            common_perts.append(control_label)
-    
-    if intersect_genes:
-        # First, get a list of valid genes from the source (not all NaN), then intersect.
-        common_genes = np.intersect1d(
-            adata_source.var_names[~np.isnan(to_numpy(adata_source.X)).all(axis=0)],
-            adata_target.var_names
-        )
-        print(f"  Found {len(common_genes)} common genes.")
-    else:
-        common_genes = None
-    print(f"  Found {len(common_perts) - 1} common perturbations (plus control).")
-
-    if common_genes is None:
-        # Intersect perts only; keep original gene spaces
-        adata_source_sub = adata_source[adata_source.obs[target_label].isin(common_perts), :].copy()
-        adata_target_sub = adata_target[adata_target.obs[target_label].isin(common_perts), :].copy()
-    else:
-        # Intersect both perts and genes
-        adata_source_sub = adata_source[adata_source.obs[target_label].isin(common_perts), common_genes].copy()
-        adata_target_sub = adata_target[adata_target.obs[target_label].isin(common_perts), common_genes].copy()
-
-    # Remove columns in source with all-NaN values (genes not in its dataset)
-    if not intersect_genes:
-        adata_source_sub = adata_source_sub[:, ~np.isnan(to_numpy(adata_source_sub.X)).all(axis=0)].copy()
-
-    return adata_source_sub, adata_target_sub
-
-def compute_deltas(adata, target_label, control_label):
-    """
-    Computes the delta (perturbation - control) vectors for a pseudobulked dataset.
-
-    Args:
-        adata: A pseudobulked AnnData object.
-        target_label: The obs column containing perturbation labels.
-        control_label: The label for control samples.
-
-    Returns:
-        A dictionary mapping perturbation labels to their delta vectors.
-    """
-    control_mask = adata.obs[target_label] == control_label
-    control_mean = adata[control_mask].X.mean(axis=0)
-
-    pert_adata = adata[~control_mask]
-    
-    deltas = {
-        pert: pert_adata[pert_adata.obs[target_label] == pert].X.flatten() - control_mean
-        for pert in pert_adata.obs[target_label].unique()
-    }
-    return deltas, control_mean
-
-def _compute_avg_kd_efficiencies(
-    adata_train: ad.AnnData,
-    O: list[str],
-    target_label: str,
-    control_label: str,
-    ctrl_mean_target: np.ndarray,
-) -> tuple[float, dict[str, float]]:
-    """
-    Estimate knockdown efficiency e in [0,1] from TRAIN perts:
-      e = clip((ctrl - pert_expr) / max(ctrl, eps), 0, 1)
-    Returns (global_avg, per_gene_avg).
-    If a gene never appears as a target in O, fall back to global_avg.
-    """
-    G = adata_train.n_vars
-    var_to_idx = {g: i for i, g in enumerate(adata_train.var_names.astype(str))}
-    effs_by_gene: dict[str, list[float]] = {}
-    eps = 1e-8
-    for p in O:
-        g = str(p)  # assume pert name equals target gene symbol
-        if g not in var_to_idx:
-            continue
-        gi = var_to_idx[g]
-        v = adata_train[adata_train.obs[target_label] == p].X
-        v = np.asarray(v).reshape(-1, G).mean(axis=0)
-        ctrl = float(ctrl_mean_target[gi])
-        if ctrl <= eps:
-            continue
-        eff = (ctrl - float(v[gi])) / max(ctrl, eps)
-        eff = float(np.clip(eff, 0.0, 1.0))
-        effs_by_gene.setdefault(g, []).append(eff)
-    # per-gene and global averages
-    per_gene_avg = {g: float(np.mean(vals)) for g, vals in effs_by_gene.items()}
-    all_effs = [e for vals in effs_by_gene.values() for e in vals]
-    global_avg = float(np.mean(all_effs)) if all_effs else 0.5  # sensible fallback
-    return global_avg, per_gene_avg
-
-def _row_standardize(M: np.ndarray) -> np.ndarray:
-    """Zero-mean, unit-norm per row (safe for sparse/np arrays)."""
-    M = np.asarray(M, dtype=np.float32)
-    M = M - M.mean(axis=1, keepdims=True)
-    denom = np.linalg.norm(M, axis=1, keepdims=True) + 1e-8
-    return M / denom
-
-def _fit_isotonic_on_pairs(S_ext_OO: np.ndarray, Y_O: np.ndarray) -> "IsotonicRegression|None":
-    """
-    Fit isotonic regression mapping external similarity -> target similarity,
-    using only training perts (O). Returns a fitted IsotonicRegression or None.
-    """
-    # target similarity among O (using correlation-style similarity of DELTAS)
-    Zt = _row_standardize(Y_O)  # (|O|, G)
-    S_tgt_OO = Zt @ Zt.T
-    # take off-diagonal upper triangle pairs
-    iu, ju = np.triu_indices(S_ext_OO.shape[0], k=1)
-    x = S_ext_OO[iu, ju].astype(np.float64)
-    y = S_tgt_OO[iu, ju].astype(np.float64)
-    # Guard against degenerate cases
-    if np.allclose(x, x[0]) or np.allclose(y, y[0]):
-        print("[iso] Degenerate pairwise similarities; skipping isotonic calibration.")
-        return None
-    iso = IsotonicRegression(y_min=-1.0, y_max=1.0, increasing=True, out_of_bounds="clip")
-    iso.fit(x, y)
-    return iso
-
-def _apply_isotonic_matrix(iso: "IsotonicRegression|None", S: np.ndarray) -> np.ndarray:
-    """Apply fitted isotonic regressor elementwise to a similarity matrix; symmetrize and fix diag."""
-    if iso is None:
-        return S
-    S_flat = S.ravel()
-    S_cal = iso.predict(S_flat).reshape(S.shape)
-    S_cal = 0.5 * (S_cal + S_cal.T)
-    np.fill_diagonal(S_cal, 1.0)
-    return S_cal
-
-def _pert_list(adata: ad.AnnData, target_label: str, control_label: str) -> list[str]:
-    perts_all = list(map(str, adata.obs[target_label].values))
-    # If pseudobulked, each row is a single pert; otherwise fallback to unique order.
-    # In either case, we evaluate on NON-control perts only.
-    uniq = list(dict.fromkeys(perts_all))  # stable unique
-    return [p for p in uniq if p != control_label]
-
-def _sharpen_neighbors(K_UO: np.ndarray, tau: float = 1.0, topk: int = 0) -> np.ndarray:
-    """
-    A4: Neighbor sharpening. Elementwise power on similarities then optional top-k per row.
-    Operates ONLY on K_UO (cross block) to avoid changing the fit on O.
-    """
-    if tau <= 1.0 and (topk is None or topk <= 0):
-        return K_UO
-    Kp = np.maximum(K_UO, 0.0).astype(np.float32)
-    if tau > 1.0:
-        Kp = np.power(Kp, tau, dtype=np.float32)
-    if topk and topk > 0:
-        topk = min(topk, Kp.shape[1])
-        # threshold each row to its k-th largest value
-        part = np.partition(Kp, Kp.shape[1] - topk, axis=1)
-        thresh = part[:, Kp.shape[1] - topk : Kp.shape[1] - topk + 1]
-        Kp[Kp < thresh] = 0.0
-    Kp_sum = Kp.sum(axis=1, keepdims=True) + 1e-8
-    Kp /= Kp_sum
-    return Kp
-
-def _subspace_boost(Y_U_hat_delta: np.ndarray, Y_O_delta: np.ndarray, k: int, gamma: float) -> np.ndarray:
-    """
-    A3: Subspace boosting in gene space. Boost components along the top-k PCs
-    computed from training deltas Y_O (|O| x G). Uses SVD to avoid extra deps.
-    """
-    if k <= 0 or gamma <= 0:
-        return Y_U_hat_delta
-    k = min(k, min(Y_O_delta.shape[0], Y_O_delta.shape[1]))
-    # Center across perts before SVD to focus on between-pert variation
-    Yc = Y_O_delta - Y_O_delta.mean(axis=0, keepdims=True)
-    # thin SVD: Yc = U S Vt ; Vt is (G x G) truncated to k
-    try:
-        U, S, Vt = np.linalg.svd(Yc, full_matrices=False)
-    except np.linalg.LinAlgError:
-        return Y_U_hat_delta  # fall back safely if SVD fails
-    P = Vt[:k, :].T  # G x k
-    proj = (Y_U_hat_delta @ P) @ P.T  # project into top-k subspace
-    boosted = Y_U_hat_delta + gamma * proj
-    return boosted
-
-def _sharpen_effects(
-    pred_mat: np.ndarray,
-    ctrl_mean: np.ndarray,
-    mode: str,
-    gamma: float = 1.5,
-    topk_frac: float = 0.1,
-    alpha: float = 0.3,
-    beta: float = 0.2,
-    sigmoid_B: float = 0.7,
-    preserve_q: float = 0.95,
-):
-    """
-    Post-process predicted effects Δ = pred - ctrl, apply a monotone sharpening, then
-    reconstruct predictions pred' = ctrl + Δ'. Operates in-place on a copy and returns it.
-    """
-    if mode == "none":
-        return pred_mat
-    pred = pred_mat.copy()
-    # Effects (same shape as pred)
-    delta = pred - ctrl_mean[None, :]
-    A = np.abs(delta)
-    sign = np.sign(delta)
-
-    if mode == "power":
-        # Δ' = sign(Δ) * |Δ|^γ ; then rescale to preserve the chosen quantile magnitude
-        Dp = (A ** max(gamma, 1.0000001))
-        # scale to preserve q-th abs magnitude (per-row)
-        q_old = np.quantile(A, preserve_q, axis=1, keepdims=True)
-        q_new = np.quantile(Dp, preserve_q, axis=1, keepdims=True) + 1e-12
-        scale = np.where(q_new > 0, q_old / q_new, 1.0)
-        delta_sharp = sign * (Dp * scale)
-
-    elif mode == "topk":
-        # Inflate top-k% |Δ| by (1+alpha), shrink others by (1-beta)
-        P, G = delta.shape
-        k = np.maximum(1, (topk_frac * G).astype(int) if isinstance(topk_frac, np.ndarray) else int(round(topk_frac * G)))
-        delta_sharp = delta.copy()
-        for i in range(P):
-            idx = np.argpartition(A[i], G - k)[-k:]
-            not_idx = np.setdiff1d(np.arange(G), idx, assume_unique=False)
-            delta_sharp[i, idx] *= (1.0 + alpha)
-            delta_sharp[i, not_idx] *= (1.0 - beta)
-
-    elif mode == "sigmoid":
-        # Δ' = A * tanh(B * Δ), with A chosen so that q-th |Δ| is preserved
-        B = sigmoid_B
-        T = np.tanh(B * delta)
-        q_old = np.quantile(A, preserve_q, axis=1, keepdims=True)
-        q_new = np.quantile(np.abs(T), preserve_q, axis=1, keepdims=True) + 1e-12
-        Arow = np.where(q_new > 0, q_old / q_new, 1.0)
-        delta_sharp = Arow * T
-    else:
-        return pred_mat
-
-    pred_sharp = ctrl_mean[None, :] + delta_sharp
-    return pred_sharp
-
 def krr_predict_from_external(
     adata_source: ad.AnnData,
     adata_train: ad.AnnData,
@@ -462,8 +145,8 @@ def krr_predict_from_external(
         ctrl_mean_target = np.asarray(adata_train.X)[train_mask].mean(axis=0).reshape(-1)
 
     # ---- define sets ----
-    O = _pert_list(adata_train, target_label, control_label)  # observed perts
-    U = _pert_list(adata_eval,  target_label, control_label)  # to predict/evaluate
+    O = pert_list(adata_train, target_label, control_label)  # observed perts
+    U = pert_list(adata_eval,  target_label, control_label)  # to predict/evaluate
     perts_all = O + [p for p in U if p not in O]
     G = adata_train.n_vars
 
@@ -488,7 +171,7 @@ def krr_predict_from_external(
     del_src, _ = compute_deltas(adata_source, target_label, control_label)  # pert -> delta row
     Delta_src = np.stack([np.asarray(del_src[p]).ravel() for p in perts_all], axis=0)  # (P,G)
     if kernel_metric == "corr":
-        Z = _row_standardize(Delta_src)
+        Z = row_standardize(Delta_src)
         S_ext = Z @ Z.T
     else:  # "cosine"
         Z = Delta_src / (np.linalg.norm(Delta_src, axis=1, keepdims=True) + 1e-8)
@@ -499,8 +182,8 @@ def krr_predict_from_external(
     # ---- isotonic calibration on training pairs (O×O) ----
     if iso_calibrate:
         print("[iso] Fitting isotonic calibration on training perts...")
-        iso = _fit_isotonic_on_pairs(S_ext[np.ix_(iO, iO)], Y_O)
-        S_cal = _apply_isotonic_matrix(iso, S_ext)
+        iso = fit_isotonic_on_pairs(S_ext[np.ix_(iO, iO)], Y_O)
+        S_cal = apply_isotonic_matrix(iso, S_ext)
     else:
         S_cal = S_ext
 
@@ -515,7 +198,7 @@ def krr_predict_from_external(
     # ---- KRR: \hat Y_U = K_{UO} (K_{OO} + λI)^{-1} Y_O ----
     A = np.linalg.solve(KOO + krr_lambda * np.eye(KOO.shape[0], dtype=KOO.dtype), Y_O)  # (|O|, G)
     # sharpen neighbor mixing at prediction time
-    KUO_sharp = _sharpen_neighbors(KUO, tau=kernel_gamma, topk=topk)
+    KUO_sharp = sharpen_neighbors(KUO, tau=kernel_gamma, topk=topk)
     Y_U_hat_delta = KUO_sharp @ A  # (|U|, G)
 
     # --- Estimate per-gene residual variance on training perts (noise model)
@@ -546,7 +229,7 @@ def krr_predict_from_external(
 
     # subspace boosting along perturbation-contrast directions from Y_O
     if boost_pcs and boost_pcs > 0 and boost_gamma > 0:
-        Y_U_hat_delta = _subspace_boost(Y_U_hat_delta, Y_O, k=boost_pcs, gamma=boost_gamma)
+        Y_U_hat_delta = subspace_boost(Y_U_hat_delta, Y_O, k=boost_pcs, gamma=boost_gamma)
 
     # --- Confidence-weighted amplification of deltas BEFORE adding ctrl_mean ---
     Y_U_hat_delta = apply_confidence_boost(
@@ -563,7 +246,7 @@ def krr_predict_from_external(
 
     # --- Target gene overwrite using avg KD efficiency from TRAIN perts ---
     var_to_idx = {g: i for i, g in enumerate(adata_train.var_names.astype(str))}
-    global_eff, per_gene_eff = _compute_avg_kd_efficiencies(
+    global_eff, per_gene_eff = compute_avg_kd_efficiencies(
         adata_train=adata_train, O=O, target_label=target_label,
         control_label=control_label, ctrl_mean_target=ctrl_mean_target
     )
@@ -967,7 +650,7 @@ def main():
 
     # Optional PDS sharpening in effect space (pred → Δ → sharpen → pred)
     if args.pds_sharpen != "none" and pred_ev.shape[0] > 0:
-        pred_ev = _sharpen_effects(
+        pred_ev = sharpen_effects(
             pred_mat=pred_ev, ctrl_mean=ctrl_mean_global, mode=args.pds_sharpen,
             gamma=args.pds_gamma, topk_frac=args.pds_topk_frac,
             alpha=args.pds_alpha, beta=args.pds_beta,
@@ -1023,7 +706,7 @@ def main():
 
         # Optional sharpening for train split too (so metrics are consistent if you eval on train)
         if args.pds_sharpen != "none" and pred_tr.shape[0] > 0:
-            pred_tr = _sharpen_effects(
+            pred_tr = sharpen_effects(
                 pred_mat=pred_tr, ctrl_mean=ctrl_mean_global, mode=args.pds_sharpen,
                 gamma=args.pds_gamma, topk_frac=args.pds_topk_frac,
                 alpha=args.pds_alpha, beta=args.pds_beta,
