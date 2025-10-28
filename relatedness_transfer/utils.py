@@ -266,3 +266,79 @@ def collapse_to_pseudobulk(adata, target_label: str):
     ad_bulk.var_names = adata.var_names.copy()
     ad_bulk.obs[target_label] = df.index.astype(str)
     return ad_bulk
+
+def _variance_to_confidence(pred_delta_var: np.ndarray,
+                            vmin: float,
+                            vmax: float) -> np.ndarray:
+    """
+    Map per-(pert,gene) predictive variance to [0,1] confidence.
+    Lower var -> confidence ~1.
+    Higher var -> confidence ~0.
+    """
+    # normalize var into [0,1]
+    norm = (pred_delta_var - vmin) / (vmax - vmin + 1e-12)
+    norm = np.clip(norm, 0.0, 1.0)
+    conf = 1.0 - norm
+    return conf
+
+
+def apply_confidence_boost(pred_delta_mat: np.ndarray,
+                            pred_delta_var: np.ndarray,
+                            conf_boost_alpha: float = 0.0,
+                            conf_shrink_alpha: float = 0.0,
+                            conf_min_var: float = 1e-6,
+                            conf_max_var: float = 1.0) -> np.ndarray:
+    """
+    Take the (|U| x G) predicted delta matrix from KRR and a matching (|U| x G)
+    predictive variance matrix, and scale each delta entry based on confidence.
+
+        scale = 1
+              + conf_boost_alpha  * conf
+              - conf_shrink_alpha * (1 - conf)
+
+    where conf is in [0,1] from _variance_to_confidence().
+
+    Setting conf_shrink_alpha=0 leaves low-confidence genes mostly unchanged.
+    Setting conf_boost_alpha>0 amplifies confident hits (PDS-friendly).
+    """
+    if (conf_boost_alpha == 0.0) and (conf_shrink_alpha == 0.0):
+        return pred_delta_mat
+
+    conf = _variance_to_confidence(
+        pred_delta_var,
+        vmin=conf_min_var,
+        vmax=conf_max_var,
+    )  # same shape as pred_delta_mat
+
+    scale = 1.0 + conf_boost_alpha * conf - conf_shrink_alpha * (1.0 - conf)
+    boosted = pred_delta_mat * scale
+    return boosted
+
+
+def sample_cell_level_deltas(mean_delta_vec: np.ndarray,
+                             var_delta_vec: np.ndarray,
+                             n_cells: int,
+                             var_scale: float = 1.0,
+                             rng: np.random.Generator | None = None) -> np.ndarray:
+    """
+    For a single perturbation:
+        mean_delta_vec: (G,) mean predicted (pert - ctrl) delta
+        var_delta_vec:  (G,) predictive variance for that perturbation
+        n_cells:        how many synthetic cells to make
+        var_scale:      multiplier on stddev
+
+    Returns (n_cells x G) array, where each row is a sampled delta to subtract
+    from a sampled control cell. Low-variance genes -> similar deltas across cells.
+    High-variance genes -> more heterogeneity.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    std_vec = np.sqrt(np.clip(var_delta_vec, 0.0, None)) * float(var_scale)
+    # Broadcast mean_delta_vec and std_vec to per-cell Gaussian draws
+    deltas = rng.normal(
+        loc=mean_delta_vec[None, :],
+        scale=std_vec[None, :],
+        size=(n_cells, mean_delta_vec.shape[0]),
+    )
+    return deltas

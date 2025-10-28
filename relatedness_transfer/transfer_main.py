@@ -88,6 +88,24 @@ def parse_arguments():
     ap.add_argument("--pds_preserve_quantile", type=float, default=0.95,
                     help="Quantile of |Δ| whose magnitude is preserved by the transform.")
 
+    # Confidence-weighted amplification of predicted deltas (pre-PDS-sharpening)
+    ap.add_argument("--conf_boost_alpha", type=float, default=0.0,
+                    help="Amplify high-confidence (low-variance) genes. 0.0 = disabled.")
+    ap.add_argument("--conf_shrink_alpha", type=float, default=0.0,
+                    help="Optionally shrink low-confidence (high-variance) genes. 0.0 = no shrink.")
+    ap.add_argument("--conf_min_var", type=float, default=1e-6,
+                    help="Lower variance bound when converting var->confidence.")
+    ap.add_argument("--conf_max_var", type=float, default=1.0,
+                    help="Upper variance bound when converting var->confidence.")
+
+    # Single-cell synthesis using predictive variance
+    ap.add_argument("--scell_use_var", action="store_true",
+                    help="If set, sample per-cell deltas using predictive variance instead of applying one fixed delta.")
+    ap.add_argument("--scell_var_scale", type=float, default=1.0,
+                    help="Global multiplier on per-gene stddev when sampling per-cell deltas.")
+    ap.add_argument("--scell_clip_zero", action="store_true",
+                    help="Clamp synthesized cells to >=0 after applying sampled deltas.")
+
     args = ap.parse_args()
     return args
 
@@ -423,12 +441,19 @@ def krr_predict_from_external(
     topk: int = 0,
     boost_pcs: int = 0,
     boost_gamma: float = 0.6,
-) -> tuple[np.ndarray, np.ndarray, list[str], np.ndarray]:
+    # NEW: confidence boost args
+    conf_boost_alpha: float = 0.0,
+    conf_shrink_alpha: float = 0.0,
+    conf_min_var: float = 1e-6,
+    conf_max_var: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray, list[str], np.ndarray, np.ndarray]:
     """
-    KRR over perturbation index with kernel built from EXTERNAL deltas (train+eval perts).
-    Returns the bundle expected by your evaluator: (pred_mat, true_mat, pert_names, ctrl_mean),
-    where **pred_mat and true_mat are EXPRESSION LEVELS**, not deltas.
-    ctrl_mean is the TRAIN-split control mean, matching your evaluation protocol.
+    Returns:
+      pred_mat        (|U| x G) predicted EXPRESSION for eval perts U
+      true_mat        (|U| x G) true EXPRESSION rows for eval perts U
+      pert_names      list[str] length |U|
+      ctrl_mean       (G,)
+      pred_delta_var  (|U| x G) predictive VARIANCE on the DELTA space (before ctrl_mean added)
     """
     G = adata_train.n_vars
     # ---- use TRAIN control mean (for adding back to deltas & evaluator's baseline) ----
@@ -493,9 +518,45 @@ def krr_predict_from_external(
     KUO_sharp = _sharpen_neighbors(KUO, tau=kernel_gamma, topk=topk)
     Y_U_hat_delta = KUO_sharp @ A  # (|U|, G)
 
+    # --- Estimate per-gene residual variance on training perts (noise model)
+    Y_O_hat = KOO @ A                           # (|O|, G), fitted deltas for O
+    resid = Y_O - Y_O_hat                       # (|O|, G)
+    sigma2_gene = (resid ** 2).mean(axis=0)     # (G,)
+
+    # --- GP-style scalar uncertainty per eval pert based on kernel geometry
+    # s2_raw[u] = k_uu - k_uO @ (KOO+λI)^(-1) @ k_Ou
+    KOO_reg_inv = np.linalg.inv(KOO + krr_lambda * np.eye(KOO.shape[0], dtype=KOO.dtype))
+    # precompute for speed: M = KOO_reg_inv @ K_Ou for each u
+    # We'll just loop since |U| is usually not huge
+    s2_raw_list = []
+    for row_u in range(KUO.shape[0]):
+        k_uO = KUO[row_u, :].reshape(1, -1)     # (1, |O|)
+        k_Ou = k_uO.T                           # (|O|, 1)
+        k_uu = float(K[iU[row_u], iU[row_u]])   # scalar
+        middle = KOO_reg_inv @ k_Ou             # (|O|,1)
+        s2_raw = k_uu - (k_uO @ middle).item()    # scalar
+        if s2_raw < 0:
+            # small negative due to numerics; clip
+            s2_raw = 0.0
+        s2_raw_list.append(s2_raw)
+    s2_raw_arr = np.asarray(s2_raw_list, dtype=np.float32)  # (|U|,)
+
+    # Broadcast to per-gene predictive variance
+    pred_delta_var = s2_raw_arr[:, None] * sigma2_gene[None, :]  # (|U|, G)
+
     # subspace boosting along perturbation-contrast directions from Y_O
     if boost_pcs and boost_pcs > 0 and boost_gamma > 0:
         Y_U_hat_delta = _subspace_boost(Y_U_hat_delta, Y_O, k=boost_pcs, gamma=boost_gamma)
+
+    # --- Confidence-weighted amplification of deltas BEFORE adding ctrl_mean ---
+    Y_U_hat_delta = apply_confidence_boost(
+        pred_delta_mat = Y_U_hat_delta,
+        pred_delta_var = pred_delta_var,
+        conf_boost_alpha = conf_boost_alpha,
+        conf_shrink_alpha = conf_shrink_alpha,
+        conf_min_var = conf_min_var,
+        conf_max_var = conf_max_var,
+    )
 
     # ---- Convert to EXPRESSION levels expected by evaluator ----
     pred_mat = Y_U_hat_delta + ctrl_mean_target[None, :]   # (|U|, G)
@@ -524,17 +585,21 @@ def krr_predict_from_external(
     pert_names = adata_eval.obs.loc[test_pert_mask, target_label].astype(str).tolist()
 
     # ctrl_mean returned in the bundle = TRAIN control mean (global baseline)
-    return pred_mat, true_mat, pert_names, np.asarray(ctrl_mean_target).ravel()
+    return pred_mat, true_mat, pert_names, np.asarray(ctrl_mean_target).ravel(), pred_delta_var
 
 def write_cell_level_predictions(
     adata_test_orig: ad.AnnData,
     eval_gene_names,
     pred_mat_eval: np.ndarray,
+    pred_delta_var_eval: np.ndarray,
     names_eval: list[str],
     ctrl_mean_eval: np.ndarray,
     target_label: str,
     control_label: str,
     out_path: str,
+    scell_use_var: bool = False,
+    scell_var_scale: float = 1.0,
+    scell_clip_zero: bool = True,
     random_state: int | None = None,
 ):
     """
@@ -584,6 +649,7 @@ def write_cell_level_predictions(
     # Compute per-pert delta vectors from predicted pseudobulk expression (eval space)
     # delta_p = ctrl_mean - pred_expr[p], so x_pert ≈ x_ctrl - delta_p
     name_to_row = {p: i for i, p in enumerate(names_eval)}
+    name_to_varrow = {p: i for i, p in enumerate(names_eval)}
 
     # Prepare outputs
     obs_rows = []
@@ -609,13 +675,37 @@ def write_cell_level_predictions(
             print(f"[cells] WARNING: no prediction for pert '{p}' in pred_mat_eval; skipping synthesis for this pert.")
             continue
         pred_expr = pred_mat_eval[row]          # (G,)
-        delta_p = ctrl_mean_eval - pred_expr    # (G,)
+        delta_p_mean = ctrl_mean_eval - pred_expr    # (G,)
+
+        # per-gene predictive variance for this pert in delta space
+        var_row = name_to_varrow.get(p, None)
+        if var_row is None:
+            var_vec = np.zeros_like(delta_p_mean)
+        else:
+            var_vec = pred_delta_var_eval[var_row]  # (G,)
+
         # sample control indices (with replacement if needed)
         replace = n_p > n_ctrl
         idx = rng.choice(n_ctrl, size=n_p, replace=replace)
         X_base = X_ctrl[idx]                    # (n_p, G)
-        X_syn = X_base - delta_p[None, :]       # subtract learned delta
-        np.maximum(X_syn, 0.0, out=X_syn)       # clamp
+
+        if scell_use_var:
+            # sample a different delta for each synthetic cell
+            sampled_deltas = sample_cell_level_deltas(
+                mean_delta_vec = delta_p_mean,
+                var_delta_vec  = var_vec,
+                n_cells        = n_p,
+                var_scale      = scell_var_scale,
+                rng            = rng,
+            )  # (n_p, G)
+            X_syn = X_base - sampled_deltas
+        else:
+            # old deterministic behavior
+            X_syn = X_base - delta_p_mean[None, :]
+
+        if scell_clip_zero:
+            np.maximum(X_syn, 0.0, out=X_syn)       # clamp
+
         # clone obs rows from sampled controls but set pert label to p
         obs_p = ctrl_obs.iloc[idx].copy()
         obs_p[target_label] = p
@@ -843,7 +933,7 @@ def main():
     if args.method != "krr":
         raise ValueError(f"Unknown method: {args.method}")
     # Run KRR ONLY on the intersected views; get predictions for intersected perts
-    pred_krr_ev, _true_krr_ev, names_krr_ev, _ctrl_ignored = krr_predict_from_external(
+    pred_krr_ev, _true_krr_ev, names_krr_ev, _ctrl_ignored, pred_delta_var_ev = krr_predict_from_external(
         adata_source=adata_source,
         adata_train=adata_train_int,
         adata_eval=eval_adata_int,
@@ -857,6 +947,10 @@ def main():
         topk=args.topk,
         boost_pcs=args.boost_pcs,
         boost_gamma=args.boost_gamma,
+        conf_boost_alpha=args.conf_boost_alpha,
+        conf_shrink_alpha=args.conf_shrink_alpha,
+        conf_min_var=args.conf_min_var,
+        conf_max_var=args.conf_max_var,
     )
     # Overwrite rows (by pert name) into the AverageKnown baseline (eval split)
     name2row_ev = {p: i for i, p in enumerate(names_ev)}
@@ -896,7 +990,7 @@ def main():
     # ---------------------------
     if args.eval_on_train and (adata_test is not None):
         print("\n=== Evaluation on TRAIN set ===")
-        pred_krr_tr, _true_krr_tr, names_krr_tr, _ = krr_predict_from_external(
+        pred_krr_tr, _true_krr_tr, names_krr_tr, _ctrl_ignored, _pred_delta_var_tr = krr_predict_from_external(
             adata_source=adata_source,
             adata_train=adata_train_int,
             adata_eval=adata_train_int,
@@ -910,6 +1004,10 @@ def main():
             topk=args.topk,
             boost_pcs=args.boost_pcs,
             boost_gamma=args.boost_gamma,
+            conf_boost_alpha=args.conf_boost_alpha,
+            conf_shrink_alpha=args.conf_shrink_alpha,
+            conf_min_var=args.conf_min_var,
+            conf_max_var=args.conf_max_var,
         )
         # Overwrite into train baseline
         name2row_tr = {p: i for i, p in enumerate(names_tr)}
@@ -958,15 +1056,20 @@ def main():
         # Use the same evaluation gene space that pred_ev uses
         eval_adata_for_eval = eval_adata_int if args.intersect_genes else eval_adata
         eval_gene_names = eval_adata_for_eval.var_names
+
         write_cell_level_predictions(
             adata_test_orig=adata_test_orig,
             eval_gene_names=eval_gene_names,
             pred_mat_eval=pred_ev,
+            pred_delta_var_eval=pred_delta_var_ev,
             names_eval=names_ev,
             ctrl_mean_eval=ctrl_mean_global,
             target_label=args.target_label,
             control_label=args.control_label,
             out_path=args.test_predict_out,
+            scell_use_var=args.scell_use_var,
+            scell_var_scale=args.scell_var_scale,
+            scell_clip_zero=args.scell_clip_zero,
             random_state=getattr(args, "seed", None),
         )
 
