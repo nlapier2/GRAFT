@@ -20,6 +20,7 @@ from sklearn.isotonic import IsotonicRegression
 from utils import *
 from losses import *
 from transforms import *
+from models import *
 
 
 def parse_arguments():
@@ -54,7 +55,7 @@ def parse_arguments():
 
     # Method + KRR hyperparams
     ap.add_argument("--method", type=str, default="krr",
-                    choices=["krr"], help="Which transfer method to run.")
+                    choices=["krr", "attn"], help="Which transfer method to run.")
     ap.add_argument("--krr_lambda", type=float, default=1e-2,
                     help="Ridge regularization λ for KRR on perturbation kernel.")
     ap.add_argument("--kernel_metric", type=str, default="corr",
@@ -613,28 +614,46 @@ def main():
     # Evaluate on the Test Set
     # ---------------------------
     print("\n=== Evaluation on {} set ===".format("TEST" if adata_test is not None else "TRAIN"))
-    if args.method != "krr":
+    if args.method == "krr":
+        # Run KRR ONLY on the intersected views; get predictions for intersected perts
+        pred_krr_ev, _true_krr_ev, names_krr_ev, _ctrl_ignored, pred_delta_var_ev = krr_predict_from_external(
+            adata_source=adata_source,
+            adata_train=adata_train_int,
+            adata_eval=eval_adata_int,
+            target_label=args.target_label,
+            control_label=args.control_label,
+            krr_lambda=args.krr_lambda,
+            kernel_metric=args.kernel_metric,
+            ctrl_mean_target=ctrl_mean_global,  # fixed control mean
+            iso_calibrate=args.iso_calibrate,
+            kernel_gamma=args.kernel_gamma,
+            topk=args.topk,
+            boost_pcs=args.boost_pcs,
+            boost_gamma=args.boost_gamma,
+            conf_boost_alpha=args.conf_boost_alpha,
+            conf_shrink_alpha=args.conf_shrink_alpha,
+            conf_min_var=args.conf_min_var,
+            conf_max_var=args.conf_max_var,
+        )
+    elif args.method == "attn":
+        pred_krr_ev, _true_krr_ev, names_krr_ev, _ctrl = attn_predict_from_external(
+            adata_source=adata_source,
+            adata_train=adata_train_int,
+            adata_eval=eval_adata_int,
+            target_label=args.target_label,
+            control_label=args.control_label,
+            ctrl_mean_target=ctrl_mean_global,
+            embed_dim=64,
+            epochs=args.epochs,     # you already have --epochs
+            lr=1e-3,
+            entropy_reg=1e-2,
+            device=args.device,
+            seed=args.seed,
+            boost_pcs=args.boost_pcs,
+            boost_gamma=args.boost_gamma,
+        )
+    else:
         raise ValueError(f"Unknown method: {args.method}")
-    # Run KRR ONLY on the intersected views; get predictions for intersected perts
-    pred_krr_ev, _true_krr_ev, names_krr_ev, _ctrl_ignored, pred_delta_var_ev = krr_predict_from_external(
-        adata_source=adata_source,
-        adata_train=adata_train_int,
-        adata_eval=eval_adata_int,
-        target_label=args.target_label,
-        control_label=args.control_label,
-        krr_lambda=args.krr_lambda,
-        kernel_metric=args.kernel_metric,
-        ctrl_mean_target=ctrl_mean_global,  # fixed control mean
-        iso_calibrate=args.iso_calibrate,
-        kernel_gamma=args.kernel_gamma,
-        topk=args.topk,
-        boost_pcs=args.boost_pcs,
-        boost_gamma=args.boost_gamma,
-        conf_boost_alpha=args.conf_boost_alpha,
-        conf_shrink_alpha=args.conf_shrink_alpha,
-        conf_min_var=args.conf_min_var,
-        conf_max_var=args.conf_max_var,
-    )
     # Overwrite rows (by pert name) into the AverageKnown baseline (eval split)
     name2row_ev = {p: i for i, p in enumerate(names_ev)}
     for j, p in enumerate(names_krr_ev):
@@ -673,25 +692,45 @@ def main():
     # ---------------------------
     if args.eval_on_train and (adata_test is not None):
         print("\n=== Evaluation on TRAIN set ===")
-        pred_krr_tr, _true_krr_tr, names_krr_tr, _ctrl_ignored, _pred_delta_var_tr = krr_predict_from_external(
-            adata_source=adata_source,
-            adata_train=adata_train_int,
-            adata_eval=adata_train_int,
-            target_label=args.target_label,
-            control_label=args.control_label,
-            krr_lambda=args.krr_lambda,
-            kernel_metric=args.kernel_metric,
-            ctrl_mean_target=ctrl_mean_global,
-            iso_calibrate=args.iso_calibrate,
-            kernel_gamma=args.kernel_gamma,
-            topk=args.topk,
-            boost_pcs=args.boost_pcs,
-            boost_gamma=args.boost_gamma,
-            conf_boost_alpha=args.conf_boost_alpha,
-            conf_shrink_alpha=args.conf_shrink_alpha,
-            conf_min_var=args.conf_min_var,
-            conf_max_var=args.conf_max_var,
-        )
+        if args.method == "krr":
+            pred_krr_tr, _true_krr_tr, names_krr_tr, _ctrl_ignored, _pred_delta_var_tr = krr_predict_from_external(
+                adata_source=adata_source,
+                adata_train=adata_train_int,
+                adata_eval=adata_train_int,
+                target_label=args.target_label,
+                control_label=args.control_label,
+                krr_lambda=args.krr_lambda,
+                kernel_metric=args.kernel_metric,
+                ctrl_mean_target=ctrl_mean_global,
+                iso_calibrate=args.iso_calibrate,
+                kernel_gamma=args.kernel_gamma,
+                topk=args.topk,
+                boost_pcs=args.boost_pcs,
+                boost_gamma=args.boost_gamma,
+                conf_boost_alpha=args.conf_boost_alpha,
+                conf_shrink_alpha=args.conf_shrink_alpha,
+                conf_min_var=args.conf_min_var,
+                conf_max_var=args.conf_max_var,
+            )
+        elif args.method == "attn":
+            pred_krr_tr, _true_krr_tr, names_krr_tr, _ctrl = attn_predict_from_external(
+                adata_source=adata_source,
+                adata_train=adata_train_int,
+                adata_eval=adata_train_int,
+                target_label=args.target_label,
+                control_label=args.control_label,
+                ctrl_mean_target=ctrl_mean_global,
+                embed_dim=64,
+                epochs=args.epochs,     # you already have --epochs
+                lr=1e-3,
+                entropy_reg=1e-2,
+                device=args.device,
+                seed=args.seed,
+                boost_pcs=args.boost_pcs,
+                boost_gamma=args.boost_gamma,
+            )
+        else:
+            raise ValueError(f"Unknown method: {args.method}")
         # Overwrite into train baseline
         name2row_tr = {p: i for i, p in enumerate(names_tr)}
         for j, p in enumerate(names_krr_tr):
