@@ -477,123 +477,147 @@ def _compute_pseudobulk_effects_for_corr(
 def generate_diag_report(
     diag_path: str,
     ctrl_mean_global: np.ndarray,
-    adata_eval_for_report,      # eval split AnnData in TARGET gene space
-    adata_donors_for_report,    # donor-only AnnData from TARGET (only observed perts + control)
-    adata_source,               # external dataset AnnData in the same gene space
+    adata_eval_for_report,      # eval/held-out AnnData (only eval perts, NO donors filtered out)
+    adata_donors_for_report,    # AnnData with ONLY observed donor perts + control, same gene space/order as adata_eval_for_report
+    adata_source_for_report,    # external AnnData, subset to the SAME common gene order as adata_eval_for_report
     target_label: str,
     control_label: str,
     pds_scores: dict[str, float],
 ):
     """
-    Write a human-readable plaintext report.
+    Writes a human-readable plaintext report.
 
-    For EACH perturbation p in the EVAL SPLIT (i.e. the held-out/test perts):
+    For EACH perturbation p in the eval split (held-out set):
+
       - PDS[p]
-      - corr_of_corrs between TARGET-donor neighborhood & EXTERNAL-donor neighborhood
-      - Top 10 most correlated OBSERVED TARGET donors by |corr|
-      - Top 10 most correlated EXTERNAL donors by |corr|
+      - corr_of_corrs: alignment between p's donor-similarity profile in TARGET vs EXTERNAL
+          (i.e. does p "like" the same donors in target and in external?)
+      - Top 10 donor neighbors in TARGET (by |corr|) using observed donor perts
+      - Top 10 donor neighbors in EXTERNAL (by |corr|) using those same donor names
+        (if the donor isn't in external, it won't show up / list may be short)
 
-    We do NOT rank against other held-out perts,
-    we rank p's similarity to the observed donor perts.
-
-    corr_of_corrs:
-      For p, we build:
-        vec_target = corr(p, each donor d in observed target donors)
-        vec_source = corr(p, each donor d in external donors)
-      We then correlate those 2 vectors across the INTERSECTION of donor names
-      that appear in BOTH target donors and external donors.
+    After all perts, appends:
+      - Overall mean PDS across perts in this eval set
+      - Pearson correlation between per-pert corr_of_corrs and PDS (excluding NaNs)
     """
 
-    # 1. Compute corr structure among OBSERVED donors in TARGET.
-    donor_perts_target, donor_effects_target, donor_corr_target, _ = _compute_pseudobulk_effects_for_corr(
-        adata_donors_for_report,
-        target_label=target_label,
-        control_label=control_label,
-        ctrl_mean_override=ctrl_mean_global,
-        restrict_perts=None  # this AnnData is already subset to donors
-    )
-    donor_idx_target = {p:i for i,p in enumerate(donor_perts_target)}
+    # Helper to compute per-perturbation pseudobulk deltas and return:
+    #   perts_list, effect_mat (K,G), ctrl_mean_used
+    # NOTE: This version does NOT build pairwise corr matrix because
+    # in this report we only ever correlate eval perts to donors.
+    def _pseudobulk_deltas_only(adata_in, ctrl_mean_override=None, restrict_perts=None):
+        G = adata_in.n_vars
+        if ctrl_mean_override is not None:
+            ctrl_mean = np.asarray(ctrl_mean_override).reshape(-1)
+        else:
+            ctrl_mask = (adata_in.obs[target_label].astype(str).values == control_label)
+            ctrl_mean = np.asarray(adata_in.X)[ctrl_mask].mean(axis=0).reshape(-1)
 
-    # 2. Compute corr structure among OBSERVED donors in EXTERNAL.
-    #    Here we don't override ctrl mean (let source define its own control).
-    donor_perts_src, donor_effects_src, donor_corr_src, _ = _compute_pseudobulk_effects_for_corr(
-        adata_source,
-        target_label=target_label,
-        control_label=control_label,
-        ctrl_mean_override=None,
-        restrict_perts=donor_perts_target  # only donors we also care about in target
-    )
-    donor_idx_src = {p:i for i,p in enumerate(donor_perts_src)}
+        if restrict_perts is None:
+            raw_perts = sorted(set(adata_in.obs[target_label].astype(str)) - {control_label})
+        else:
+            raw_perts = sorted([p for p in restrict_perts if p != control_label])
 
-    # 3. Compute pseudobulk DELTAS for EVAL perts (held-out/test perts).
-    #    We're going to compare these eval perts to the donor set.
-    eval_perts, eval_effects, _, _ = _compute_pseudobulk_effects_for_corr(
-        adata_eval_for_report,
-        target_label=target_label,
-        control_label=control_label,
-        ctrl_mean_override=ctrl_mean_global,
-        restrict_perts=None,   # include all perts actually present in eval set
-    )
-    eval_idx = {p:i for i,p in enumerate(eval_perts)}
+        X_np = np.asarray(adata_in.X)
+        bulk_rows = []
+        kept_perts = []
+        for p in raw_perts:
+            mask_p = (adata_in.obs[target_label].astype(str).values == p)
+            if not np.any(mask_p):
+                continue
+            v = X_np[mask_p].reshape(-1, G).mean(axis=0)
+            bulk_rows.append((v - ctrl_mean).astype(np.float32))
+            kept_perts.append(p)
 
-    # 4. We'll need correlations between:
-    #    (a) each eval pert and each TARGET donor pert (using TARGET deltas)
-    #    (b) each eval pert and each EXTERNAL donor pert (using EXTERNAL deltas)
-    #
-    # We'll make helper to get correlation between a single vector v and each row of M.
+        if len(kept_perts) == 0:
+            return kept_perts, np.zeros((0, G), dtype=np.float32), ctrl_mean
+
+        effect_mat = np.stack(bulk_rows, axis=0).astype(np.float32)
+        return kept_perts, effect_mat, ctrl_mean
+
+    # Correlate each row of M (K,G) with a single vector v (G,)
     def rowwise_corr_to_vec(M, v):
-        # M: (K,G), v: (G,)
-        M = M - M.mean(axis=1, keepdims=True)
+        # center each row of M and v
+        M0 = M - M.mean(axis=1, keepdims=True)
         v0 = v - v.mean()
-        Mden = np.sqrt((M**2).sum(axis=1)) + 1e-8
-        vden = np.sqrt((v0**2).sum()) + 1e-8
-        return (M @ v0) / (Mden * vden)
+        Mden = np.sqrt((M0 ** 2).sum(axis=1)) + 1e-8
+        vden = np.sqrt((v0 ** 2).sum()) + 1e-8
+        return (M0 @ v0) / (Mden * vden)
 
-    # Open file for human-readable report
+    # ----------------------------
+    # Build donor pseudobulks in TARGET space (observed perts)
+    # ----------------------------
+    donor_perts_target, donor_effects_target, _ = _pseudobulk_deltas_only(
+        adata_in=adata_donors_for_report,
+        ctrl_mean_override=ctrl_mean_global,
+        restrict_perts=None,  # adata_donors_for_report is already only observed perts + control
+    )
+    donor_idx_target = {p: i for i, p in enumerate(donor_perts_target)}
+
+    # ----------------------------
+    # Build donor pseudobulks in EXTERNAL space, but already gene-aligned
+    # (adata_source_for_report has already been subset to the same gene order)
+    # ----------------------------
+    donor_perts_src, donor_effects_src, _ = _pseudobulk_deltas_only(
+        adata_in=adata_source_for_report,
+        ctrl_mean_override=None,
+        restrict_perts=donor_perts_target  # only donors from target, so names line up as much as possible
+    )
+    donor_idx_src = {p: i for i, p in enumerate(donor_perts_src)}
+
+    # ----------------------------
+    # Build eval pseudobulks (held-out perts) in TARGET space
+    # ----------------------------
+    eval_perts, eval_effects, _ = _pseudobulk_deltas_only(
+        adata_in=adata_eval_for_report,
+        ctrl_mean_override=ctrl_mean_global,
+        restrict_perts=None,
+    )
+    eval_idx = {p: i for i, p in enumerate(eval_perts)}
+
+    # We'll accumulate for summary:
+    all_pds_vals = []
+    all_coc_vals = []  # corr-of-corrs vals, NaN for those where undefined
+
     with open(diag_path, "w") as fh:
         for p in eval_perts:
-            p_pds = pds_scores.get(p, np.nan)
+            this_pds = pds_scores.get(p, np.nan)
+            all_pds_vals.append(this_pds)
 
-            # ----- build neighbor list in TARGET donors -----
-            # corr of eval pert p with each donor in TARGET donor set
+            # vector for this eval perturbation (delta in TARGET space)
             i_eval = eval_idx[p]
-            v_eval = eval_effects[i_eval]  # (G,)
+            v_eval = eval_effects[i_eval]  # shape (G,)
 
+            # --- corr to TARGET donors (observed perts) ---
             if len(donor_perts_target) > 0:
-                corr_target_vec = rowwise_corr_to_vec(
-                    donor_effects_target,  # (K_target_donors, G)
-                    v_eval,                # (G,)
-                )  # -> (K_target_donors,)
+                corr_target_vec = rowwise_corr_to_vec(donor_effects_target, v_eval)
             else:
-                corr_target_vec = np.zeros(0, dtype=np.float32)
+                corr_target_vec = np.zeros((0,), dtype=np.float32)
 
-            # Rank donors by |corr| desc
+            # get top-10 |corr|
             order_tgt = np.argsort(-np.abs(corr_target_vec))
             top_tgt_lines = []
-            for rank_j, j in enumerate(order_tgt[:10]):
-                donor_name = donor_perts_target[j]
-                donor_corr = corr_target_vec[j]
+            for rank_j, jdon in enumerate(order_tgt[:10]):
+                donor_name = donor_perts_target[jdon]
+                donor_corr = corr_target_vec[jdon]
                 top_tgt_lines.append(f"  {rank_j+1:2d}. {donor_name:20s} r={donor_corr:+.3f}")
 
-            # ----- build neighbor list in EXTERNAL donors -----
-            # corr of eval pert p with each donor in EXTERNAL (same names if present)
+            # --- corr to EXTERNAL donors ---
+            # We correlate v_eval (TARGET delta) vs donor_effects_src (EXTERNAL deltas, already gene-aligned).
             if len(donor_perts_src) > 0:
-                corr_src_vec = rowwise_corr_to_vec(
-                    donor_effects_src,   # (K_src_donors, G)
-                    v_eval,              # still using eval's TARGET delta vector
-                )
+                corr_src_vec = rowwise_corr_to_vec(donor_effects_src, v_eval)
             else:
-                corr_src_vec = np.zeros(0, dtype=np.float32)
+                corr_src_vec = np.zeros((0,), dtype=np.float32)
 
             order_src = np.argsort(-np.abs(corr_src_vec))
             top_src_lines = []
-            for rank_j, j in enumerate(order_src[:10]):
-                donor_name = donor_perts_src[j]
-                donor_corr = corr_src_vec[j]
+            for rank_j, jdon in enumerate(order_src[:10]):
+                donor_name = donor_perts_src[jdon]
+                donor_corr = corr_src_vec[jdon]
                 top_src_lines.append(f"  {rank_j+1:2d}. {donor_name:20s} r={donor_corr:+.3f}")
 
-            # ----- corr-of-corrs alignment -----
-            # Compare "who I look like in TARGET donors" vs "who I look like in EXTERNAL donors"
+            # --- corr-of-corrs (alignment of donor neighborhood)
+            # Only compare across donors we have in BOTH target and source
             shared_donors = [d for d in donor_perts_target if d in donor_idx_src]
             if len(shared_donors) >= 2:
                 tgt_list = []
@@ -605,32 +629,58 @@ def generate_diag_report(
                     src_list.append(corr_src_vec[js])
                 tgt_arr = np.asarray(tgt_list, dtype=float)
                 src_arr = np.asarray(src_list, dtype=float)
-                if np.std(tgt_arr) < 1e-12 or np.std(src_arr) < 1e-12:
+
+                if (np.std(tgt_arr) < 1e-12) or (np.std(src_arr) < 1e-12):
                     corr_of_corrs_val = np.nan
                 else:
                     corr_of_corrs_val = np.corrcoef(tgt_arr, src_arr)[0, 1]
             else:
                 corr_of_corrs_val = np.nan
 
-            # ----- write block -----
+            all_coc_vals.append(corr_of_corrs_val)
+
+            # --- write block for this perturbation
             fh.write("======================================\n")
             fh.write(f"Perturbation: {p}\n")
-            fh.write(f"PDS: {p_pds:.4f}\n")
-            fh.write(f"Corr-of-corrs (donor neighborhood align): {corr_of_corrs_val:.4f}\n\n")
+            fh.write(f"PDS: {this_pds:.4f}\n")
+            if np.isnan(corr_of_corrs_val):
+                fh.write("Corr-of-corrs (donor neighborhood align): NA\n\n")
+            else:
+                fh.write(f"Corr-of-corrs (donor neighborhood align): {corr_of_corrs_val:.4f}\n\n")
 
             fh.write("Top observed donors in TARGET (by |corr|):\n")
-            if top_tgt_lines:
+            if len(top_tgt_lines) > 0:
                 fh.write("\n".join(top_tgt_lines) + "\n")
             else:
                 fh.write("  [none]\n")
 
             fh.write("\nTop observed donors in EXTERNAL (by |corr|):\n")
-            if top_src_lines:
+            if len(top_src_lines) > 0:
                 fh.write("\n".join(top_src_lines) + "\n")
             else:
-                fh.write("  [none]\n")
+                fh.write("  [none or donor not present in external]\n")
 
-            fh.write("\n\n")  # blank space after each pert
+            fh.write("\n\n")
+
+        # ---- summary stats ----
+        mean_pds = float(np.nanmean(all_pds_vals)) if len(all_pds_vals) > 0 else np.nan
+
+        # correlation between PDS and corr-of-corrs across perts (exclude NaNs)
+        coc_arr = np.asarray(all_coc_vals, dtype=float)
+        pds_arr = np.asarray(all_pds_vals, dtype=float)
+        mask = (~np.isnan(coc_arr)) & (~np.isnan(pds_arr))
+        if mask.sum() >= 2 and np.std(coc_arr[mask]) > 1e-12 and np.std(pds_arr[mask]) > 1e-12:
+            pds_vs_align_corr = float(np.corrcoef(coc_arr[mask], pds_arr[mask])[0, 1])
+        else:
+            pds_vs_align_corr = np.nan
+
+        fh.write("======================================\n")
+        fh.write("SUMMARY\n")
+        fh.write(f"Overall mean PDS: {mean_pds:.4f}\n")
+        if np.isnan(pds_vs_align_corr):
+            fh.write("Corr(PDS, corr-of-corrs): NA\n")
+        else:
+            fh.write(f"Corr(PDS, corr-of-corrs): {pds_vs_align_corr:.4f}\n")
 
     print(f"\nWrote human-readable diagnostic report to {diag_path}")
 
@@ -914,12 +964,15 @@ def main():
     eval_adata_for_eval = eval_adata_int if args.intersect_genes else eval_adata
     eval_results = evaluate_model(adata=eval_adata_for_eval, args=args, pred_bundle=(pred_ev, true_ev, names_ev, ctrl_mean_global))
 
-    # Build donor-only AnnData in the SAME gene space used for eval:
-    #   - concat train+eval in that gene space
-    #   - keep only cells from observed perts (O) plus control
+    # Build donor-only AnnData from the TARGET system.
+    # This is "observed perts + control", in the same split/gene space as eval.
     if args.intersect_genes:
+        # Both train and eval already live in intersected gene space
         adata_target_for_subset = ad.concat([adata_train_int, eval_adata_int])
     else:
+        # No gene intersection was enforced globally,
+        # so train/eval are in target gene space (e.g. 7.5k genes),
+        # external may have more genes.
         adata_target_for_subset = ad.concat([adata_train, eval_adata])
 
     keep_mask = np.isin(
@@ -928,14 +981,38 @@ def main():
     )
     adata_donors_for_report = adata_target_for_subset[keep_mask].copy()
 
+    # Prepare matched-gene-space views for the correlation diagnostics.
+    # We need eval, donors, and source to share the same gene set IN THE SAME ORDER.
+    eval_for_rep   = eval_adata_for_eval.copy()
+    donors_for_rep = adata_donors_for_report.copy()
+    source_for_rep = adata_source.copy()  # note: adata_source is already intersected if args.intersect_genes=True,
+                                          # but if args.intersect_genes=False it may have many extra genes.
+
+    # Choose common genes across eval and source (we only care about genes both have).
+    common_genes = np.intersect1d(
+        eval_for_rep.var_names.astype(str).values,
+        source_for_rep.var_names.astype(str).values,
+    )
+
+    # If common_genes is empty (extreme edge case), just skip gene alignment step:
+    if common_genes.size == 0:
+        # We'll fall back to using eval_for_rep / donors_for_rep as-is,
+        # and source_for_rep will effectively produce empty donor_perts_src.
+        pass
+    else:
+        # subset ALL THREE AnnDatas to this same common gene order
+        eval_for_rep   = eval_for_rep[:, common_genes].copy()
+        donors_for_rep = donors_for_rep[:, common_genes].copy()
+        source_for_rep = source_for_rep[:, common_genes].copy()
+
     # Optional: write per-pert diagnostics report
     if args.diag_report_path and args.diag_report_path != "":
         generate_diag_report(
             diag_path=args.diag_report_path,
             ctrl_mean_global=ctrl_mean_global,
-            adata_eval_for_report=(eval_adata_int if args.intersect_genes else eval_adata),
-            adata_donors_for_report=adata_donors_for_report,
-            adata_source=adata_source,
+            adata_eval_for_report=eval_for_rep,
+            adata_donors_for_report=donors_for_rep,
+            adata_source_for_report=source_for_rep,
             target_label=args.target_label,
             control_label=args.control_label,
             pds_scores=eval_results["PDS_scores"],
