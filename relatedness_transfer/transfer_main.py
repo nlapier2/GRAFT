@@ -42,6 +42,8 @@ def parse_arguments():
     ap.add_argument("--keep_oov_perts", action="store_true", 
                     help="If set, keep perts that are not in the source∩target intersection (left as AverageKnown baseline). "
                          "If unset, drop those rows before evaluation/output.")
+    ap.add_argument("--diag_report_path",type=str, default="",
+        help="If set, write per-pert diagnostics (PDS, top neighbors, corr-of-corrs) to this TSV.")
 
     # Train/test split and eval options
     ap.add_argument("--test_pct_perts", type=float, default=0.0,
@@ -269,7 +271,8 @@ def krr_predict_from_external(
     pert_names = adata_eval.obs.loc[test_pert_mask, target_label].astype(str).tolist()
 
     # ctrl_mean returned in the bundle = TRAIN control mean (global baseline)
-    return pred_mat, true_mat, pert_names, np.asarray(ctrl_mean_target).ravel(), pred_delta_var
+    O = pert_list(adata_train, target_label, control_label)  # observed perts
+    return pred_mat, true_mat, pert_names, np.asarray(ctrl_mean_target).ravel(), pred_delta_var, O
 
 def write_cell_level_predictions(
     adata_test_orig: ad.AnnData,
@@ -406,6 +409,230 @@ def write_cell_level_predictions(
     print(f"[cells] Writing synthesized test predictions: {out_path} "
           f"(controls={ctrl_mask.sum()}, synthesized={X_out.shape[0] - ctrl_mask.sum()}, genes={G})")
     ad_out.write_h5ad(out_path)
+
+def _compute_pseudobulk_effects_for_corr(
+    adata,
+    target_label: str,
+    control_label: str,
+    ctrl_mean_override: np.ndarray | None = None,
+    restrict_perts: list[str] | None = None,
+):
+    """
+    Compute per-perturbation pseudobulk deltas and pairwise corr.
+
+    If restrict_perts is provided, we only consider those perts (plus we will
+    ignore any that aren't found). Otherwise we consider all non-control perts.
+
+    Returns:
+        perts_list: list[str] length K, in sorted order
+        effect_mat: (K, G) float32, (pseudobulk - control_mean)
+        corr_mat:   (K, K) Pearson corr between rows of effect_mat
+        ctrl_mean:  (G,)   control mean actually used
+    """
+    G = adata.n_vars
+
+    # control mean (global or dataset-specific)
+    if ctrl_mean_override is not None:
+        ctrl_mean = np.asarray(ctrl_mean_override).reshape(-1)
+    else:
+        ctrl_mask = (adata.obs[target_label] == control_label).values
+        ctrl_mean = np.asarray(adata.X)[ctrl_mask].mean(axis=0).reshape(-1)
+
+    # which perts to include
+    if restrict_perts is None:
+        raw_perts = sorted(set(adata.obs[target_label].astype(str)) - {control_label})
+    else:
+        raw_perts = sorted([p for p in restrict_perts if p != control_label])
+
+    bulk_rows = []
+    kept_perts = []
+    X_np = np.asarray(adata.X)
+    for p in raw_perts:
+        mask_p = (adata.obs[target_label] == p).values
+        if not np.any(mask_p):
+            continue
+        v = X_np[mask_p].reshape(-1, G).mean(axis=0)
+        bulk_rows.append((v - ctrl_mean).astype(np.float32))
+        kept_perts.append(p)
+
+    if len(kept_perts) == 0:
+        # edge case: no perts
+        effect_mat = np.zeros((0, G), dtype=np.float32)
+        corr_mat = np.zeros((0, 0), dtype=np.float32)
+        return kept_perts, effect_mat, corr_mat, ctrl_mean
+
+    effect_mat = np.stack(bulk_rows, axis=0).astype(np.float32)  # (K,G)
+    K = effect_mat.shape[0]
+
+    if K > 1:
+        em = effect_mat - effect_mat.mean(axis=1, keepdims=True)
+        denom = np.sqrt((em ** 2).sum(axis=1, keepdims=True)) + 1e-8
+        emn = em / denom
+        corr_mat = emn @ emn.T  # (K,K)
+    else:
+        corr_mat = np.ones((K, K), dtype=np.float32)
+
+    return kept_perts, effect_mat, corr_mat, ctrl_mean
+
+def generate_diag_report(
+    diag_path: str,
+    ctrl_mean_global: np.ndarray,
+    adata_eval_for_report,      # eval split AnnData in TARGET gene space
+    adata_donors_for_report,    # donor-only AnnData from TARGET (only observed perts + control)
+    adata_source,               # external dataset AnnData in the same gene space
+    target_label: str,
+    control_label: str,
+    pds_scores: dict[str, float],
+):
+    """
+    Write a human-readable plaintext report.
+
+    For EACH perturbation p in the EVAL SPLIT (i.e. the held-out/test perts):
+      - PDS[p]
+      - corr_of_corrs between TARGET-donor neighborhood & EXTERNAL-donor neighborhood
+      - Top 10 most correlated OBSERVED TARGET donors by |corr|
+      - Top 10 most correlated EXTERNAL donors by |corr|
+
+    We do NOT rank against other held-out perts,
+    we rank p's similarity to the observed donor perts.
+
+    corr_of_corrs:
+      For p, we build:
+        vec_target = corr(p, each donor d in observed target donors)
+        vec_source = corr(p, each donor d in external donors)
+      We then correlate those 2 vectors across the INTERSECTION of donor names
+      that appear in BOTH target donors and external donors.
+    """
+
+    # 1. Compute corr structure among OBSERVED donors in TARGET.
+    donor_perts_target, donor_effects_target, donor_corr_target, _ = _compute_pseudobulk_effects_for_corr(
+        adata_donors_for_report,
+        target_label=target_label,
+        control_label=control_label,
+        ctrl_mean_override=ctrl_mean_global,
+        restrict_perts=None  # this AnnData is already subset to donors
+    )
+    donor_idx_target = {p:i for i,p in enumerate(donor_perts_target)}
+
+    # 2. Compute corr structure among OBSERVED donors in EXTERNAL.
+    #    Here we don't override ctrl mean (let source define its own control).
+    donor_perts_src, donor_effects_src, donor_corr_src, _ = _compute_pseudobulk_effects_for_corr(
+        adata_source,
+        target_label=target_label,
+        control_label=control_label,
+        ctrl_mean_override=None,
+        restrict_perts=donor_perts_target  # only donors we also care about in target
+    )
+    donor_idx_src = {p:i for i,p in enumerate(donor_perts_src)}
+
+    # 3. Compute pseudobulk DELTAS for EVAL perts (held-out/test perts).
+    #    We're going to compare these eval perts to the donor set.
+    eval_perts, eval_effects, _, _ = _compute_pseudobulk_effects_for_corr(
+        adata_eval_for_report,
+        target_label=target_label,
+        control_label=control_label,
+        ctrl_mean_override=ctrl_mean_global,
+        restrict_perts=None,   # include all perts actually present in eval set
+    )
+    eval_idx = {p:i for i,p in enumerate(eval_perts)}
+
+    # 4. We'll need correlations between:
+    #    (a) each eval pert and each TARGET donor pert (using TARGET deltas)
+    #    (b) each eval pert and each EXTERNAL donor pert (using EXTERNAL deltas)
+    #
+    # We'll make helper to get correlation between a single vector v and each row of M.
+    def rowwise_corr_to_vec(M, v):
+        # M: (K,G), v: (G,)
+        M = M - M.mean(axis=1, keepdims=True)
+        v0 = v - v.mean()
+        Mden = np.sqrt((M**2).sum(axis=1)) + 1e-8
+        vden = np.sqrt((v0**2).sum()) + 1e-8
+        return (M @ v0) / (Mden * vden)
+
+    # Open file for human-readable report
+    with open(diag_path, "w") as fh:
+        for p in eval_perts:
+            p_pds = pds_scores.get(p, np.nan)
+
+            # ----- build neighbor list in TARGET donors -----
+            # corr of eval pert p with each donor in TARGET donor set
+            i_eval = eval_idx[p]
+            v_eval = eval_effects[i_eval]  # (G,)
+
+            if len(donor_perts_target) > 0:
+                corr_target_vec = rowwise_corr_to_vec(
+                    donor_effects_target,  # (K_target_donors, G)
+                    v_eval,                # (G,)
+                )  # -> (K_target_donors,)
+            else:
+                corr_target_vec = np.zeros(0, dtype=np.float32)
+
+            # Rank donors by |corr| desc
+            order_tgt = np.argsort(-np.abs(corr_target_vec))
+            top_tgt_lines = []
+            for rank_j, j in enumerate(order_tgt[:10]):
+                donor_name = donor_perts_target[j]
+                donor_corr = corr_target_vec[j]
+                top_tgt_lines.append(f"  {rank_j+1:2d}. {donor_name:20s} r={donor_corr:+.3f}")
+
+            # ----- build neighbor list in EXTERNAL donors -----
+            # corr of eval pert p with each donor in EXTERNAL (same names if present)
+            if len(donor_perts_src) > 0:
+                corr_src_vec = rowwise_corr_to_vec(
+                    donor_effects_src,   # (K_src_donors, G)
+                    v_eval,              # still using eval's TARGET delta vector
+                )
+            else:
+                corr_src_vec = np.zeros(0, dtype=np.float32)
+
+            order_src = np.argsort(-np.abs(corr_src_vec))
+            top_src_lines = []
+            for rank_j, j in enumerate(order_src[:10]):
+                donor_name = donor_perts_src[j]
+                donor_corr = corr_src_vec[j]
+                top_src_lines.append(f"  {rank_j+1:2d}. {donor_name:20s} r={donor_corr:+.3f}")
+
+            # ----- corr-of-corrs alignment -----
+            # Compare "who I look like in TARGET donors" vs "who I look like in EXTERNAL donors"
+            shared_donors = [d for d in donor_perts_target if d in donor_idx_src]
+            if len(shared_donors) >= 2:
+                tgt_list = []
+                src_list = []
+                for d in shared_donors:
+                    jt = donor_idx_target[d]
+                    js = donor_idx_src[d]
+                    tgt_list.append(corr_target_vec[jt])
+                    src_list.append(corr_src_vec[js])
+                tgt_arr = np.asarray(tgt_list, dtype=float)
+                src_arr = np.asarray(src_list, dtype=float)
+                if np.std(tgt_arr) < 1e-12 or np.std(src_arr) < 1e-12:
+                    corr_of_corrs_val = np.nan
+                else:
+                    corr_of_corrs_val = np.corrcoef(tgt_arr, src_arr)[0, 1]
+            else:
+                corr_of_corrs_val = np.nan
+
+            # ----- write block -----
+            fh.write("======================================\n")
+            fh.write(f"Perturbation: {p}\n")
+            fh.write(f"PDS: {p_pds:.4f}\n")
+            fh.write(f"Corr-of-corrs (donor neighborhood align): {corr_of_corrs_val:.4f}\n\n")
+
+            fh.write("Top observed donors in TARGET (by |corr|):\n")
+            if top_tgt_lines:
+                fh.write("\n".join(top_tgt_lines) + "\n")
+            else:
+                fh.write("  [none]\n")
+
+            fh.write("\nTop observed donors in EXTERNAL (by |corr|):\n")
+            if top_src_lines:
+                fh.write("\n".join(top_src_lines) + "\n")
+            else:
+                fh.write("  [none]\n")
+
+            fh.write("\n\n")  # blank space after each pert
+
+    print(f"\nWrote human-readable diagnostic report to {diag_path}")
 
 def evaluate_model(
     adata: ad.AnnData,
@@ -616,7 +843,7 @@ def main():
     print("\n=== Evaluation on {} set ===".format("TEST" if adata_test is not None else "TRAIN"))
     if args.method == "krr":
         # Run KRR ONLY on the intersected views; get predictions for intersected perts
-        pred_krr_ev, _true_krr_ev, names_krr_ev, _ctrl_ignored, pred_delta_var_ev = krr_predict_from_external(
+        pred_krr_ev, _true_krr_ev, names_krr_ev, _ctrl_ignored, pred_delta_var_ev, observed_perts_list_ev = krr_predict_from_external(
             adata_source=adata_source,
             adata_train=adata_train_int,
             adata_eval=eval_adata_int,
@@ -636,7 +863,7 @@ def main():
             conf_max_var=args.conf_max_var,
         )
     elif args.method == "attn":
-        pred_krr_ev, _true_krr_ev, names_krr_ev, _ctrl = attn_predict_from_external(
+        pred_krr_ev, _true_krr_ev, names_krr_ev, _ctrl, obs_perts = attn_predict_from_external(
             adata_source=adata_source,
             adata_train=adata_train_int,
             adata_eval=eval_adata_int,
@@ -685,7 +912,34 @@ def main():
     )
     # Evaluate using our assembled bundle (fixed control mean)
     eval_adata_for_eval = eval_adata_int if args.intersect_genes else eval_adata
-    evaluate_model(adata=eval_adata_for_eval, args=args, pred_bundle=(pred_ev, true_ev, names_ev, ctrl_mean_global))
+    eval_results = evaluate_model(adata=eval_adata_for_eval, args=args, pred_bundle=(pred_ev, true_ev, names_ev, ctrl_mean_global))
+
+    # Build donor-only AnnData in the SAME gene space used for eval:
+    #   - concat train+eval in that gene space
+    #   - keep only cells from observed perts (O) plus control
+    if args.intersect_genes:
+        adata_target_for_subset = ad.concat([adata_train_int, eval_adata_int])
+    else:
+        adata_target_for_subset = ad.concat([adata_train, eval_adata])
+
+    keep_mask = np.isin(
+        adata_target_for_subset.obs[args.target_label].astype(str).values,
+        np.array(list(observed_perts_list_ev) + [args.control_label], dtype=str)
+    )
+    adata_donors_for_report = adata_target_for_subset[keep_mask].copy()
+
+    # Optional: write per-pert diagnostics report
+    if args.diag_report_path and args.diag_report_path != "":
+        generate_diag_report(
+            diag_path=args.diag_report_path,
+            ctrl_mean_global=ctrl_mean_global,
+            adata_eval_for_report=(eval_adata_int if args.intersect_genes else eval_adata),
+            adata_donors_for_report=adata_donors_for_report,
+            adata_source=adata_source,
+            target_label=args.target_label,
+            control_label=args.control_label,
+            pds_scores=eval_results["PDS_scores"],
+        )
 
     # ---------------------------
     # (Optional) Evaluate on the Train Set
@@ -693,7 +947,7 @@ def main():
     if args.eval_on_train and (adata_test is not None):
         print("\n=== Evaluation on TRAIN set ===")
         if args.method == "krr":
-            pred_krr_tr, _true_krr_tr, names_krr_tr, _ctrl_ignored, _pred_delta_var_tr = krr_predict_from_external(
+            pred_krr_tr, _true_krr_tr, names_krr_tr, _ctrl_ignored, _pred_delta_var_tr, _ = krr_predict_from_external(
                 adata_source=adata_source,
                 adata_train=adata_train_int,
                 adata_eval=adata_train_int,
@@ -713,7 +967,7 @@ def main():
                 conf_max_var=args.conf_max_var,
             )
         elif args.method == "attn":
-            pred_krr_tr, _true_krr_tr, names_krr_tr, _ctrl = attn_predict_from_external(
+            pred_krr_tr, _true_krr_tr, names_krr_tr, _ctrl, _ = attn_predict_from_external(
                 adata_source=adata_source,
                 adata_train=adata_train_int,
                 adata_eval=adata_train_int,

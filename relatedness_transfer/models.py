@@ -538,4 +538,4 @@ def attn_predict_from_external(
         true_rows.append(v)
     true_mat = np.stack(true_rows, axis=0).astype(np.float32)  # (|U|,G)
 
-    return pred_mat, true_mat, U, ctrl_mean_target
+    return pred_mat, true_mat, U, ctrl_mean_target, O_int
