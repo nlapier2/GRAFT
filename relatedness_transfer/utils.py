@@ -401,6 +401,8 @@ def intersect_datasets(adata_source, adata_target, target_label, control_label, 
         common_genes = None
     print(f"  Found {len(common_perts) - 1} common perturbations (plus control).")
 
+    print('Target perturbations not found in target:', sorted(list(target_perts - set(common_perts))))
+
     if common_genes is None:
         # Intersect perts only; keep original gene spaces
         adata_source_sub = adata_source[adata_source.obs[target_label].isin(common_perts), :].copy()

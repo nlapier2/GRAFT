@@ -812,6 +812,8 @@ def evaluate_model(
     print(f"Pseudobulk MAE (mean over perts):   {np.mean(list(bulk_mae_per_pert.values())):.5f}")
     print(f"Perturbation similarity (pred mean effects): mean corr={mean_corr:.4f}, min corr={min_corr:.4f}")
     print(f"PDS (mean over perts): {PDS_mean:.4f}")
+    print("\nPDS per perturbation:")
+    print(dict(zip(perts, PDS_scores)))
     print("\nKnockdown efficiency per perturbation (target gene, true_abs, true_pct, pred_abs, pred_pct):")
     # show a few lines sorted by true_abs descending
     preview = sorted(kd_eff.items(), key=lambda kv: (np.nan_to_num(kv[1]['true_abs'], nan=-1e9)), reverse=True)
