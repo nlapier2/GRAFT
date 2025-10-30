@@ -100,13 +100,33 @@ def aggregate_and_reformat(input_dir, mapping_file, template_file, output_file):
     print("Reformatting .obs columns...")
     if 'gene_target' in adata.obs.columns:
         adata.obs.rename(columns={'gene_target': 'target_gene'}, inplace=True)
-        
-        # Replace control label
-        adata.obs['target_gene'] = adata.obs['target_gene'].replace(
-            'Non-targeting', 'non-targeting'
-        )
         print("  Renamed 'gene_target' -> 'target_gene'")
-        print("  Relabeled 'Non-targeting' -> 'non-targeting'")
+        
+        # Check if replacement is needed
+        if 'Non-Targeting' in adata.obs['target_gene'].unique():
+            print("  Found 'Non-Targeting'. Attempting replacement...")
+            
+            # Robust replacement: check if dtype is categorical
+            is_categorical = pd.api.types.is_categorical_dtype(adata.obs['target_gene'])
+            
+            if is_categorical:
+                # Use pandas' built-in category renaming
+                adata.obs['target_gene'] = adata.obs['target_gene'].cat.rename_categories(
+                    {'Non-Targeting': 'non-targeting'}
+                )
+            else:
+                # Fallback to string replacement
+                adata.obs['target_gene'] = adata.obs['target_gene'].astype(str).replace(
+                    'Non-Targeting', 'non-targeting'
+                )
+            
+            # Check if successful
+            if 'non-targeting' in adata.obs['target_gene'].unique():
+                print("  Successfully relabeled 'Non-Targeting' -> 'non-targeting'")
+            else:
+                print("  Warning: Replacement may not have been successful.")
+        else:
+             print("  'Non-Targeting' not found in 'target_gene' column. Skipping relabel.")
     else:
         print("  Warning: 'gene_target' column not found. Skipping rename/relabel.")
 
@@ -123,34 +143,21 @@ def aggregate_and_reformat(input_dir, mapping_file, template_file, output_file):
     
     print(f"Aligning {current_genes.nunique()} genes to {template_genes.nunique()} template genes.")
 
-    # Create a new, empty DataFrame with template genes as columns
-    # and current obs as rows, filled with NaN
-    new_X_df = pd.DataFrame(
-        np.nan, 
-        index=adata.obs.index, 
-        columns=template_genes
-    )
-
     # Find genes present in both
     shared_genes = current_genes.intersection(template_genes)
-    print(f"  Found {len(shared_genes)} shared genes.")
     
-    # Fill in the data we have for the shared genes
-    # This correctly subsets and reorders our data to match the template
-    # This works because .X on a slice returns a numpy array
-    if not shared_genes.empty:
-        new_X_df[shared_genes] = adata[:, shared_genes].X
-
-    print(f"  {template_genes.difference(current_genes).nunique()} genes from template will be added with NaN.")
+    # Get the list of shared genes, but in the order of the template file
+    final_gene_list = template_genes[template_genes.isin(shared_genes)]
+    
+    print(f"  Found {len(final_gene_list)} shared genes. Subsetting and reordering to match template.")
     
     # Create the final AnnData object
-    # It will have the obs from our data, the var from the template,
-    # and the new .X matrix aligned to the template genes.
-    final_adata = ad.AnnData(
-        X=new_X_df.values, 
-        obs=adata.obs.copy(), 
-        var=template_adata.var.copy()
-    )
+    # 1. Subset and reorder our aggregated data to this final gene list
+    final_adata = adata[:, final_gene_list].copy()
+    
+    # 2. Assign the corresponding .var metadata from the template
+    #    This ensures .var is also aligned
+    final_adata.var = template_adata.var.loc[final_gene_list].copy()
 
     # --- 5. Write Output ---
     print(f"\nAlignment complete. Final shape: {final_adata.shape}")
