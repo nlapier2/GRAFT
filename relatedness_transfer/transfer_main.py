@@ -272,7 +272,7 @@ def krr_predict_from_external(
 
     # ctrl_mean returned in the bundle = TRAIN control mean (global baseline)
     O = pert_list(adata_train, target_label, control_label)  # observed perts
-    return pred_mat, true_mat, pert_names, np.asarray(ctrl_mean_target).ravel(), pred_delta_var, O
+    return pred_mat, true_mat, pert_names, np.asarray(ctrl_mean_target).ravel(), pred_delta_var, O, KUO
 
 def write_cell_level_predictions(
     adata_test_orig: ad.AnnData,
@@ -410,70 +410,6 @@ def write_cell_level_predictions(
           f"(controls={ctrl_mask.sum()}, synthesized={X_out.shape[0] - ctrl_mask.sum()}, genes={G})")
     ad_out.write_h5ad(out_path)
 
-def _compute_pseudobulk_effects_for_corr(
-    adata,
-    target_label: str,
-    control_label: str,
-    ctrl_mean_override: np.ndarray | None = None,
-    restrict_perts: list[str] | None = None,
-):
-    """
-    Compute per-perturbation pseudobulk deltas and pairwise corr.
-
-    If restrict_perts is provided, we only consider those perts (plus we will
-    ignore any that aren't found). Otherwise we consider all non-control perts.
-
-    Returns:
-        perts_list: list[str] length K, in sorted order
-        effect_mat: (K, G) float32, (pseudobulk - control_mean)
-        corr_mat:   (K, K) Pearson corr between rows of effect_mat
-        ctrl_mean:  (G,)   control mean actually used
-    """
-    G = adata.n_vars
-
-    # control mean (global or dataset-specific)
-    if ctrl_mean_override is not None:
-        ctrl_mean = np.asarray(ctrl_mean_override).reshape(-1)
-    else:
-        ctrl_mask = (adata.obs[target_label] == control_label).values
-        ctrl_mean = np.asarray(adata.X)[ctrl_mask].mean(axis=0).reshape(-1)
-
-    # which perts to include
-    if restrict_perts is None:
-        raw_perts = sorted(set(adata.obs[target_label].astype(str)) - {control_label})
-    else:
-        raw_perts = sorted([p for p in restrict_perts if p != control_label])
-
-    bulk_rows = []
-    kept_perts = []
-    X_np = np.asarray(adata.X)
-    for p in raw_perts:
-        mask_p = (adata.obs[target_label] == p).values
-        if not np.any(mask_p):
-            continue
-        v = X_np[mask_p].reshape(-1, G).mean(axis=0)
-        bulk_rows.append((v - ctrl_mean).astype(np.float32))
-        kept_perts.append(p)
-
-    if len(kept_perts) == 0:
-        # edge case: no perts
-        effect_mat = np.zeros((0, G), dtype=np.float32)
-        corr_mat = np.zeros((0, 0), dtype=np.float32)
-        return kept_perts, effect_mat, corr_mat, ctrl_mean
-
-    effect_mat = np.stack(bulk_rows, axis=0).astype(np.float32)  # (K,G)
-    K = effect_mat.shape[0]
-
-    if K > 1:
-        em = effect_mat - effect_mat.mean(axis=1, keepdims=True)
-        denom = np.sqrt((em ** 2).sum(axis=1, keepdims=True)) + 1e-8
-        emn = em / denom
-        corr_mat = emn @ emn.T  # (K,K)
-    else:
-        corr_mat = np.ones((K, K), dtype=np.float32)
-
-    return kept_perts, effect_mat, corr_mat, ctrl_mean
-
 def generate_diag_report(
     diag_path: str,
     ctrl_mean_global: np.ndarray,
@@ -483,6 +419,9 @@ def generate_diag_report(
     target_label: str,
     control_label: str,
     pds_scores: dict[str, float],
+    kernel_uo: np.ndarray | None = None,
+    donor_names_uo: list[str] | None = None,
+    kernel_row_names: list[str] | None = None,
 ):
     """
     Writes a human-readable plaintext report.
@@ -602,12 +541,34 @@ def generate_diag_report(
                 donor_corr = corr_target_vec[jdon]
                 top_tgt_lines.append(f"  {rank_j+1:2d}. {donor_name:20s} r={donor_corr:+.3f}")
 
-            # --- corr to EXTERNAL donors ---
-            # We correlate v_eval (TARGET delta) vs donor_effects_src (EXTERNAL deltas, already gene-aligned).
-            if len(donor_perts_src) > 0:
-                corr_src_vec = rowwise_corr_to_vec(donor_effects_src, v_eval)
+            # --- EXTERNAL neighbors from KERNEL if provided; else fallback to recompute corr ---
+            if (kernel_uo is not None) and (donor_names_uo is not None) and (kernel_row_names is not None):
+                # Map pert NAME -> row index in kernel_uo (rows are aligned to names_krr_ev)
+                name2row_uo = {q: i for i, q in enumerate(kernel_row_names)}
+                row_u = name2row_uo.get(p, None)
+                if row_u is not None:
+                    corr_src_vec = kernel_uo[row_u, :].astype(np.float32, copy=False)
+                    donor_perts_src = donor_names_uo
+                else:
+                    # OOV eval pert: include in report but no EXTERNAL neighbors
+                    corr_src_vec = np.zeros((0,), dtype=np.float32)
+                    donor_perts_src = []
             else:
-                corr_src_vec = np.zeros((0,), dtype=np.float32)
+                # fallback: compute from external deltas as before
+                if donor_effects_src.shape[0] > 0:
+                    corr_src_vec = rowwise_corr_to_vec(donor_effects_src, v_eval)
+                    donor_perts_src = donor_perts_src  # already defined above
+                else:
+                    corr_src_vec = np.zeros((0,), dtype=np.float32)
+                    donor_perts_src = []
+
+            order_src = np.argsort(-np.abs(corr_src_vec))
+            top_src_lines = [
+                f"  {rank+1:2d}. {donor_perts_src[j]:20s} r={corr_src_vec[j]:+.3f}"
+                for rank, j in enumerate(order_src[:10])
+            ] if len(corr_src_vec) else []
+
+            donor_idx_src = {p: i for i, p in enumerate(donor_perts_src)}
 
             order_src = np.argsort(-np.abs(corr_src_vec))
             top_src_lines = []
@@ -895,7 +856,7 @@ def main():
     print("\n=== Evaluation on {} set ===".format("TEST" if adata_test is not None else "TRAIN"))
     if args.method == "krr":
         # Run KRR ONLY on the intersected views; get predictions for intersected perts
-        pred_krr_ev, _true_krr_ev, names_krr_ev, _ctrl_ignored, pred_delta_var_ev, observed_perts_list_ev = krr_predict_from_external(
+        pred_krr_ev, _true_krr_ev, names_krr_ev, _ctrl_ignored, pred_delta_var_ev, observed_perts_list_ev, KUO = krr_predict_from_external(
             adata_source=adata_source,
             adata_train=adata_train_int,
             adata_eval=eval_adata_int,
@@ -1018,6 +979,9 @@ def main():
             target_label=args.target_label,
             control_label=args.control_label,
             pds_scores=eval_results["PDS_scores"],
+            kernel_uo=KUO,
+            donor_names_uo=list(observed_perts_list_ev),
+            kernel_row_names=list(names_krr_ev),
         )
 
     # ---------------------------
@@ -1026,7 +990,7 @@ def main():
     if args.eval_on_train and (adata_test is not None):
         print("\n=== Evaluation on TRAIN set ===")
         if args.method == "krr":
-            pred_krr_tr, _true_krr_tr, names_krr_tr, _ctrl_ignored, _pred_delta_var_tr, _ = krr_predict_from_external(
+            pred_krr_tr, _true_krr_tr, names_krr_tr, _ctrl_ignored, _pred_delta_var_tr, _, _ = krr_predict_from_external(
                 adata_source=adata_source,
                 adata_train=adata_train_int,
                 adata_eval=adata_train_int,
