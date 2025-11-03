@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+import warnings
+# Suppress annoying FutureWarning from scanpy
+warnings.filterwarnings('ignore', category=FutureWarning)
 import argparse, math, os
 import numpy as np
 import pandas as pd
@@ -16,6 +19,7 @@ from sklearn.isotonic import IsotonicRegression
 
 from utils import *
 from losses import *
+from transforms import *
 
 
 def parse_arguments():
@@ -30,6 +34,13 @@ def parse_arguments():
     ap.add_argument("--control_label", default="non-targeting", help="label value for control cells.")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--epochs", type=int, default=10)
+    ap.add_argument("--intersect_genes", action="store_true", default=False,
+                    help="If set, intersect genes across source and target. Otherwise, only intersect perts (default).")
+    ap.add_argument("--already_logged", action="store_true", 
+                    help="Set if inputs are already log1p-normalized; otherwise apply log1p to raw counts.")
+    ap.add_argument("--keep_oov_perts", action="store_true", 
+                    help="If set, keep perts that are not in the source∩target intersection (left as AverageKnown baseline). "
+                         "If unset, drop those rows before evaluation/output.")
 
     # Train/test split and eval options
     ap.add_argument("--test_pct_perts", type=float, default=0.0,
@@ -38,6 +49,8 @@ def parse_arguments():
                     help="Optional path to a separate test AnnData. If set, overrides --test_pct_perts.")
     ap.add_argument('--eval_on_train', action='store_true', help='Evaluate on training set in addition to test set')
     ap.add_argument('--write_test', action='store_true', help='Write true test set')
+    ap.add_argument("--test_predict_out", type=str, default="",
+                    help="Path to write cell-level predicted test AnnData (.h5ad).")
 
     # Method + KRR hyperparams
     ap.add_argument("--method", type=str, default="krr",
@@ -49,113 +62,45 @@ def parse_arguments():
                     help="How to build the perturbation kernel from the external dataset.")
     ap.add_argument("--iso_calibrate", action="store_true",
                         help="Apply isotonic calibration of external similarity to match target similarity on training perts.")
+    # Neighbor sharpening (perturbation-space)
+    ap.add_argument("--kernel_gamma", type=float, default=1.0,
+                    help="Power sharpening for K_UO rows; >1 sharpens (e.g., 1.4). 1.0 disables.")
+    ap.add_argument("--topk", type=int, default=0,
+                    help="Keep only top-k neighbors per row of K_UO; 0 disables.")
+    # Subspace boosting (gene-space)
+    ap.add_argument("--boost_pcs", type=int, default=0,
+                    help="Number of PCA components (from Y_O) to boost in predictions; 0 disables.")
+    ap.add_argument("--boost_gamma", type=float, default=0.6,
+                    help="Boost strength along PCA subspace (e.g., 0.3–1.0).")
+    # PDS sharpening (post-processing on predicted effects)
+    ap.add_argument("--pds_sharpen", type=str, default="none",
+                    choices=["none", "power", "topk", "sigmoid"],
+                    help="Post-process predicted effects to boost large signals and shrink small ones.")
+    ap.add_argument("--pds_gamma", type=float, default=1.5,
+                    help="Exponent for power mode (>|1| boosts large |Δ|, shrinks small).")
+    ap.add_argument("--pds_topk_frac", type=float, default=0.1,
+                    help="Fraction (0-1) of largest-|Δ| genes to inflate in topk mode.")
+    ap.add_argument("--pds_alpha", type=float, default=0.3,
+                    help="Inflation factor for topk mode (Δ_topk *= (1+alpha)).")
+    ap.add_argument("--pds_beta", type=float, default=0.2,
+                    help="Shrink factor for non-topk in topk mode (Δ_else *= (1-beta)).")
+    ap.add_argument("--pds_sigmoid_B", type=float, default=0.7,
+                    help="Slope B in Δ' = A*tanh(B*Δ). A is auto-scaled to preserve a high-percentile.")
+    ap.add_argument("--pds_preserve_quantile", type=float, default=0.95,
+                    help="Quantile of |Δ| whose magnitude is preserved by the transform.")
+
+    # Confidence-weighted amplification of predicted deltas (pre-PDS-sharpening)
+    ap.add_argument("--conf_boost_alpha", type=float, default=0.0,
+                    help="Amplify high-confidence (low-variance) genes. 0.0 = disabled.")
+    ap.add_argument("--conf_shrink_alpha", type=float, default=0.0,
+                    help="Optionally shrink low-confidence (high-variance) genes. 0.0 = no shrink.")
+    ap.add_argument("--conf_min_var", type=float, default=1e-6,
+                    help="Lower variance bound when converting var->confidence.")
+    ap.add_argument("--conf_max_var", type=float, default=1.0,
+                    help="Upper variance bound when converting var->confidence.")
 
     args = ap.parse_args()
     return args
-
-def intersect_datasets(adata_source, adata_target, target_label, control_label):
-    """
-    Subsets two AnnData objects to their common genes and perturbations.
-
-    Args:
-        adata_source: The source (external) AnnData object.
-        adata_target: The target AnnData object.
-        target_label: The obs column containing perturbation labels.
-        control_label: The label for control samples.
-
-    Returns:
-        A tuple of (subsetted source AnnData, subsetted target AnnData).
-    """
-    print("Finding intersection of genes and perturbations...")
-    # First, get a list of valid genes from the source (not all NaN), then intersect.
-    common_genes = np.intersect1d(
-        adata_source.var_names[~np.isnan(to_numpy(adata_source.X)).all(axis=0)],
-        adata_target.var_names
-    )
-
-    source_perts = set(adata_source.obs[target_label].unique())
-    target_perts = set(adata_target.obs[target_label].unique())
-    common_perts = sorted(list(source_perts.intersection(target_perts)))
-
-    # Ensure the control label is always kept, even if it's not in the intersection
-    if control_label not in common_perts:
-        if control_label in source_perts and control_label in target_perts:
-            common_perts.append(control_label)
-    
-    print(f"  Found {len(common_genes)} common genes.")
-    print(f"  Found {len(common_perts) - 1} common perturbations (plus control).")
-
-    adata_source_sub = adata_source[adata_source.obs[target_label].isin(common_perts), common_genes].copy()
-    adata_target_sub = adata_target[adata_target.obs[target_label].isin(common_perts), common_genes].copy()
-
-    return adata_source_sub, adata_target_sub
-
-def compute_deltas(adata, target_label, control_label):
-    """
-    Computes the delta (perturbation - control) vectors for a pseudobulked dataset.
-
-    Args:
-        adata: A pseudobulked AnnData object.
-        target_label: The obs column containing perturbation labels.
-        control_label: The label for control samples.
-
-    Returns:
-        A dictionary mapping perturbation labels to their delta vectors.
-    """
-    control_mask = adata.obs[target_label] == control_label
-    control_mean = adata[control_mask].X.mean(axis=0)
-
-    pert_adata = adata[~control_mask]
-    
-    deltas = {
-        pert: pert_adata[pert_adata.obs[target_label] == pert].X.flatten() - control_mean
-        for pert in pert_adata.obs[target_label].unique()
-    }
-    return deltas, control_mean
-
-def _row_standardize(M: np.ndarray) -> np.ndarray:
-    """Zero-mean, unit-norm per row (safe for sparse/np arrays)."""
-    M = np.asarray(M, dtype=np.float32)
-    M = M - M.mean(axis=1, keepdims=True)
-    denom = np.linalg.norm(M, axis=1, keepdims=True) + 1e-8
-    return M / denom
-
-def _fit_isotonic_on_pairs(S_ext_OO: np.ndarray, Y_O: np.ndarray) -> "IsotonicRegression|None":
-    """
-    Fit isotonic regression mapping external similarity -> target similarity,
-    using only training perts (O). Returns a fitted IsotonicRegression or None.
-    """
-    # target similarity among O (using correlation-style similarity of DELTAS)
-    Zt = _row_standardize(Y_O)  # (|O|, G)
-    S_tgt_OO = Zt @ Zt.T
-    # take off-diagonal upper triangle pairs
-    iu, ju = np.triu_indices(S_ext_OO.shape[0], k=1)
-    x = S_ext_OO[iu, ju].astype(np.float64)
-    y = S_tgt_OO[iu, ju].astype(np.float64)
-    # Guard against degenerate cases
-    if np.allclose(x, x[0]) or np.allclose(y, y[0]):
-        print("[iso] Degenerate pairwise similarities; skipping isotonic calibration.")
-        return None
-    iso = IsotonicRegression(y_min=-1.0, y_max=1.0, increasing=True, out_of_bounds="clip")
-    iso.fit(x, y)
-    return iso
-
-def _apply_isotonic_matrix(iso: "IsotonicRegression|None", S: np.ndarray) -> np.ndarray:
-    """Apply fitted isotonic regressor elementwise to a similarity matrix; symmetrize and fix diag."""
-    if iso is None:
-        return S
-    S_flat = S.ravel()
-    S_cal = iso.predict(S_flat).reshape(S.shape)
-    S_cal = 0.5 * (S_cal + S_cal.T)
-    np.fill_diagonal(S_cal, 1.0)
-    return S_cal
-
-def _pert_list(adata: ad.AnnData, target_label: str, control_label: str) -> list[str]:
-    perts_all = list(map(str, adata.obs[target_label].values))
-    # If pseudobulked, each row is a single pert; otherwise fallback to unique order.
-    # In either case, we evaluate on NON-control perts only.
-    uniq = list(dict.fromkeys(perts_all))  # stable unique
-    return [p for p in uniq if p != control_label]
 
 def krr_predict_from_external(
     adata_source: ad.AnnData,
@@ -167,12 +112,23 @@ def krr_predict_from_external(
     kernel_metric: str = "corr",
     ctrl_mean_target: np.ndarray | None = None,
     iso_calibrate: bool = False,
-) -> tuple[np.ndarray, np.ndarray, list[str], np.ndarray]:
+    kernel_gamma: float = 1.0,
+    topk: int = 0,
+    boost_pcs: int = 0,
+    boost_gamma: float = 0.6,
+    # NEW: confidence boost args
+    conf_boost_alpha: float = 0.0,
+    conf_shrink_alpha: float = 0.0,
+    conf_min_var: float = 1e-6,
+    conf_max_var: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray, list[str], np.ndarray, np.ndarray]:
     """
-    KRR over perturbation index with kernel built from EXTERNAL deltas (train+eval perts).
-    Returns the bundle expected by your evaluator: (pred_mat, true_mat, pert_names, ctrl_mean),
-    where **pred_mat and true_mat are EXPRESSION LEVELS**, not deltas.
-    ctrl_mean is the TRAIN-split control mean, matching your evaluation protocol.
+    Returns:
+      pred_mat        (|U| x G) predicted EXPRESSION for eval perts U
+      true_mat        (|U| x G) true EXPRESSION rows for eval perts U
+      pert_names      list[str] length |U|
+      ctrl_mean       (G,)
+      pred_delta_var  (|U| x G) predictive VARIANCE on the DELTA space (before ctrl_mean added)
     """
     G = adata_train.n_vars
     # ---- use TRAIN control mean (for adding back to deltas & evaluator's baseline) ----
@@ -181,8 +137,8 @@ def krr_predict_from_external(
         ctrl_mean_target = np.asarray(adata_train.X)[train_mask].mean(axis=0).reshape(-1)
 
     # ---- define sets ----
-    O = _pert_list(adata_train, target_label, control_label)  # observed perts
-    U = _pert_list(adata_eval,  target_label, control_label)  # to predict/evaluate
+    O = pert_list(adata_train, target_label, control_label)  # observed perts
+    U = pert_list(adata_eval,  target_label, control_label)  # to predict/evaluate
     perts_all = O + [p for p in U if p not in O]
     G = adata_train.n_vars
 
@@ -203,12 +159,11 @@ def krr_predict_from_external(
 
     Y_O = _delta_mat(adata_train, O)   # (|O|, G)
 
-
     # ---- external deltas & similarity over ALL perts (O∪U) ----
     del_src, _ = compute_deltas(adata_source, target_label, control_label)  # pert -> delta row
     Delta_src = np.stack([np.asarray(del_src[p]).ravel() for p in perts_all], axis=0)  # (P,G)
     if kernel_metric == "corr":
-        Z = _row_standardize(Delta_src)
+        Z = row_standardize(Delta_src)
         S_ext = Z @ Z.T
     else:  # "cosine"
         Z = Delta_src / (np.linalg.norm(Delta_src, axis=1, keepdims=True) + 1e-8)
@@ -219,8 +174,8 @@ def krr_predict_from_external(
     # ---- isotonic calibration on training pairs (O×O) ----
     if iso_calibrate:
         print("[iso] Fitting isotonic calibration on training perts...")
-        iso = _fit_isotonic_on_pairs(S_ext[np.ix_(iO, iO)], Y_O)
-        S_cal = _apply_isotonic_matrix(iso, S_ext)
+        iso = fit_isotonic_on_pairs(S_ext[np.ix_(iO, iO)], Y_O)
+        S_cal = apply_isotonic_matrix(iso, S_ext)
     else:
         S_cal = S_ext
 
@@ -233,12 +188,71 @@ def krr_predict_from_external(
     KUO = K[np.ix_(iU, iO)]
 
     # ---- KRR: \hat Y_U = K_{UO} (K_{OO} + λI)^{-1} Y_O ----
-    A = np.linalg.solve(KOO + krr_lambda * np.eye(KOO.shape[0], dtype=KOO.dtype),
-                        Y_O)  # (|O|, G)
-    Y_U_hat_delta = KUO @ A  # (|U|, G) deltas
+    A = np.linalg.solve(KOO + krr_lambda * np.eye(KOO.shape[0], dtype=KOO.dtype), Y_O)  # (|O|, G)
+    # sharpen neighbor mixing at prediction time
+    KUO_sharp = sharpen_neighbors(KUO, tau=kernel_gamma, topk=topk)
+    Y_U_hat_delta = KUO_sharp @ A  # (|U|, G)
+
+    # --- Estimate per-gene residual variance on training perts (noise model)
+    Y_O_hat = KOO @ A                           # (|O|, G), fitted deltas for O
+    resid = Y_O - Y_O_hat                       # (|O|, G)
+    sigma2_gene = (resid ** 2).mean(axis=0)     # (G,)
+
+    # --- GP-style scalar uncertainty per eval pert based on kernel geometry
+    # s2_raw[u] = k_uu - k_uO @ (KOO+λI)^(-1) @ k_Ou
+    KOO_reg_inv = np.linalg.inv(KOO + krr_lambda * np.eye(KOO.shape[0], dtype=KOO.dtype))
+    # precompute for speed: M = KOO_reg_inv @ K_Ou for each u
+    # We'll just loop since |U| is usually not huge
+    s2_raw_list = []
+    for row_u in range(KUO.shape[0]):
+        k_uO = KUO[row_u, :].reshape(1, -1)     # (1, |O|)
+        k_Ou = k_uO.T                           # (|O|, 1)
+        k_uu = float(K[iU[row_u], iU[row_u]])   # scalar
+        middle = KOO_reg_inv @ k_Ou             # (|O|,1)
+        s2_raw = k_uu - (k_uO @ middle).item()    # scalar
+        if s2_raw < 0:
+            # small negative due to numerics; clip
+            s2_raw = 0.0
+        s2_raw_list.append(s2_raw)
+    s2_raw_arr = np.asarray(s2_raw_list, dtype=np.float32)  # (|U|,)
+
+    # Broadcast to per-gene predictive variance
+    pred_delta_var = s2_raw_arr[:, None] * sigma2_gene[None, :]  # (|U|, G)
+
+    # subspace boosting along perturbation-contrast directions from Y_O
+    if boost_pcs and boost_pcs > 0 and boost_gamma > 0:
+        Y_U_hat_delta = subspace_boost(Y_U_hat_delta, Y_O, k=boost_pcs, gamma=boost_gamma)
+
+    # --- Confidence-weighted amplification of deltas BEFORE adding ctrl_mean ---
+    Y_U_hat_delta = apply_confidence_boost(
+        pred_delta_mat = Y_U_hat_delta,
+        pred_delta_var = pred_delta_var,
+        conf_boost_alpha = conf_boost_alpha,
+        conf_shrink_alpha = conf_shrink_alpha,
+        conf_min_var = conf_min_var,
+        conf_max_var = conf_max_var,
+    )
 
     # ---- Convert to EXPRESSION levels expected by evaluator ----
     pred_mat = Y_U_hat_delta + ctrl_mean_target[None, :]   # (|U|, G)
+
+    # --- Target gene overwrite using avg KD efficiency from TRAIN perts ---
+    var_to_idx = {g: i for i, g in enumerate(adata_train.var_names.astype(str))}
+    global_eff, per_gene_eff = compute_avg_kd_efficiencies(
+        adata_train=adata_train, O=O, target_label=target_label,
+        control_label=control_label, ctrl_mean_target=ctrl_mean_target
+    )
+    for row, pert in enumerate(U):
+        g = str(pert)
+        gi = var_to_idx.get(g, None)
+        if gi is None:
+            continue
+        eff = per_gene_eff.get(g, global_eff)  # [0,1]
+        # predicted target-gene expression = ctrl_mean * (1 - eff)
+        pred_mat[row, gi] = ctrl_mean_target[gi] * (1.0 - eff)
+
+    # --- Non-negativity clamp: no expression should be < 0 ---
+    np.maximum(pred_mat, 0.0, out=pred_mat)
 
     # ---- True expression rows and pert_names from EVAL split (like your example) ----
     test_pert_mask = adata_eval.obs[target_label].isin(U)
@@ -246,7 +260,114 @@ def krr_predict_from_external(
     pert_names = adata_eval.obs.loc[test_pert_mask, target_label].astype(str).tolist()
 
     # ctrl_mean returned in the bundle = TRAIN control mean (global baseline)
-    return pred_mat, true_mat, pert_names, np.asarray(ctrl_mean_target).ravel()
+    return pred_mat, true_mat, pert_names, np.asarray(ctrl_mean_target).ravel(), pred_delta_var
+
+def write_cell_level_predictions(
+    adata_test_orig: ad.AnnData,
+    eval_gene_names,
+    pred_mat_eval: np.ndarray,
+    names_eval: list[str],
+    ctrl_mean_eval: np.ndarray,
+    target_label: str,
+    control_label: str,
+    out_path: str,
+    random_state: int | None = None,
+):
+    """
+    Build a cell-level predicted AnnData for the TEST set by:
+      - Copying control cells from adata_test_orig unchanged.
+      - For each perturbation p in adata_test_orig (excluding control), sampling N_p control cells
+        and subtracting the learned delta vector delta_p = ctrl_mean - pred_expr[p].
+      - Clamping to >= 0 and writing to out_path.
+    The resulting AnnData has (controls + synthesized perts) and matches per-pert cell counts in adata_test_orig.
+    """
+    if out_path is None or out_path == "":
+        return
+    rng = np.random.default_rng(random_state)
+
+    # --- Align gene space: use the evaluation gene order (columns of pred_mat_eval) ---
+    eval_genes = np.array(eval_gene_names, dtype=str)
+    test_genes = np.array(adata_test_orig.var_names, dtype=str)
+    # map eval_genes into adata_test_orig
+    take_idx = pd.Index(test_genes).get_indexer(eval_genes)
+    if np.any(take_idx < 0):
+        # intersect
+        common = np.intersect1d(eval_genes, test_genes)
+        if common.size == 0:
+            raise ValueError("No overlapping genes between eval gene space and adata_test_orig.")
+        print(f"[cells] Restricting to {common.size} common genes for cell-level synthesis.")
+        # remap everything to 'common'
+        # positions in eval
+        pos_eval = pd.Index(eval_genes).get_indexer(common)
+        # positions in test
+        pos_test = pd.Index(test_genes).get_indexer(common)
+        eval_genes = common
+        pred_mat_eval = pred_mat_eval[:, pos_eval]
+        ctrl_mean_eval = ctrl_mean_eval[pos_eval]
+        take_idx = pos_test  # now all >= 0 by construction
+    else:
+        # same order as eval
+        pass
+
+    # Pull the control pool from adata_test_orig (in eval gene order)
+    ctrl_mask = (adata_test_orig.obs[target_label].astype(str) == control_label).values
+    if not ctrl_mask.any():
+        raise ValueError("No control cells found in adata_test_orig; cannot synthesize perts from control pool.")
+    X_ctrl = to_numpy(adata_test_orig.X)[:, take_idx]
+    X_ctrl = X_ctrl[ctrl_mask]  # (n_ctrl, G_eval)
+    n_ctrl, G = X_ctrl.shape
+
+    # Compute per-pert delta vectors from predicted pseudobulk expression (eval space)
+    # delta_p = ctrl_mean - pred_expr[p], so x_pert ≈ x_ctrl - delta_p
+    name_to_row = {p: i for i, p in enumerate(names_eval)}
+
+    # Prepare outputs
+    obs_rows = []
+    X_rows = []
+    var_df = adata_test_orig.var.loc[test_genes[take_idx]].copy()
+    var_df.index = eval_genes  # ensure matching names/order
+
+    # 1) copy original control cells (unaltered) into output
+    ctrl_obs = adata_test_orig.obs.loc[ctrl_mask].copy()
+    X_rows.append(X_ctrl)  # unchanged
+    obs_rows.append(ctrl_obs)
+
+    # 2) for each perturbation present in adata_test_orig, synthesize cells
+    perts_in_test = adata_test_orig.obs[target_label].astype(str).unique().tolist()
+    perts_in_test = [p for p in perts_in_test if p != control_label]
+    for p in perts_in_test:
+        n_p = int((adata_test_orig.obs[target_label].astype(str) == p).sum())
+        if n_p == 0:
+            continue
+        row = name_to_row.get(p, None)
+        if row is None:
+            # No predicted vector for this pert; skip (or you could choose to leave original cells)
+            print(f"[cells] WARNING: no prediction for pert '{p}' in pred_mat_eval; skipping synthesis for this pert.")
+            continue
+        pred_expr = pred_mat_eval[row]          # (G,)
+        delta_p = ctrl_mean_eval - pred_expr    # (G,)
+        # sample control indices (with replacement if needed)
+        replace = n_p > n_ctrl
+        idx = rng.choice(n_ctrl, size=n_p, replace=replace)
+        X_base = X_ctrl[idx]                    # (n_p, G)
+        X_syn = X_base - delta_p[None, :]       # subtract learned delta
+        np.maximum(X_syn, 0.0, out=X_syn)       # clamp
+        # clone obs rows from sampled controls but set pert label to p
+        obs_p = ctrl_obs.iloc[idx].copy()
+        obs_p[target_label] = p
+        X_rows.append(X_syn)
+        obs_rows.append(obs_p)
+
+    # Concatenate
+    X_out = np.vstack(X_rows) if len(X_rows) else np.zeros((0, G), dtype=float)
+    obs_out = pd.concat(obs_rows, axis=0) if len(obs_rows) else adata_test_orig.obs.iloc[:0].copy()
+    obs_out = obs_out.loc[:, ~obs_out.columns.duplicated(keep="first")]
+    # Build AnnData and write
+    ad_out = ad.AnnData(X_out, obs=obs_out, var=var_df.copy())
+    ad_out.layers = {}  # keep minimal; add if you want raw etc.
+    print(f"[cells] Writing synthesized test predictions: {out_path} "
+          f"(controls={ctrl_mask.sum()}, synthesized={X_out.shape[0] - ctrl_mask.sum()}, genes={G})")
+    ad_out.write_h5ad(out_path)
 
 def evaluate_model(
     adata: ad.AnnData,
@@ -342,8 +463,8 @@ def evaluate_model(
     # - exclude only the TRUE target gene for expression data, by name
     # - zero-based rank normalized by N (not N-1): PDS_p = 1 - rank/N
     # absolute deltas vs global control mean
-    true_bulk_mat = np.stack([np.abs(true_bulk[p] - ctrl_mean) for p in perts], axis=0)  # (K,G)
-    pred_bulk_mat = np.stack([np.abs(pred_bulk[p] - ctrl_mean) for p in perts], axis=0)  # (K,G)
+    true_bulk_mat = np.stack([true_bulk[p] - ctrl_mean for p in perts], axis=0)  # (K,G)
+    pred_bulk_mat = np.stack([pred_bulk[p] - ctrl_mean for p in perts], axis=0)  # (K,G)
     t_idx_per_pert = {p: t2gi.get(p, -1) for p in perts}
 
     # precompute masks per pair to exclude targets
@@ -401,83 +522,199 @@ def main():
     args.use_pseudobulk = True
 
     # ---------------------------
-    # 1. Read and Prepare Data
+    # Read and Prepare Data
     # ---------------------------
     print("Reading and preparing data...")
     adata_target = ad.read_h5ad(args.in_h5ad)
     adata_source = ad.read_h5ad(args.external_h5ad)
+    adata_source = adata_source[:, ~np.isnan(to_numpy(adata_source.X)).all(axis=0)].copy()  # filter all-NaN genes
+    if not args.already_logged:
+        sc.pp.normalize_total(adata_target, inplace=True)
+        sc.pp.log1p(adata_target)
+        sc.pp.normalize_total(adata_source, inplace=True)
+        sc.pp.log1p(adata_source)
 
-    # Subset both datasets to their intersection of genes and perturbations
-    adata_source, adata_target = intersect_datasets(
-        adata_source, adata_target, args.target_label, args.control_label
-    )
+    # Compute a SINGLE global control mean from ALL target controls (fixed across splits)
+    ctrl_mask_full = (adata_target.obs[args.target_label] == args.control_label).values
+    ctrl_mean_global = np.asarray(adata_target.X)[ctrl_mask_full].mean(axis=0).reshape(-1)
 
-    # Process and pseudobulk both datasets
-    for adata in [adata_source, adata_target]:
-        # Normalize and log1p. We assume source is already pseudobulked.
-        sc.pp.normalize_total(adata, inplace=True)
-        sc.pp.log1p(adata)
-    
-    # Pseudobulk the target data if it's not already
-    if adata_target.n_obs > len(adata_target.obs[args.target_label].unique()):
-        print("Collapsing target data to pseudobulk...")
-        adata_target = collapse_to_pseudobulk(adata_target, args.target_label)
-
-    # Split the TARGET data into train/test sets
-    adata_train, adata_test = train_test_split(args, adata_target)
+    # Split TARGET into train/test (controls appear in both; controls themselves are never modified)
+    adata_train, adata_test, adata_test_orig = train_test_split(args, adata_target)
+    if args.test_h5ad != "":  # if external test set provided, merge into overall target dataset
+        tmp = adata_test[adata_test.obs[args.target_label] != args.control_label].copy()
+        adata_target = ad.concat([adata_train, tmp])
     eval_adata = adata_test if adata_test is not None else adata_train
 
-    # ---------------------------
-    # 3. Evaluate on the Test Set
-    # ---------------------------
-    print("\n=== Evaluation on {} set ===".format("TEST" if adata_test is not None else "TRAIN"))
-    if args.method == "krr":
-        eval_pred_bundle = krr_predict_from_external(
-            adata_source=adata_source,
-            adata_train=adata_train,
-            adata_eval=eval_adata,
-            target_label=args.target_label,
-            control_label=args.control_label,
-            krr_lambda=args.krr_lambda,
-            kernel_metric=args.kernel_metric,
-            ctrl_mean_target=None,
-            iso_calibrate=args.iso_calibrate,
-        )
-    else:
-        raise ValueError(f"Unknown method: {args.method}")
-    evaluate_model(adata=eval_adata, args=args, pred_bundle=eval_pred_bundle)
+    # Build AverageKnown baselines and truths BEFORE any intersection
+    (pred_tr, true_tr, names_tr), (pred_ev, true_ev, names_ev) = build_average_known_baseline(
+        adata_train, eval_adata, args.target_label, args.control_label, ctrl_mean_global
+    )
+
+    # Now intersect datasets (perts always; genes optional). This will also strip all-NaN external genes if needed.
+    adata_source, adata_target_int = intersect_datasets(
+        adata_source, adata_target, args.target_label, args.control_label, intersect_genes=args.intersect_genes
+    )
+    # Keep split views in intersected target
+    adata_train_int = adata_target_int[adata_target_int.obs.index.isin(adata_train.obs.index)].copy()
+    eval_adata_int  = adata_target_int[adata_target_int.obs.index.isin(eval_adata.obs.index)].copy()
+
+    # If genes were intersected, align baseline tensors and ctrl_mean to the intersected gene order
+    if args.intersect_genes:
+        gene_order = adata_target_int.var_names
+        idx_in_full = pd.Index(adata_target.var_names).get_indexer(gene_order)
+        # Slice baselines and truths to intersected genes
+        if pred_tr.shape[0] > 0:
+            pred_tr  = pred_tr[:, idx_in_full]
+            true_tr  = true_tr[:, idx_in_full]
+        if pred_ev.shape[0] > 0:
+            pred_ev  = pred_ev[:, idx_in_full]
+            true_ev  = true_ev[:, idx_in_full]
+        # Slice the global control mean as well
+        ctrl_mean_global = ctrl_mean_global[idx_in_full]
 
     # ---------------------------
-    # 4. (Optional) Evaluate on the Train Set
+    # Evaluate on the Test Set
+    # ---------------------------
+    print("\n=== Evaluation on {} set ===".format("TEST" if adata_test is not None else "TRAIN"))
+    if args.method != "krr":
+        raise ValueError(f"Unknown method: {args.method}")
+    # Run KRR ONLY on the intersected views; get predictions for intersected perts
+    pred_krr_ev, _true_krr_ev, names_krr_ev, _ctrl_ignored, pred_delta_var_ev = krr_predict_from_external(
+        adata_source=adata_source,
+        adata_train=adata_train_int,
+        adata_eval=eval_adata_int,
+        target_label=args.target_label,
+        control_label=args.control_label,
+        krr_lambda=args.krr_lambda,
+        kernel_metric=args.kernel_metric,
+        ctrl_mean_target=ctrl_mean_global,  # fixed control mean
+        iso_calibrate=args.iso_calibrate,
+        kernel_gamma=args.kernel_gamma,
+        topk=args.topk,
+        boost_pcs=args.boost_pcs,
+        boost_gamma=args.boost_gamma,
+        conf_boost_alpha=args.conf_boost_alpha,
+        conf_shrink_alpha=args.conf_shrink_alpha,
+        conf_min_var=args.conf_min_var,
+        conf_max_var=args.conf_max_var,
+    )
+    # Overwrite rows (by pert name) into the AverageKnown baseline (eval split)
+    name2row_ev = {p: i for i, p in enumerate(names_ev)}
+    for j, p in enumerate(names_krr_ev):
+        if p in name2row_ev:
+            pred_ev[name2row_ev[p], :] = pred_krr_ev[j, :]
+    # Optionally DROP OOV perts (not present in intersection)
+    if not args.keep_oov_perts:
+        keep = np.array([p in set(names_krr_ev) for p in names_ev])
+        pred_ev, true_ev = pred_ev[keep], true_ev[keep]
+        names_ev = [p for (p, k) in zip(names_ev, keep) if k]
+    # Use the AnnData with matching gene space for target overwrite indexing
+    ad_train_for_eff = adata_train_int if args.intersect_genes else adata_train
+
+    # Optional PDS sharpening in effect space (pred → Δ → sharpen → pred)
+    if args.pds_sharpen != "none" and pred_ev.shape[0] > 0:
+        pred_ev = sharpen_effects(
+            pred_mat=pred_ev, ctrl_mean=ctrl_mean_global, mode=args.pds_sharpen,
+            gamma=args.pds_gamma, topk_frac=args.pds_topk_frac,
+            alpha=args.pds_alpha, beta=args.pds_beta,
+            sigmoid_B=args.pds_sigmoid_B, preserve_q=args.pds_preserve_quantile
+        )
+
+    # Post-processing on the FULL eval predictions (target overwrite + clamp)
+    apply_target_overwrite_and_clamp(
+        pred_mat=pred_ev, pert_names=names_ev,
+        adata_train=ad_train_for_eff,  # efficiencies from TRAIN perts
+        target_label=args.target_label, control_label=args.control_label,
+        ctrl_mean_global=ctrl_mean_global
+    )
+    # Evaluate using our assembled bundle (fixed control mean)
+    eval_adata_for_eval = eval_adata_int if args.intersect_genes else eval_adata
+    evaluate_model(adata=eval_adata_for_eval, args=args, pred_bundle=(pred_ev, true_ev, names_ev, ctrl_mean_global))
+
+    # ---------------------------
+    # (Optional) Evaluate on the Train Set
     # ---------------------------
     if args.eval_on_train and (adata_test is not None):
         print("\n=== Evaluation on TRAIN set ===")
-        train_pred_bundle = krr_predict_from_external(
+        pred_krr_tr, _true_krr_tr, names_krr_tr, _ctrl_ignored, _pred_delta_var_tr = krr_predict_from_external(
             adata_source=adata_source,
-            adata_train=adata_train,
-            adata_eval=adata_train,
+            adata_train=adata_train_int,
+            adata_eval=adata_train_int,
             target_label=args.target_label,
             control_label=args.control_label,
             krr_lambda=args.krr_lambda,
             kernel_metric=args.kernel_metric,
-            ctrl_mean_target=None,
+            ctrl_mean_target=ctrl_mean_global,
             iso_calibrate=args.iso_calibrate,
+            kernel_gamma=args.kernel_gamma,
+            topk=args.topk,
+            boost_pcs=args.boost_pcs,
+            boost_gamma=args.boost_gamma,
+            conf_boost_alpha=args.conf_boost_alpha,
+            conf_shrink_alpha=args.conf_shrink_alpha,
+            conf_min_var=args.conf_min_var,
+            conf_max_var=args.conf_max_var,
         )
-        evaluate_model(adata=adata_train, args=args, pred_bundle=train_pred_bundle)
+        # Overwrite into train baseline
+        name2row_tr = {p: i for i, p in enumerate(names_tr)}
+        for j, p in enumerate(names_krr_tr):
+            if p in name2row_tr:
+                pred_tr[name2row_tr[p], :] = pred_krr_tr[j, :]
+        if not args.keep_oov_perts:
+            keep = np.array([p in set(names_krr_tr) for p in names_tr])
+            pred_tr, true_tr = pred_tr[keep], true_tr[keep]
+            names_tr = [p for (p, k) in zip(names_tr, keep) if k]
+        # Use the AnnData with matching gene space for target overwrite indexing
+        ad_train_for_eff = adata_train_int if args.intersect_genes else adata_train
+
+        # Optional sharpening for train split too (so metrics are consistent if you eval on train)
+        if args.pds_sharpen != "none" and pred_tr.shape[0] > 0:
+            pred_tr = sharpen_effects(
+                pred_mat=pred_tr, ctrl_mean=ctrl_mean_global, mode=args.pds_sharpen,
+                gamma=args.pds_gamma, topk_frac=args.pds_topk_frac,
+                alpha=args.pds_alpha, beta=args.pds_beta,
+                sigmoid_B=args.pds_sigmoid_B, preserve_q=args.pds_preserve_quantile
+            )
+
+        apply_target_overwrite_and_clamp(
+            pred_mat=pred_tr, pert_names=names_tr,
+            adata_train=ad_train_for_eff, target_label=args.target_label,
+            control_label=args.control_label, ctrl_mean_global=ctrl_mean_global
+        )
+        train_adata_for_eval = adata_train_int if args.intersect_genes else adata_train
+        evaluate_model(adata=train_adata_for_eval, args=args, pred_bundle=(pred_tr, true_tr, names_tr, ctrl_mean_global))
 
     # ---------------------------
-    # 5. (Optional) Write Output Files
+    # (Optional) Write Output Files
     # ---------------------------
     if args.out_pred_h5ad:
         print(f"\nWriting prediction outputs to {args.out_pred_h5ad}...")
         write_pred_true_h5ads(
-            eval_adata=eval_adata,
-            pred_bundle=eval_pred_bundle,
+            eval_adata=(eval_adata_int if args.intersect_genes else eval_adata),
+            pred_bundle=(pred_ev, true_ev, names_ev, ctrl_mean_global),
             out_pred_h5ad=args.out_pred_h5ad,
             target_label=args.target_label,
             control_label=args.control_label,
         )
-    
+
+    # single cell predictions and output
+    if (args.test_predict_out is not None and args.test_predict_out != "") and (adata_test_orig is not None):
+        # Use the same evaluation gene space that pred_ev uses
+        eval_adata_for_eval = eval_adata_int if args.intersect_genes else eval_adata
+        eval_gene_names = eval_adata_for_eval.var_names
+
+        write_cell_level_predictions(
+            adata_test_orig=adata_test_orig,
+            eval_gene_names=eval_gene_names,
+            pred_mat_eval=pred_ev,
+            names_eval=names_ev,
+            ctrl_mean_eval=ctrl_mean_global,
+            target_label=args.target_label,
+            control_label=args.control_label,
+            out_path=args.test_predict_out,
+            random_state=getattr(args, "seed", None),
+        )
+
     print("\n✨ Done!")
 
 if __name__ == "__main__":
