@@ -27,6 +27,8 @@ def parse_arguments():
     # Basic and I/O options
     ap.add_argument("--in_h5ad", required=True, help="Small input AnnData object.")
     ap.add_argument("--external_h5ad", required=True, help="Path to the external pseudobulked AnnData object.")
+    ap.add_argument("--external_list", type=str, default="",
+                    help="Optional text file with one external .h5ad path per line. If set, overrides --external_h5ad.")
     ap.add_argument("--out_pred_h5ad", type=str, default="",
                     help="If set, write an AnnData with predictions for the evaluation split.")
     ap.add_argument("--seed", type=int, default=0)
@@ -527,12 +529,46 @@ def main():
     print("Reading and preparing data...")
     adata_target = ad.read_h5ad(args.in_h5ad)
     adata_source = ad.read_h5ad(args.external_h5ad)
-    adata_source = adata_source[:, ~np.isnan(to_numpy(adata_source.X)).all(axis=0)].copy()  # filter all-NaN genes
+
+    # Normalize/log target if requested
     if not args.already_logged:
         sc.pp.normalize_total(adata_target, inplace=True)
         sc.pp.log1p(adata_target)
-        sc.pp.normalize_total(adata_source, inplace=True)
-        sc.pp.log1p(adata_source)
+
+    # Load externals:
+    # If --external_list is provided and non-empty, it *overrides* --external_h5ad.
+    external_paths = []
+    if args.external_list:
+        with open(args.external_list, "r") as f:
+            external_paths = [ln.strip() for ln in f if ln.strip()]
+
+    using_external_list = len(external_paths) > 0
+    if using_external_list:
+        print(f"Found {len(external_paths)} external dataset(s) from list. Reading & intersecting perts (target unchanged)...")
+        adata_sources_list = [
+            read_and_intersect(
+                ext_path=p,
+                adata_target=adata_target,
+                target_label=args.target_label,
+                control_label=args.control_label,
+                already_logged=args.already_logged,
+            )
+            for p in external_paths
+        ]
+        # For now (until kernel aggregation is wired), use the first as the active external
+        # so the rest of the pipeline remains unchanged.
+        if len(adata_sources_list) == 0:
+            raise ValueError("`--external_list` was provided but no valid paths were found.")
+        adata_source = adata_sources_list[0]
+    else:
+        # Legacy single-external path, but route through read_and_intersect for consistency.
+        adata_source = read_and_intersect(
+            ext_path=args.external_h5ad,
+            adata_target=adata_target,
+            target_label=args.target_label,
+            control_label=args.control_label,
+            already_logged=args.already_logged,
+        )
 
     # Compute a SINGLE global control mean from ALL target controls (fixed across splits)
     ctrl_mask_full = (adata_target.obs[args.target_label] == args.control_label).values
@@ -550,10 +586,17 @@ def main():
         adata_train, eval_adata, args.target_label, args.control_label, ctrl_mean_global
     )
 
-    # Now intersect datasets (perts always; genes optional). This will also strip all-NaN external genes if needed.
-    adata_source, adata_target_int = intersect_datasets(
-        adata_source, adata_target, args.target_label, args.control_label, intersect_genes=args.intersect_genes
-    )
+    # Intersection handling:
+    # - With --external_list we already intersected perts per-external and we DO NOT modify the target.
+    # - Otherwise, keep your existing two-sided intersection.
+    if using_external_list:
+        adata_target_int = adata_target  # target remains unchanged; genes unchanged
+        # (adata_source is already per-pert intersected by read_and_intersect)
+    else:
+        # Existing behavior (two-sided intersect)
+        adata_source, adata_target_int = intersect_datasets(
+            adata_source, adata_target, args.target_label, args.control_label, intersect_genes=args.intersect_genes
+        )
     # Keep split views in intersected target
     adata_train_int = adata_target_int[adata_target_int.obs.index.isin(adata_train.obs.index)].copy()
     eval_adata_int  = adata_target_int[adata_target_int.obs.index.isin(eval_adata.obs.index)].copy()

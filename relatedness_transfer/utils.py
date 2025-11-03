@@ -16,6 +16,38 @@ def to_numpy(X):
         return X.toarray()
     return np.asarray(X)
 
+def read_and_intersect(
+    ext_path: str,
+    adata_target: ad.AnnData,
+    target_label: str = "target_gene",
+    control_label: str = "non-targeting",
+    already_logged: bool = False,
+) -> ad.AnnData:
+    """
+    Read ONE external AnnData, normalize if needed, drop all-NaN genes, and
+    *individually* intersect by perturbations with the TARGET dataset.
+    NOTE: This does NOT modify the target dataset and does NOT intersect genes.
+    """
+    src = ad.read_h5ad(ext_path)
+
+    # Drop genes that are all-NaN in the external
+    X = np.asarray(src.X)
+    if X.ndim == 2:
+        src = src[:, ~np.isnan(X).all(axis=0)].copy()
+
+    # Normalize/log if requested (independently of target)
+    if not already_logged:
+        sc.pp.normalize_total(src, inplace=True)
+        sc.pp.log1p(src)
+
+    # Keep only rows (perts) that also exist in the TARGET (always keep control if present)
+    tgt_perts = set(adata_target.obs[target_label].astype(str).unique().tolist())
+    keep_rows = src.obs[target_label].astype(str).isin(tgt_perts)
+    src_int = src[keep_rows].copy()
+
+    # (No gene intersection here by design)
+    return src_int
+
 def build_target_to_gene_index(adata: ad.AnnData, target_label: str) -> Dict[str, int]:
     """
     Map each perturbation label to a gene index IF the label is a gene present in var_names.
