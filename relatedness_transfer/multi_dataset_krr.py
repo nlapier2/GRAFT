@@ -21,6 +21,7 @@ from sklearn.metrics import pairwise_distances
 from utils import *
 from losses import *
 from transforms import *
+from load_pathways import load_pathway_sources, make_pathway_matrix  # YAML + per-source matrix loaders
 
 
 def parse_arguments():
@@ -113,6 +114,16 @@ def parse_arguments():
                     help="Lower variance bound when converting var->confidence.")
     ap.add_argument("--conf_max_var", type=float, default=1.0,
                     help="Upper variance bound when converting var->confidence.")
+    
+    # arguments for using gene embeddings / pathway info
+    ap.add_argument("--embeddings_yaml", type=str, default="",
+                    help="YAML config with embedding sources (each entry has file/gene_col/pathway_col/format).")
+    ap.add_argument("--emb_metric", type=str, choices=["cosine", "corr", "rbf"], default="cosine",
+                    help="Similarity for embedding sources: cosine (default), Pearson corr, or RBF.")
+    ap.add_argument("--emb_pca_dim", type=int, default=0,
+                    help="Optional PCA on embedding features before similarity (0=off).")
+    ap.add_argument("--emb_rbf_gamma", type=float, default=0.0,
+                    help="RBF gamma; if 0, use median heuristic.")
 
     args = ap.parse_args()
     return args
@@ -201,6 +212,141 @@ def create_kernel(
     S_src = S_src + eps * np.eye(Src := S_src.shape[0], dtype=np.float32)
 
     return S_src.astype(np.float32), perts
+
+def _row_l2_normalize(X: np.ndarray) -> np.ndarray:
+    X = np.asarray(X, dtype=np.float32, order="C")
+    nrm = np.linalg.norm(X, axis=1, keepdims=True) + 1e-8
+    return X / nrm
+
+def _median_heuristic_gamma(X: np.ndarray) -> float:
+    # sample up to 4096 rows for a quick median distance
+    rng = np.random.default_rng(0)
+    n = X.shape[0]
+    take = min(n, 4096)
+    idx = rng.choice(n, size=take, replace=False) if n > take else np.arange(n)
+    Xa = X[idx]
+    # pairwise squared distances
+    d2 = ((Xa[:, None, :] - Xa[None, :, :]) ** 2).sum(axis=2)
+    # take upper triangle median
+    iu = np.triu_indices(d2.shape[0], k=1)
+    med = np.median(d2[iu]) if iu[0].size > 0 else 1.0
+    if med <= 0 or not np.isfinite(med):
+        med = 1.0
+    # gamma = 1/(2*sigma^2) with sigma^2 = med
+    return float(1.0 / (2.0 * med))
+
+def create_embedding_kernel_from_df(
+    df_gene_by_feat: "pd.DataFrame",
+    perts_candidates: list[str],
+    metric: str = "cosine",
+    pca_dim: int = 0,
+    rbf_gamma: float = 0.0,
+) -> tuple[np.ndarray, list[str]]:
+    """
+    Build a pert-pert kernel from a gene-by-feature matrix (rows=genes).
+    Returns (K, perts_present_in_df).
+    """
+    # intersect available perts (gene symbols) with df index
+    genes_in_df = set(map(str, df_gene_by_feat.index))
+    perts = [p for p in perts_candidates if p in genes_in_df]
+    if len(perts) < 2:
+        return np.zeros((0, 0), dtype=np.float32), []
+
+    X = df_gene_by_feat.loc[perts].to_numpy(dtype=np.float32, copy=True)  # (P, F)
+
+    # optional PCA for stability / denoising
+    if pca_dim and pca_dim > 0 and X.shape[1] > pca_dim:
+        try:
+            from sklearn.decomposition import PCA
+            X = PCA(n_components=pca_dim, random_state=0).fit_transform(X)
+        except Exception:
+            # keep original X if sklearn not available
+            pass
+
+    metric = str(metric).lower()
+    if metric == "cosine":
+        Xn = _row_l2_normalize(X)
+        K = Xn @ Xn.T
+    elif metric == "corr":
+        Xm = X - X.mean(axis=1, keepdims=True)
+        denom = np.sqrt((Xm ** 2).sum(axis=1, keepdims=True)) + 1e-8
+        Xz = Xm / denom
+        K = Xz @ Xz.T
+    elif metric == "rbf":
+        if rbf_gamma and rbf_gamma > 0.0:
+            gamma = float(rbf_gamma)
+        else:
+            gamma = _median_heuristic_gamma(X)
+        # pairwise squared distances
+        d2 = ((X[:, None, :] - X[None, :, :]) ** 2).sum(axis=2)
+        K = np.exp(-gamma * d2, dtype=np.float32)
+    else:
+        raise ValueError(f"Unknown emb_metric {metric}")
+
+    # symmetrize, diag=1, tiny ridge
+    K = 0.5 * (K + K.T)
+    np.fill_diagonal(K, 1.0)
+    K = K + 1e-6 * np.eye(K.shape[0], dtype=np.float32)
+    return K.astype(np.float32, copy=False), perts
+
+def build_embedding_kernels_from_yaml(
+    embeddings_yaml: str,
+    var_names_target: list[str],
+    perts_O: list[str],
+    perts_U: list[str],
+    emb_metric: str = "cosine",
+    emb_pca_dim: int = 0,
+    emb_rbf_gamma: float = 0.0,
+) -> list[tuple[np.ndarray, list[str]]]:
+    """
+    Parse YAML of embedding sources, materialize gene-by-feature matrices using your loader,
+    and convert each into a (K_i, perts_i) kernel to append to kernels_and_perts.
+    """
+    if not embeddings_yaml:
+        return []
+
+    # 1) YAML → dict of sources
+    #    Required keys per entry: file, gene_col, pathway_col, format
+    sources = load_pathway_sources(embeddings_yaml)  # dict[name] -> meta
+    if not sources:
+        return []
+
+    kernels = []
+    perts_candidates = list(dict.fromkeys(list(perts_O) + list(perts_U)))  # O∪U order-preserving
+
+    for name, meta in sources.items():
+        file_name   = meta["file"]
+        gene_col    = meta["gene_col"]
+        pathway_col = meta["pathway_col"]
+        fmt         = meta["format"]  # "tsv" or "presage"
+
+        # 2) Make pathway/feature matrix aligned to target gene set
+        #    Returns a DataFrame with rows=genes, cols=features (the helpers handle TSV/PRESAGE shapes). 
+        #    - TSV: parses, de-URLs, pivots, fills missing genes, reorders to var_names, returns .T
+        #    - PRESAGE: loads pickle, transposes, intersects + fills, reorders, returns .T
+        df_gene_by_feat = make_pathway_matrix(
+            file_name=file_name,
+            gene_col=gene_col,
+            pathway_col=pathway_col,
+            format=fmt,
+            var_names=list(map(str, var_names_target)),
+        )
+
+        # 3) Build (K_i, perts_i) for this source over perts present in df
+        K_i, perts_i = create_embedding_kernel_from_df(
+            df_gene_by_feat=df_gene_by_feat,
+            perts_candidates=perts_candidates,
+            metric=emb_metric,
+            pca_dim=emb_pca_dim,
+            rbf_gamma=emb_rbf_gamma,
+        )
+        if K_i.size and len(perts_i):
+            kernels.append((K_i, perts_i))
+            # (optional) print a tiny summary for visibility
+            print(f"[emb] source '{name}': {K_i.shape} over {len(perts_i)} perts "
+                  f"(metric={emb_metric}, pca_dim={emb_pca_dim})")
+
+    return kernels
 
 def _center_kernel(K: np.ndarray) -> np.ndarray:
     """Double-center a symmetric kernel."""
@@ -1059,6 +1205,8 @@ def main():
     # ---------------------------
     # Build per-dataset kernels and aggregate
     # ---------------------------
+    perts_O = pert_list(adata_train_int, args.target_label, args.control_label)
+    perts_U = pert_list(eval_adata_int,  args.target_label, args.control_label)
     # which externals to use
     if using_external_list:
         src_list = adata_sources_list
@@ -1077,8 +1225,19 @@ def main():
         )
         if K_i.size and len(perts_i):
             kernels_and_perts.append((K_i, perts_i))
+
+    # --- Append embedding kernels from YAML, if provided ---
+    if args.embeddings_yaml and args.embeddings_yaml != "":
+        emb_kernels = build_embedding_kernels_from_yaml(
+            embeddings_yaml=args.embeddings_yaml,
+            var_names_target=list(map(str, adata_target_int.var_names)),
+            perts_O=perts_O, perts_U=perts_U,
+            emb_metric=args.emb_metric, emb_pca_dim=args.emb_pca_dim, emb_rbf_gamma=args.emb_rbf_gamma,
+        )
+        kernels_and_perts.extend(emb_kernels)
+
     if len(kernels_and_perts) == 0:
-        raise ValueError("No valid per-dataset kernels were constructed.")
+        raise ValueError("No valid per-dataset kernels were constructed (neither h5ad nor embedding sources).")
 
     if args.kernel_agg == "wmean":
         # global weights from alignment with target train O×O
