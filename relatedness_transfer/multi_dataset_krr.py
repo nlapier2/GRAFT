@@ -1136,6 +1136,13 @@ def main():
         sc.pp.normalize_total(adata_target, inplace=True)
         sc.pp.log1p(adata_target)
 
+    # Split TARGET into train/test (controls appear in both; controls themselves are never modified)
+    adata_train, adata_test, adata_test_orig = train_test_split(args, adata_target)
+    if args.test_h5ad != "":  # if external test set provided, merge into overall target dataset
+        tmp = adata_test[adata_test.obs[args.target_label] != args.control_label].copy()
+        adata_target = ad.concat([adata_train, tmp])
+    eval_adata = adata_test if adata_test is not None else adata_train
+
     # Load externals:
     # If --external_list is provided and non-empty, it *overrides* --external_h5ad.
     external_paths = []
@@ -1174,13 +1181,6 @@ def main():
     # Compute a SINGLE global control mean from ALL target controls (fixed across splits)
     ctrl_mask_full = (adata_target.obs[args.target_label] == args.control_label).values
     ctrl_mean_global = np.asarray(adata_target.X)[ctrl_mask_full].mean(axis=0).reshape(-1)
-
-    # Split TARGET into train/test (controls appear in both; controls themselves are never modified)
-    adata_train, adata_test, adata_test_orig = train_test_split(args, adata_target)
-    if args.test_h5ad != "":  # if external test set provided, merge into overall target dataset
-        tmp = adata_test[adata_test.obs[args.target_label] != args.control_label].copy()
-        adata_target = ad.concat([adata_train, tmp])
-    eval_adata = adata_test if adata_test is not None else adata_train
 
     # Build AverageKnown baselines and truths BEFORE any intersection
     (pred_tr, true_tr, names_tr), (pred_ev, true_ev, names_ev) = build_average_known_baseline(
