@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.isotonic import IsotonicRegression
+from sklearn.metrics import pairwise_distances
 
 from utils import *
 from losses import *
@@ -26,7 +27,7 @@ def parse_arguments():
     ap = argparse.ArgumentParser(description="Step0-aware MPNN to fit perturbed gene vectors on a small panel.")
     # Basic and I/O options
     ap.add_argument("--in_h5ad", required=True, help="Small input AnnData object.")
-    ap.add_argument("--external_h5ad", required=True, help="Path to the external pseudobulked AnnData object.")
+    ap.add_argument("--external_h5ad", default="", help="Path to the external pseudobulked AnnData object.")
     ap.add_argument("--external_list", type=str, default="",
                     help="Optional text file with one external .h5ad path per line. If set, overrides --external_h5ad.")
     ap.add_argument("--out_pred_h5ad", type=str, default="",
@@ -64,6 +65,8 @@ def parse_arguments():
                     help="How to build the perturbation kernel from the external dataset.")
     ap.add_argument("--iso_calibrate", action="store_true",
                         help="Apply isotonic calibration of external similarity to match target similarity on training perts.")
+    ap.add_argument("--kernel_agg", type=str, choices=["mean", "max"], default="mean",
+                    help="How to aggregate per-dataset kernels when --external_list is used.")
     # Neighbor sharpening (perturbation-space)
     ap.add_argument("--kernel_gamma", type=float, default=1.0,
                     help="Power sharpening for K_UO rows; >1 sharpens (e.g., 1.4). 1.0 disables.")
@@ -104,25 +107,166 @@ def parse_arguments():
     args = ap.parse_args()
     return args
 
+def create_kernel(
+    adata_source_int: ad.AnnData,
+    adata_train_target: ad.AnnData,
+    target_label: str,
+    control_label: str,
+    kernel_metric: str = "corr",     # {"corr","cosine"}
+    iso_calibrate: bool = False,     # match current flag semantics
+    eps: float = 1e-6,               # tiny PSD nudge
+) -> tuple[np.ndarray, list[str]]:
+    """
+    Build a perturbation kernel from ONE external dataset, with optional isotonic calibration
+    using TARGET train deltas (on the overlapping training perts).
+
+    Returns:
+        K_src  : (P_i x P_i) numpy array (float32), symmetric with diag=1
+        perts  : List[str] of NON-control perturbations in this external (row/col order of K_src)
+    """
+    # --- collect perts in this external (exclude control) ---
+    perts_src_all = list(map(str, adata_source_int.obs[target_label].values))
+    perts = [p for p in dict.fromkeys(perts_src_all) if p != control_label]  # stable unique, no control
+    if len(perts) == 0:
+        # return a degenerate 1x1 kernel if nothing to contribute; caller can ignore it
+        return np.ones((0, 0), dtype=np.float32), []
+
+    # --- compute SOURCE deltas matrix: rows=perts, cols=genes ---
+    deltas_src_dict, _ = compute_deltas(adata_source_int, target_label, control_label)
+    # Keep only perts that truly exist in this source's delta dict (paranoia)
+    perts = [p for p in perts if p in deltas_src_dict]
+    D_src = np.stack([np.asarray(deltas_src_dict[p]).ravel() for p in perts], axis=0).astype(np.float32)
+
+    # --- similarity on source deltas ---
+    if kernel_metric == "corr":
+        # Pearson correlation between rows
+        # np.corrcoef expects rows as variables if rowvar=True (default)
+        S_src = np.corrcoef(D_src)
+        # numerical guard: NaNs can happen if a row is constant
+        S_src = np.nan_to_num(S_src, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    elif kernel_metric == "cosine":
+        # similarity = 1 - cosine distance
+        S_src = 1.0 - pairwise_distances(D_src, metric="cosine")
+        S_src = np.nan_to_num(S_src, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    else:
+        raise ValueError(f"Unsupported kernel_metric={kernel_metric!r}. Use 'corr' or 'cosine'.")
+
+    # --- optional isotonic calibration on O×O overlap (training perts only) ---
+    if iso_calibrate:
+        # Training perts present in BOTH this external and the target TRAIN split
+        perts_O = [p for p in pert_list(adata_train_target, target_label, control_label) if p in set(perts)]
+        if len(perts_O) >= 4:
+            # target deltas for O (rows aligned to perts_O) -> target similarity on O×O
+            deltas_tgt_O, _ = compute_deltas(adata_train_target, target_label, control_label)
+            D_tgt_O = np.stack([np.asarray(deltas_tgt_O[p]).ravel() for p in perts_O], axis=0).astype(np.float32)
+            if kernel_metric == "corr":
+                S_tgt_OO = np.corrcoef(D_tgt_O)
+            else:
+                S_tgt_OO = 1.0 - pairwise_distances(D_tgt_O, metric="cosine")
+            S_tgt_OO = np.nan_to_num(S_tgt_OO, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+            # map perts_O to indices in the source kernel
+            idx_src = {p: i for i, p in enumerate(perts)}
+            iO = np.array([idx_src[p] for p in perts_O], dtype=int)
+            S_src_OO = S_src[np.ix_(iO, iO)]
+
+            # fit an increasing isotonic map: src_sim -> tgt_sim, using upper triangle (i<j)
+            iu = np.triu_indices(len(perts_O), k=1)
+            x = S_src_OO[iu].ravel()
+            y = S_tgt_OO[iu].ravel()
+            # clamp to [-1,1] for safety
+            x = np.clip(x, -1.0, 1.0)
+            y = np.clip(y, -1.0, 1.0)
+
+            if np.all(np.isfinite(x)) and np.all(np.isfinite(y)) and x.size >= 8:
+                iso = IsotonicRegression(y_min=-1.0, y_max=1.0, increasing=True, out_of_bounds="clip")
+                iso.fit(x, y)
+                # apply to the whole matrix
+                S_src = iso.predict(np.clip(S_src, -1.0, 1.0).reshape(-1)).reshape(S_src.shape).astype(np.float32)
+            # else: quietly keep S_src as-is (too few/ill-conditioned pairs)
+
+    # --- symmetrize, set diag=1, tiny PSD nudge ---
+    S_src = 0.5 * (S_src + S_src.T)
+    np.fill_diagonal(S_src, 1.0)
+    S_src = S_src + eps * np.eye(Src := S_src.shape[0], dtype=np.float32)
+
+    return S_src.astype(np.float32), perts
+
+def aggregate_kernels(
+    kernels_and_perts: list[tuple[np.ndarray, list[str]]],
+    method: str = "mean",     # {"mean","max"}
+    eps: float = 1e-6,
+) -> tuple[np.ndarray, list[str]]:
+    """
+    Aggregate multiple per-dataset kernels into a single kernel over the union of perts.
+    NaN-aware reduction:
+      - If multiple datasets define a pair, reduce via mean/max.
+      - If only one defines it, that value is used.
+      - If none define it, the entry stays NaN (caller can decide to drop those perts).
+    Returns:
+        K_agg : (P_union x P_union) float32 kernel (diag=1, symmetrized, eps*I added)
+        perts_union : row/col order
+    """
+    # filter out empties
+    items = [(K, perts) for (K, perts) in kernels_and_perts if K is not None and len(perts) > 0]
+    if len(items) == 0:
+        return np.ones((0, 0), dtype=np.float32), []
+
+    # stable union order: appearance order across inputs
+    perts_union = []
+    seen = set()
+    for _, perts in items:
+        for p in perts:
+            if p not in seen:
+                seen.add(p)
+                perts_union.append(p)
+    P = len(perts_union)
+    index = {p: i for i, p in enumerate(perts_union)}
+
+    # accumulator cube with NaNs
+    stacks = []  # list of (P x P) arrays with NaNs where undefined
+    for K_i, perts_i in items:
+        A = np.full((P, P), np.nan, dtype=np.float32)
+        idx_i = [index[p] for p in perts_i]
+        A[np.ix_(idx_i, idx_i)] = K_i.astype(np.float32)
+        stacks.append(A)
+
+    S = np.stack(stacks, axis=0)  # (M, P, P)
+
+    if method == "mean":
+        K_agg = np.nanmean(S, axis=0)
+    elif method == "max":
+        K_agg = np.nanmax(S, axis=0)
+    else:
+        raise ValueError(f"Unknown aggregation method {method!r}; use 'mean' or 'max'.")
+
+    # Any pairs never observed by any dataset remain NaN -> set to 0 (neutral-ish)
+    K_agg = np.nan_to_num(K_agg, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # symmetrize, set diag=1, and nudge
+    K_agg = 0.5 * (K_agg + K_agg.T)
+    np.fill_diagonal(K_agg, 1.0)
+    K_agg = K_agg + eps * np.eye(P, dtype=np.float32)
+
+    return K_agg.astype(np.float32), perts_union
+
 def krr_predict_from_external(
-    adata_source: ad.AnnData,
     adata_train: ad.AnnData,
     adata_eval: ad.AnnData,
     target_label: str,
     control_label: str,
     krr_lambda: float = 1e-2,
-    kernel_metric: str = "corr",
     ctrl_mean_target: np.ndarray | None = None,
-    iso_calibrate: bool = False,
     kernel_gamma: float = 1.0,
     topk: int = 0,
     boost_pcs: int = 0,
     boost_gamma: float = 0.6,
-    # NEW: confidence boost args
     conf_boost_alpha: float = 0.0,
     conf_shrink_alpha: float = 0.0,
     conf_min_var: float = 1e-6,
     conf_max_var: float = 1.0,
+    K_full: np.ndarray = None,
+    perts_all: List[str] = None,
 ) -> tuple[np.ndarray, np.ndarray, list[str], np.ndarray, np.ndarray]:
     """
     Returns:
@@ -138,16 +282,20 @@ def krr_predict_from_external(
         train_mask = np.asarray(adata_train.obs[target_label] == control_label)
         ctrl_mean_target = np.asarray(adata_train.X)[train_mask].mean(axis=0).reshape(-1)
 
-    # ---- define sets ----
-    O = pert_list(adata_train, target_label, control_label)  # observed perts
-    U = pert_list(adata_eval,  target_label, control_label)  # to predict/evaluate
-    perts_all = O + [p for p in U if p not in O]
-    G = adata_train.n_vars
-
-    # indices for O and U inside perts_all
+    # ---- define sets (KEEP kernel order; do not rebuild perts_all) ----
+    if K_full is None or perts_all is None:
+        raise ValueError("krr_predict_from_external requires a precomputed kernel: pass K_full and perts_all.")
+    O_raw = pert_list(adata_train, target_label, control_label)  # observed perts
+    U_raw = pert_list(adata_eval,  target_label, control_label)  # to predict/evaluate
+    # map provided kernel order
     idx = {p: i for i, p in enumerate(perts_all)}
-    iO = np.array([idx[p] for p in O], dtype=int)
-    iU = np.array([idx[p] for p in U], dtype=int)
+    # keep only perts present in the kernel (order preserved from O_raw / U_raw)
+    O = [p for p in O_raw if p in idx]
+    U = [p for p in U_raw if p in idx]
+    if len(O) == 0 or len(U) == 0:
+        raise ValueError("After aligning to kernel perts, O or U is empty. Check kernel construction / intersections.")
+    iO = np.asarray([idx[p] for p in O], dtype=int)
+    iU = np.asarray([idx[p] for p in U], dtype=int)
 
     # ---- target deltas: Y_O (|O| x G) and Y_true_U (|U| x G) ----
     # build deltas against the SAME ctrl_mean_target
@@ -161,30 +309,10 @@ def krr_predict_from_external(
 
     Y_O = _delta_mat(adata_train, O)   # (|O|, G)
 
-    # ---- external deltas & similarity over ALL perts (O∪U) ----
-    del_src, _ = compute_deltas(adata_source, target_label, control_label)  # pert -> delta row
-    Delta_src = np.stack([np.asarray(del_src[p]).ravel() for p in perts_all], axis=0)  # (P,G)
-    if kernel_metric == "corr":
-        Z = row_standardize(Delta_src)
-        S_ext = Z @ Z.T
-    else:  # "cosine"
-        Z = Delta_src / (np.linalg.norm(Delta_src, axis=1, keepdims=True) + 1e-8)
-        S_ext = Z @ Z.T
-    S_ext = 0.5 * (S_ext + S_ext.T)
-    np.fill_diagonal(S_ext, 1.0)
-
-    # ---- isotonic calibration on training pairs (O×O) ----
-    if iso_calibrate:
-        print("[iso] Fitting isotonic calibration on training perts...")
-        iso = fit_isotonic_on_pairs(S_ext[np.ix_(iO, iO)], Y_O)
-        S_cal = apply_isotonic_matrix(iso, S_ext)
-    else:
-        S_cal = S_ext
-
-    # ---- build kernel K from calibrated similarity ----
-    K = S_cal
-    K = 0.5 * (K + K.T)
-    K += np.eye(K.shape[0], dtype=K.dtype) * 1e-6  # nudge toward PSD
+    # ---- use the provided aggregated kernel (over O∪U) ----
+    if K_full is None or perts_all is None:
+        raise ValueError("krr_predict_from_external now requires a precomputed kernel: pass K_full and perts_all.")
+    K = K_full.astype(np.float32, copy=False)
 
     KOO = K[np.ix_(iO, iO)]
     KUO = K[np.ix_(iU, iO)]
@@ -256,10 +384,15 @@ def krr_predict_from_external(
     # --- Non-negativity clamp: no expression should be < 0 ---
     np.maximum(pred_mat, 0.0, out=pred_mat)
 
-    # ---- True expression rows and pert_names from EVAL split (like your example) ----
-    test_pert_mask = adata_eval.obs[target_label].isin(U)
-    true_mat = np.asarray(adata_eval.X)[np.asarray(test_pert_mask)]
-    pert_names = adata_eval.obs.loc[test_pert_mask, target_label].astype(str).tolist()
+    # ---- True expression rows and pert_names (just the U we actually predicted) ----
+    # We return rows in the SAME order as 'U' (the eval perts aligned to kernel)
+    # Build true_mat by averaging per pert from adata_eval (pseudobulk rows).
+    rows = []
+    for p in U:
+        v = adata_eval[adata_eval.obs[target_label] == p].X
+        rows.append(np.asarray(v).reshape(-1, G).mean(axis=0))
+    true_mat = np.stack(rows, axis=0)
+    pert_names = list(U)
 
     # ctrl_mean returned in the bundle = TRAIN control mean (global baseline)
     return pred_mat, true_mat, pert_names, np.asarray(ctrl_mean_target).ravel(), pred_delta_var
@@ -528,7 +661,10 @@ def main():
     # ---------------------------
     print("Reading and preparing data...")
     adata_target = ad.read_h5ad(args.in_h5ad)
-    adata_source = ad.read_h5ad(args.external_h5ad)
+    if args.external_h5ad != "":
+        adata_source = ad.read_h5ad(args.external_h5ad)
+    elif args.external_list == "":
+        raise ValueError("Either --external_h5ad or --external_list must be provided.")
 
     # Normalize/log target if requested
     if not args.already_logged:
@@ -601,6 +737,51 @@ def main():
     adata_train_int = adata_target_int[adata_target_int.obs.index.isin(adata_train.obs.index)].copy()
     eval_adata_int  = adata_target_int[adata_target_int.obs.index.isin(eval_adata.obs.index)].copy()
 
+    # ---------------------------
+    # Build per-dataset kernels and aggregate
+    # ---------------------------
+    perts_O = pert_list(adata_train_int, args.target_label, args.control_label)
+    perts_U = pert_list(eval_adata_int,  args.target_label, args.control_label)
+    # which externals to use
+    if using_external_list:
+        src_list = adata_sources_list
+    else:
+        src_list = [adata_source]
+
+    kernels_and_perts = []
+    for src_i in src_list:
+        K_i, perts_i = create_kernel(
+            adata_source_int=src_i,
+            adata_train_target=adata_train_int,   # isotonic is per-dataset vs target train
+            target_label=args.target_label,
+            control_label=args.control_label,
+            kernel_metric=args.kernel_metric,
+            iso_calibrate=args.iso_calibrate,
+        )
+        if K_i.size and len(perts_i):
+            kernels_and_perts.append((K_i, perts_i))
+    if len(kernels_and_perts) == 0:
+        raise ValueError("No valid per-dataset kernels were constructed.")
+
+    K_full, perts_union = aggregate_kernels(kernels_and_perts, method=args.kernel_agg)
+    print(f"Aggregated kernel: {K_full.shape} over {len(perts_union)} perts.")
+
+    # Build "core" splits that *only* contain perts covered by the kernel union (plus controls).
+    # These are used for the KRR call so indices/names match the kernel exactly.
+    kernel_pert_set = set(perts_union)
+    def _mask_in_kernel(adx):
+        lab = adx.obs[args.target_label].astype(str)
+        return lab.isin(kernel_pert_set) | (lab == args.control_label)
+
+    adata_train_core = adata_train_int[_mask_in_kernel(adata_train_int)].copy()
+    eval_adata_core  = eval_adata_int[_mask_in_kernel(eval_adata_int)].copy()
+
+    # If the user *doesn't* want to keep OOV perts, also shrink the "public" splits
+    # so all downstream metrics only reflect the perts covered by the kernel.
+    if not args.keep_oov_perts:
+        adata_train_int = adata_train_core
+        eval_adata_int  = eval_adata_core
+
     # If genes were intersected, align baseline tensors and ctrl_mean to the intersected gene order
     if args.intersect_genes:
         gene_order = adata_target_int.var_names
@@ -623,15 +804,12 @@ def main():
         raise ValueError(f"Unknown method: {args.method}")
     # Run KRR ONLY on the intersected views; get predictions for intersected perts
     pred_krr_ev, _true_krr_ev, names_krr_ev, _ctrl_ignored, pred_delta_var_ev = krr_predict_from_external(
-        adata_source=adata_source,
-        adata_train=adata_train_int,
-        adata_eval=eval_adata_int,
+        adata_train=adata_train_core,
+        adata_eval=eval_adata_core,
         target_label=args.target_label,
         control_label=args.control_label,
         krr_lambda=args.krr_lambda,
-        kernel_metric=args.kernel_metric,
         ctrl_mean_target=ctrl_mean_global,  # fixed control mean
-        iso_calibrate=args.iso_calibrate,
         kernel_gamma=args.kernel_gamma,
         topk=args.topk,
         boost_pcs=args.boost_pcs,
@@ -640,6 +818,8 @@ def main():
         conf_shrink_alpha=args.conf_shrink_alpha,
         conf_min_var=args.conf_min_var,
         conf_max_var=args.conf_max_var,
+        K_full=K_full,
+        perts_all=perts_union,
     )
     # Overwrite rows (by pert name) into the AverageKnown baseline (eval split)
     name2row_ev = {p: i for i, p in enumerate(names_ev)}
@@ -680,15 +860,12 @@ def main():
     if args.eval_on_train and (adata_test is not None):
         print("\n=== Evaluation on TRAIN set ===")
         pred_krr_tr, _true_krr_tr, names_krr_tr, _ctrl_ignored, _pred_delta_var_tr = krr_predict_from_external(
-            adata_source=adata_source,
-            adata_train=adata_train_int,
-            adata_eval=adata_train_int,
+            adata_train=adata_train_core,
+            adata_eval=adata_train_core,
             target_label=args.target_label,
             control_label=args.control_label,
             krr_lambda=args.krr_lambda,
-            kernel_metric=args.kernel_metric,
             ctrl_mean_target=ctrl_mean_global,
-            iso_calibrate=args.iso_calibrate,
             kernel_gamma=args.kernel_gamma,
             topk=args.topk,
             boost_pcs=args.boost_pcs,
@@ -697,6 +874,8 @@ def main():
             conf_shrink_alpha=args.conf_shrink_alpha,
             conf_min_var=args.conf_min_var,
             conf_max_var=args.conf_max_var,
+            K_full=K_full,
+            perts_all=perts_union,
         )
         # Overwrite into train baseline
         name2row_tr = {p: i for i, p in enumerate(names_tr)}
