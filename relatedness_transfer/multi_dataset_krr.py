@@ -3,6 +3,7 @@ import warnings
 # Suppress annoying FutureWarning from scanpy
 warnings.filterwarnings('ignore', category=FutureWarning)
 import argparse, math, os
+import pickle as pkl
 import numpy as np
 import pandas as pd
 import anndata as ad
@@ -967,6 +968,118 @@ def write_cell_level_predictions(
           f"(controls={ctrl_mask.sum()}, synthesized={X_out.shape[0] - ctrl_mask.sum()}, genes={G})")
     ad_out.write_h5ad(out_path)
 
+def collect_top_neighbors_per_u(
+    *,
+    adata_train_target: ad.AnnData,
+    adata_eval_target: ad.AnnData,
+    target_label: str,
+    control_label: str,
+    perts_U: list[str],
+    kernels_and_perts: list[tuple[np.ndarray, list[str]]],
+    dataset_names: list[str] | None = None,
+    topk: int = 10,
+    true_metric: str = "corr",   # similarity for TRUE (target) side: "corr" or "cosine"
+) -> dict[str, dict]:
+    """
+    Build an inspection object for each test perturbation u in perts_U:
+      {
+        u: {
+          "true_top":      [(pert, sim), ...],        # from target deltas vs TRAIN perts
+          "datasets": {                               # per precomputed kernel (no recomputation)
+              <ds_name>: [(pert, kernel_val), ...],
+              ...
+          }
+        },
+        ...
+      }
+
+    Notes:
+      - Only TRAIN perts (O) are eligible as neighbors.
+      - For 'true_top', we compute similarity between the eval delta of u and train deltas of O from the TARGET data.
+      - For each kernel, we use the PRECOMPUTED kernel entries directly (no recomputation).
+      - If a dataset lacks u or lacks a given train pert, it simply won't contribute to that list.
+      - All lists are sorted descending by similarity and truncated to 'topk'.
+    """
+    # -------- 0) collect O and basic maps --------
+    def _pert_list(adata):
+        return [p for p in adata.obs[target_label].astype(str).unique().tolist() if p != control_label]
+
+    perts_O = _pert_list(adata_train_target)
+    perts_U = [str(p) for p in perts_U if p != control_label]
+    if dataset_names is None:
+        dataset_names = [f"ds{i}" for i in range(len(kernels_and_perts))]
+    assert len(dataset_names) == len(kernels_and_perts), "dataset_names must match kernels_and_perts length"
+
+    # -------- 1) TRUE similarities: y_u (from eval) vs Y_O (from train) --------
+    # Compute deltas once
+    deltas_O, _ = compute_deltas(adata_train_target, target_label, control_label)  # {pert -> (G,)}
+    deltas_U, _ = compute_deltas(adata_eval_target,  target_label, control_label)  # {pert -> (G,)}
+
+    # Build a matrix Y_O in a stable O order (only keep perts actually present)
+    perts_O_present = [p for p in perts_O if p in deltas_O]
+    if len(perts_O_present) == 0:
+        raise ValueError("No training deltas available to compute 'true_top' neighbors.")
+
+    Y_O = np.stack([np.asarray(deltas_O[p]).ravel() for p in perts_O_present], axis=0).astype(np.float32)  # (|O|, G)
+    # Normalize once depending on metric
+    if true_metric == "corr":
+        # row-wise z-score
+        Yo = Y_O - Y_O.mean(axis=1, keepdims=True)
+        Yo /= (np.linalg.norm(Yo, axis=1, keepdims=True) + 1e-8)
+    elif true_metric == "cosine":
+        Yo = Y_O / (np.linalg.norm(Y_O, axis=1, keepdims=True) + 1e-8)
+    else:
+        raise ValueError("true_metric must be 'corr' or 'cosine'.")
+
+    def _true_top_for_u(u: str) -> list[tuple[str, float]]:
+        if u not in deltas_U:
+            return []
+        yu = np.asarray(deltas_U[u]).ravel().astype(np.float32)
+        if true_metric == "corr":
+            yu = yu - yu.mean()
+            denom = np.linalg.norm(yu) + 1e-8
+            yu = yu / denom
+        else:  # cosine
+            yu = yu / (np.linalg.norm(yu) + 1e-8)
+        sims = (Yo @ yu).astype(np.float32)  # (|O|,)
+        order = np.argsort(-sims)[:topk]
+        return [(perts_O_present[i], float(sims[i])) for i in order]
+
+    # -------- 2) Kernel-based neighbors per dataset (use precomputed values) --------
+    # For each dataset, align its kernel to (u vs O) if available
+    ds_index_maps = []
+    for K_i, perts_i in kernels_and_perts:
+        ds_index_maps.append({p: j for j, p in enumerate(perts_i)})
+
+    def _kernel_top_for_u(ds_idx: int, u: str) -> list[tuple[str, float]]:
+        K_i, perts_i = kernels_and_perts[ds_idx]
+        idx = ds_index_maps[ds_idx]
+        if u not in idx:
+            return []
+        ju = idx[u]
+        # consider only O perts present in this dataset
+        cand = [(p, idx[p]) for p in perts_O if p in idx]
+        if not cand:
+            return []
+        cols = np.array([j for _, j in cand], dtype=int)
+        vals = K_i[ju, cols].astype(np.float32)
+        order = np.argsort(-vals)[:topk]
+        # map back to pert names
+        return [(cand[i][0], float(vals[i])) for i in order]
+
+    # -------- 3) Assemble result --------
+    out: dict[str, dict] = {}
+    for u in perts_U:
+        entry = {
+            "true_top": _true_top_for_u(u),
+            "datasets": {}
+        }
+        for i, name in enumerate(dataset_names):
+            entry["datasets"][name] = _kernel_top_for_u(i, u)
+        out[u] = entry
+
+    return out
+
 def evaluate_model(
     adata: ad.AnnData,
     args,
@@ -1488,6 +1601,24 @@ def main():
             out_path=args.test_predict_out,
             random_state=getattr(args, "seed", None),
         )
+
+    # Optional human-readable names for each kernel (same order as kernels_and_perts):
+    dataset_names = []
+    # Fill dataset_names if you have names; otherwise they auto-name as ds0, ds1, ...
+
+    neighbor_obj = collect_top_neighbors_per_u(
+        adata_train_target=adata_train_core,
+        adata_eval_target=eval_adata_core,
+        target_label=args.target_label,
+        control_label=args.control_label,
+        perts_U=perts_U,
+        kernels_and_perts=kernels_and_perts,
+        dataset_names=dataset_names or None,
+        topk=10,                 # tweak as you like
+        true_metric="corr",      # "corr" or "cosine" for the TRUE side
+    )
+    with(open('kernel_similarity.pkl', 'wb')) as f:
+        pkl.dump(neighbor_obj, f)
 
     print("\n✨ Done!")
 
