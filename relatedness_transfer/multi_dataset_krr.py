@@ -65,8 +65,18 @@ def parse_arguments():
                     help="How to build the perturbation kernel from the external dataset.")
     ap.add_argument("--iso_calibrate", action="store_true",
                         help="Apply isotonic calibration of external similarity to match target similarity on training perts.")
-    ap.add_argument("--kernel_agg", type=str, choices=["mean", "max"], default="mean",
+    ap.add_argument("--kernel_agg", type=str, choices=["mean", "max", "wmean", "pwmean"], default="mean",
                     help="How to aggregate per-dataset kernels when --external_list is used.")
+    ap.add_argument("--kernel_weight_gamma", type=float, default=1.0,
+                    help="Exponent gamma for global reliability weights (w_i ∝ score_i^gamma).")
+    ap.add_argument("--pw_topk", type=int, default=10,
+                    help="Top-k neighbors in O used to transfer per-pert weights to U.")
+    ap.add_argument("--pw_pair_rule", type=str, choices=["geom", "min"], default="geom",
+                    help="Combine per-pert weights into pair weights: geometric mean or min.")
+    ap.add_argument("--pw_gamma", type=float, default=1.0,
+                    help="Exponent gamma for per-pert reliability scores before normalization.")
+    ap.add_argument("--pw_floor", type=float, default=0.0,
+                    help="Small floor added to per-pert weights before normalization to avoid brittle zeros.")
     # Neighbor sharpening (perturbation-space)
     ap.add_argument("--kernel_gamma", type=float, default=1.0,
                     help="Power sharpening for K_UO rows; >1 sharpens (e.g., 1.4). 1.0 disables.")
@@ -192,10 +202,308 @@ def create_kernel(
 
     return S_src.astype(np.float32), perts
 
+def _center_kernel(K: np.ndarray) -> np.ndarray:
+    """Double-center a symmetric kernel."""
+    n = K.shape[0]
+    one = np.ones((n, 1), dtype=K.dtype) / n
+    row_mean = K @ one
+    col_mean = (one.T @ K).T
+    grand = (one.T @ K @ one)[0, 0]
+    return K - row_mean - col_mean + grand
+
+
+def _kernel_alignment(K: np.ndarray, S: np.ndarray) -> float:
+    """
+    Centered kernel alignment (a.k.a. HSIC normalized, aka KTA):
+    <Kc, Sc>_F / (||Kc||_F * ||Sc||_F)
+    """
+    Kc = _center_kernel(K)
+    Sc = _center_kernel(S)
+    num = np.sum(Kc * Sc)
+    den = np.linalg.norm(Kc, ord="fro") * np.linalg.norm(Sc, ord="fro")
+    if den <= 0 or not np.isfinite(den):
+        return 0.0
+    val = float(num / den)
+    # clip tiny numeric drift
+    if not np.isfinite(val):
+        return 0.0
+    return val
+
+
+def compute_global_kernel_weights(
+    kernels_and_perts: list[tuple[np.ndarray, list[str]]],
+    adata_train_target: ad.AnnData,
+    target_label: str,
+    control_label: str,
+    perts_O: list[str],
+    gamma: float = 1.0,
+    min_common: int = 4,
+) -> tuple[list[float], list[float]]:
+    """
+    Compute one reliability weight per dataset using alignment of K_i^{OO} to the
+    target train similarity S_tgt^{OO}. Returns (weights, raw_scores) where
+    weights are normalized to sum to 1. If all scores are 0, falls back to uniform.
+    """
+    # Build target train similarity on O×O from target deltas (corr)
+    deltas_tgt_O, _ = compute_deltas(adata_train_target, target_label, control_label)
+    # Keep only perts we actually have in training
+    perts_O = [p for p in perts_O if p in deltas_tgt_O]
+    if len(perts_O) < min_common:
+        # degenerate: not enough training perts
+        return [1.0 / max(1, len(kernels_and_perts))] * len(kernels_and_perts), [0.0] * len(kernels_and_perts)
+
+    D_tgt_O = np.stack([np.asarray(deltas_tgt_O[p]).ravel() for p in perts_O], axis=0).astype(np.float32)
+    # Pearson corr similarity on O×O
+    S_tgt = np.corrcoef(D_tgt_O)
+    S_tgt = np.nan_to_num(S_tgt, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+    scores = []
+    for (K_i, perts_i) in kernels_and_perts:
+        # intersect perts of this dataset with O
+        common = [p for p in perts_O if p in set(perts_i)]
+        if len(common) < min_common:
+            scores.append(0.0)
+            continue
+        # align K_i to the same ordering
+        idx_map = {p: j for j, p in enumerate(perts_i)}
+        I = np.array([idx_map[p] for p in common], dtype=int)
+        K_OO = K_i[np.ix_(I, I)].astype(np.float32)
+        # Build target similarity on the same subset order
+        j_map = {p: j for j, p in enumerate(perts_O)}
+        J = np.array([j_map[p] for p in common], dtype=int)
+        S_sub = S_tgt[np.ix_(J, J)]
+        s = _kernel_alignment(K_OO, S_sub)
+        # non-negative score; negative alignment shouldn’t get weight
+        scores.append(max(0.0, s))
+
+    # turn into weights with exponent gamma
+    if np.allclose(scores, 0.0):
+        w = [1.0 / len(kernels_and_perts)] * len(kernels_and_perts)
+        return w, scores
+    sc = np.array(scores, dtype=np.float64)
+    sc = np.power(sc, max(0.0, float(gamma)))
+    sc_sum = sc.sum()
+    w = (sc / sc_sum).tolist()
+    return w, scores
+
+def _row_corr2(a: np.ndarray, b: np.ndarray) -> float:
+    """Return squared Pearson correlation between two 1D arrays, guarding NaNs."""
+    a = np.asarray(a, dtype=np.float32).ravel()
+    b = np.asarray(b, dtype=np.float32).ravel()
+    if a.size < 2 or b.size < 2:
+        return 0.0
+    am = a - a.mean()
+    bm = b - b.mean()
+    denom = float(np.linalg.norm(am) * np.linalg.norm(bm))
+    if denom <= 0 or not np.isfinite(denom):
+        return 0.0
+    r = float((am @ bm) / denom)
+    if not np.isfinite(r):
+        return 0.0
+    r2 = r * r
+    return max(0.0, r2)
+
+
+def compute_per_pert_weights_on_O(
+    kernels_and_perts: list[tuple[np.ndarray, list[str]]],
+    adata_train_target: ad.AnnData,
+    target_label: str,
+    control_label: str,
+    perts_O: list[str],
+    gamma: float = 1.0,
+    floor: float = 0.0,
+    min_common: int = 4,
+) -> list[dict[str, float]]:
+    """
+    For each dataset i, compute a dict w_i(p) for p∈O, from corr^2 between K_i[p, O∩P_i]
+    and S_tgt[p, same subset]. Then, for each p, normalize weights across datasets
+    that contain p (apply floor and exponent gamma before normalization).
+    Returns: list of length M, each is {pert -> weight} for p∈O∩P_i.
+    """
+    # Build target similarity S_tgt over O using deltas (corr)
+    deltas_tgt_O, _ = compute_deltas(adata_train_target, target_label, control_label)
+    perts_O = [p for p in perts_O if p in deltas_tgt_O]
+    if len(perts_O) < min_common:
+        return [{p: 1.0 for p in perts_O}] * len(kernels_and_perts)
+
+    D_tgt_O = np.stack([np.asarray(deltas_tgt_O[p]).ravel() for p in perts_O], axis=0).astype(np.float32)
+    S_tgt = np.corrcoef(D_tgt_O)
+    S_tgt = np.nan_to_num(S_tgt, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    pos = {p: j for j, p in enumerate(perts_O)}
+
+    # raw scores r_i(p)
+    raw_scores_per_ds: list[dict[str, float]] = []
+    for (K_i, perts_i) in kernels_and_perts:
+        avail = set(perts_i)
+        idx_i = {p: j for j, p in enumerate(perts_i)}
+        scores: dict[str, float] = {}
+        for p in perts_O:
+            if p not in avail:
+                continue
+            # common O perts this dataset has (including p)
+            common = [q for q in perts_O if q in avail]
+            if len(common) < min_common:
+                continue
+            I = np.array([idx_i[q] for q in common], dtype=int)
+            J = np.array([pos[q] for q in common], dtype=int)
+            row_i = K_i[idx_i[p], I]
+            row_t = S_tgt[pos[p], J]
+            r2 = _row_corr2(row_i, row_t)
+            scores[p] = r2
+        raw_scores_per_ds.append(scores)
+
+    # normalize per-pert across datasets that contain that pert
+    M = len(kernels_and_perts)
+    w_per_ds: list[dict[str, float]] = [dict() for _ in range(M)]
+    for p in perts_O:
+        vals = []
+        which = []
+        for i in range(M):
+            if p in raw_scores_per_ds[i]:
+                vals.append(max(0.0, raw_scores_per_ds[i][p]))
+                which.append(i)
+        if not which:
+            continue
+        vals = np.asarray(vals, dtype=np.float64)
+        vals = np.power(vals + float(floor), max(0.0, float(gamma)))
+        s = float(vals.sum())
+        if s <= 0 or not np.isfinite(s):
+            vals = np.ones_like(vals) / len(vals)
+        else:
+            vals = vals / s
+        for v, i in zip(vals.tolist(), which):
+            w_per_ds[i][p] = float(v)
+    return w_per_ds
+
+
+def estimate_weights_for_U_by_neighbors(
+    perts_U: list[str],
+    perts_O: list[str],
+    base_kernel: np.ndarray,
+    base_perts: list[str],
+    w_per_ds_O: list[dict[str, float]],
+    topk: int = 10,
+) -> list[dict[str, float]]:
+    """
+    For each u∈U, estimate w_i(u) by averaging weights of top-k neighbors in O,
+    neighbors chosen using base_kernel[u, O] in base_perts ordering.
+    Returns: list of dicts per dataset i with entries for u that exist in base_perts.
+    """
+    idx = {p: j for j, p in enumerate(base_perts)}
+    O_in_base = [p for p in perts_O if p in idx]
+    if not O_in_base:
+        # degenerate: return empty dicts (caller should fall back gracefully)
+        return [dict() for _ in w_per_ds_O]
+
+    jO = np.array([idx[p] for p in O_in_base], dtype=int)
+    M = len(w_per_ds_O)
+    w_per_ds_U: list[dict[str, float]] = [dict() for _ in range(M)]
+
+    for u in perts_U:
+        if u not in idx:
+            continue
+        ju = idx[u]
+        sims = base_kernel[ju, jO].astype(np.float32)
+        # keep positive sims only (avoid noisy negatives)
+        sims = np.where(np.isfinite(sims), sims, 0.0)
+        sims[sims < 0] = 0.0
+        if sims.sum() <= 0:
+            continue
+        # pick top-k
+        if topk > 0 and topk < sims.size:
+            top_idx = np.argpartition(sims, -topk)[-topk:]
+            sims_k = sims[top_idx]
+            O_k = [O_in_base[t] for t in top_idx]
+        else:
+            sims_k = sims
+            O_k = O_in_base
+        sw = float(sims_k.sum())
+        if sw <= 0:
+            continue
+        weights_O_norm = (sims_k / sw).tolist()
+        # transfer average per-pert weights
+        for i in range(M):
+            acc = 0.0
+            for q, alpha in zip(O_k, weights_O_norm):
+                acc += alpha * float(w_per_ds_O[i].get(q, 0.0))
+            if acc > 0:
+                w_per_ds_U[i][u] = acc
+    return w_per_ds_U
+
+
+def aggregate_kernels_pwmean(
+    kernels_and_perts: list[tuple[np.ndarray, list[str]]],
+    perts_union: list[str],
+    w_per_ds_O: list[dict[str, float]],
+    w_per_ds_U: list[dict[str, float]],
+    pair_rule: str = "geom",
+    eps: float = 1e-6,
+) -> np.ndarray:
+    """
+    Per-perturbation weighted mean aggregation over union perts.
+    For each dataset i, we prepare a per-pert weight vector W_i over union P,
+    then form pair weights W_i(p,q) via sqrt(W_i(p)W_i(q)) or min rule.
+    Coverage-aware normalization per pair.
+    """
+    P = len(perts_union)
+    index = {p: j for j, p in enumerate(perts_union)}
+    M = len(kernels_and_perts)
+
+    # Build W (M x P): per-dataset weight per pert (0 if unknown)
+    W = np.zeros((M, P), dtype=np.float32)
+    for i in range(M):
+        for p, w in w_per_ds_O[i].items():
+            if p in index:
+                W[i, index[p]] = max(0.0, float(w))
+        for u, w in w_per_ds_U[i].items():
+            if u in index:
+                W[i, index[u]] = max(W[i, index[u]], max(0.0, float(w)))  # prefer positive estimate
+
+    # Build per-dataset availability masks, and align kernels to union
+    K_aligned = []
+    A_masks = []  # per-pert availability (P,)
+    for (K_i, perts_i) in kernels_and_perts:
+        avail = np.zeros(P, dtype=bool)
+        idx_i = {p: j for j, p in enumerate(perts_i)}
+        sel = [index[p] for p in perts_i if p in index]
+        A = np.full((P, P), np.nan, dtype=np.float32)
+        if sel:
+            J = np.array([idx_i[perts_union[s]] for s in sel], dtype=int)
+            A[np.ix_(sel, sel)] = K_i[np.ix_(J, J)].astype(np.float32)
+            avail[sel] = True
+        K_aligned.append(A)
+        A_masks.append(avail)
+
+    # Aggregate
+    num = np.zeros((P, P), dtype=np.float32)
+    den = np.zeros((P, P), dtype=np.float32)
+    for i in range(M):
+        wi = W[i, :]  # (P,)
+        if pair_rule == "geom":
+            Wi = np.sqrt(np.maximum(0.0, wi)[:, None] * np.maximum(0.0, wi)[None, :])
+        else:  # "min"
+            Wi = np.minimum(wi[:, None], wi[None, :])
+        mask = np.outer(A_masks[i], A_masks[i])  # pairs available in dataset i
+        Ki = np.where(mask, K_aligned[i], np.nan)
+        # coverage-aware weighted mean
+        num += np.nan_to_num(Wi * Ki, nan=0.0)
+        den += np.where(np.isnan(Ki), 0.0, Wi)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        K_agg = num / den
+    K_agg = np.nan_to_num(K_agg, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # finalize
+    K_agg = 0.5 * (K_agg + K_agg.T)
+    np.fill_diagonal(K_agg, 1.0)
+    K_agg = K_agg + eps * np.eye(P, dtype=np.float32)
+    return K_agg.astype(np.float32)
+
 def aggregate_kernels(
     kernels_and_perts: list[tuple[np.ndarray, list[str]]],
-    method: str = "mean",     # {"mean","max"}
+    method: str = "mean",     
     eps: float = 1e-6,
+    weights: list[float] | None = None,
 ) -> tuple[np.ndarray, list[str]]:
     """
     Aggregate multiple per-dataset kernels into a single kernel over the union of perts.
@@ -237,6 +545,15 @@ def aggregate_kernels(
         K_agg = np.nanmean(S, axis=0)
     elif method == "max":
         K_agg = np.nanmax(S, axis=0)
+    elif method == "wmean":
+        if weights is None or len(weights) != len(items):
+            raise ValueError("aggregate_kernels(method='wmean') requires weights with length == #datasets.")
+        w = np.asarray(weights, dtype=np.float32).reshape(-1, 1, 1)  # (M,1,1)
+        mask = ~np.isnan(S)      # (M,P,P)
+        num = np.nansum(np.where(mask, w * S, 0.0), axis=0)  # (P,P)
+        den = np.sum(np.where(mask, w, 0.0), axis=0)         # (P,P)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            K_agg = num / den
     else:
         raise ValueError(f"Unknown aggregation method {method!r}; use 'mean' or 'max'.")
 
@@ -632,6 +949,8 @@ def evaluate_model(
     print(f"Pseudobulk MAE (mean over perts):   {np.mean(list(bulk_mae_per_pert.values())):.5f}")
     print(f"Perturbation similarity (pred mean effects): mean corr={mean_corr:.4f}, min corr={min_corr:.4f}")
     print(f"PDS (mean over perts): {PDS_mean:.4f}")
+    print("\nPDS per perturbation:")
+    print(dict(zip(perts, PDS_scores)))
     print("\nKnockdown efficiency per perturbation (target gene, true_abs, true_pct, pred_abs, pred_pct):")
     # show a few lines sorted by true_abs descending
     preview = sorted(kd_eff.items(), key=lambda kv: (np.nan_to_num(kv[1]['true_abs'], nan=-1e9)), reverse=True)
@@ -740,8 +1059,6 @@ def main():
     # ---------------------------
     # Build per-dataset kernels and aggregate
     # ---------------------------
-    perts_O = pert_list(adata_train_int, args.target_label, args.control_label)
-    perts_U = pert_list(eval_adata_int,  args.target_label, args.control_label)
     # which externals to use
     if using_external_list:
         src_list = adata_sources_list
@@ -763,7 +1080,83 @@ def main():
     if len(kernels_and_perts) == 0:
         raise ValueError("No valid per-dataset kernels were constructed.")
 
-    K_full, perts_union = aggregate_kernels(kernels_and_perts, method=args.kernel_agg)
+    if args.kernel_agg == "wmean":
+        # global weights from alignment with target train O×O
+        perts_O = pert_list(adata_train_int, args.target_label, args.control_label)
+        weights, raw_scores = compute_global_kernel_weights(
+            kernels_and_perts=kernels_and_perts,
+            adata_train_target=adata_train_int,
+            target_label=args.target_label,
+            control_label=args.control_label,
+            perts_O=perts_O,
+            gamma=args.kernel_weight_gamma,
+        )
+        print(f"[wmean] raw_scores per dataset: {np.round(np.array(raw_scores), 4).tolist()}")
+        print(f"[wmean] normalized weights    : {np.round(np.array(weights), 4).tolist()}")
+        K_full, perts_union = aggregate_kernels(
+            kernels_and_perts,
+            method="wmean",
+            weights=weights,
+        )
+    elif args.kernel_agg == "pwmean":
+        # 1) Union order (same as other aggregators)
+        #    Reuse aggregate_kernels to get perts_union cheaply (we'll overwrite K afterward)
+        K_tmp, perts_union = aggregate_kernels(kernels_and_perts, method="mean")
+        # 2) Build a base kernel for neighbor transfer to U
+        perts_O = pert_list(adata_train_int, args.target_label, args.control_label)
+        # Try global weighted mean for base if multiple datasets; else mean
+        if len(kernels_and_perts) > 1:
+            weights_base, scores_base = compute_global_kernel_weights(
+                kernels_and_perts=kernels_and_perts,
+                adata_train_target=adata_train_int,
+                target_label=args.target_label,
+                control_label=args.control_label,
+                perts_O=perts_O,
+                gamma=args.kernel_weight_gamma,
+            )
+            K_base, perts_union_base = aggregate_kernels(
+                kernels_and_perts, method="wmean", weights=weights_base
+            )
+        else:
+            K_base, perts_union_base = K_tmp, perts_union
+        if perts_union_base != perts_union:
+            # align base to union order
+            idx_base = {p: j for j, p in enumerate(perts_union_base)}
+            sel = [idx_base[p] for p in perts_union if p in idx_base]
+            K_base = K_base[np.ix_(sel, sel)]
+        # 3) Per-pert weights on O
+        w_per_ds_O = compute_per_pert_weights_on_O(
+            kernels_and_perts=kernels_and_perts,
+            adata_train_target=adata_train_int,
+            target_label=args.target_label,
+            control_label=args.control_label,
+            perts_O=perts_O,
+            gamma=args.pw_gamma,
+            floor=args.pw_floor,
+        )
+        # 4) Transfer weights to U via neighbors in base kernel
+        perts_U = pert_list(eval_adata_int, args.target_label, args.control_label)
+        w_per_ds_U = estimate_weights_for_U_by_neighbors(
+            perts_U=perts_U,
+            perts_O=perts_O,
+            base_kernel=K_base,
+            base_perts=perts_union,
+            w_per_ds_O=w_per_ds_O,
+            topk=args.pw_topk,
+        )
+        # 5) Final per-pert weighted aggregation
+        K_full = aggregate_kernels_pwmean(
+            kernels_and_perts=kernels_and_perts,
+            perts_union=perts_union,
+            w_per_ds_O=w_per_ds_O,
+            w_per_ds_U=w_per_ds_U,
+            pair_rule=args.pw_pair_rule,
+        )
+    else:
+        K_full, perts_union = aggregate_kernels(
+            kernels_and_perts,
+            method=args.kernel_agg,   # {"mean","max"}
+        )
     print(f"Aggregated kernel: {K_full.shape} over {len(perts_union)} perts.")
 
     # Build "core" splits that *only* contain perts covered by the kernel union (plus controls).
