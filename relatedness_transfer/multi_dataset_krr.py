@@ -126,8 +126,128 @@ def parse_arguments():
     ap.add_argument("--emb_rbf_gamma", type=float, default=0.0,
                     help="RBF gamma; if 0, use median heuristic.")
 
+    # low rank mode
+    ap.add_argument("--lowrank_pca_r", type=int, default=0,
+                    help="If >0, run KRR in a rank-r PCA space learned from target TRAIN deltas, then reconstruct.")
+    ap.add_argument("--lowrank_gene_zscore", action="store_true",
+                    help="Z-score genes across TRAIN perts before PCA (undo after reconstruction).")
+    ap.add_argument("--kernel_pc_space_r", type=int, default=0,
+                    help="If >0, build per-dataset kernels in the target TRAIN PCA space of rank r before aggregation.")
+    ap.add_argument("--kernel_pc_gene_zscore", action="store_true",
+                    help="Z-score genes across TRAIN perts when fitting PCA (apply same transform to externals before projection).")
+
     args = ap.parse_args()
     return args
+def create_kernel_pc_space(
+    adata_panel: ad.AnnData,
+    *,
+    target_label: str,
+    control_label: str,
+    W_r: np.ndarray,           # (G, r) PCA loadings from target TRAIN
+    col_mean: np.ndarray,      # (G,) TRAIN per-gene mean
+    col_std: np.ndarray,       # (G,) TRAIN per-gene std (ones if not zscored)
+    genes_target: list[str],   # gene order used to fit W_r / col_mean / col_std
+    metric: str = "corr",      # "corr" or "cosine"
+) -> tuple[np.ndarray, list[str]]:
+    """
+    Project panel deltas into target TRAIN PCA space and compute a similarity kernel
+    between perturbations in that space.
+    Returns: (K_pc, perts_list)
+    """
+    # 1) deltas in panel gene space
+    deltas_panel, _ = compute_deltas(adata_panel, target_label, control_label)  # {pert: (G_panel,)}
+    perts = [p for p in adata_panel.obs[target_label].astype(str).unique().tolist()
+             if p != control_label and p in deltas_panel]
+    if not perts:
+        return np.zeros((0, 0), dtype=np.float32), []
+
+    # 2) align panel genes -> target PCA gene order (subset on intersection)
+    genes_panel = adata_panel.var_names.astype(str).tolist()
+    pos_t = {g: i for i, g in enumerate(genes_target)}
+    pos_p = {g: i for i, g in enumerate(genes_panel)}
+    common = [g for g in genes_target if g in pos_p]          # preserve target order
+    if len(common) < 10:
+        # not enough overlap to build a meaningful PC kernel
+        return np.zeros((0, 0), dtype=np.float32), []
+
+    Jt = np.array([pos_t[g] for g in common], dtype=int)
+    Jp = np.array([pos_p[g] for g in common], dtype=int)
+
+    # slice the stats/loadings to common genes
+    Wc = W_r[Jt, :]                  # (G_common, r)
+    mc = col_mean[Jt]                # (G_common,)
+    sc = col_std[Jt]                 # (G_common,)
+
+    # 3) stack panel deltas in common-gene order
+    Yp = np.stack([np.asarray(deltas_panel[p]).ravel()[Jp] for p in perts], axis=0).astype(np.float32)  # (P, Gc)
+
+    # 4) apply target TRAIN centering / (optional) z-scoring
+    Yc = Yp - mc[None, :]
+    sc_safe = np.where(sc > 1e-8, sc, 1.0).astype(np.float32)
+    Yc = Yc / sc_safe[None, :]
+
+    # 5) project to PC space and build similarity
+    T = (Yc @ Wc).astype(np.float32)   # (P, r)
+    if metric == "corr":
+        # corr between rows of T
+        K = np.corrcoef(T)
+    elif metric == "cosine":
+        from sklearn.metrics import pairwise_distances
+        K = 1.0 - pairwise_distances(T, metric="cosine")
+    else:
+        raise ValueError("metric must be 'corr' or 'cosine'")
+    K = np.nan_to_num(K, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    K = 0.5 * (K + K.T)
+    np.fill_diagonal(K, 1.0)
+    return K, perts
+
+def _build_pca_basis_from_train(
+    adata_train_target: ad.AnnData,
+    target_label: str,
+    control_label: str,
+    r: int,
+    gene_zscore: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
+    """
+    Returns:
+      W_r : (G, r) PCA loadings with orthonormal columns (approx; TruncatedSVD components^T)
+      T_O : (|O|, r) component scores for TRAIN perts (Y_O projected onto W_r)
+      col_mean : (G,) per-gene mean across TRAIN perts (added back later if gene_zscore=False)
+      col_std  : (G,) per-gene std across TRAIN perts (if gene_zscore=True; used to unscale)
+      perts_O_order : list[str] TRAIN perts used (order matches T_O rows)
+    """
+    # collect TRAIN deltas as (|O|, G)
+    deltas_O, _ = compute_deltas(adata_train_target, target_label, control_label)
+    perts_O_order = [p for p in adata_train_target.obs[target_label].astype(str).unique().tolist()
+                     if p != control_label and p in deltas_O]
+    if len(perts_O_order) == 0:
+        raise ValueError("No TRAIN deltas found to build PCA basis.")
+    Y_O = np.stack([np.asarray(deltas_O[p]).ravel() for p in perts_O_order], axis=0).astype(np.float32)  # (|O|, G)
+
+    # center and (optionally) z-score genes across TRAIN perts
+    col_mean = Y_O.mean(axis=0, dtype=np.float64).astype(np.float32)
+    Yc = Y_O - col_mean[None, :]
+    if gene_zscore:
+        col_std = Yc.std(axis=0, ddof=1, dtype=np.float64).astype(np.float32)
+        col_std = np.where(col_std > 1e-8, col_std, 1.0)
+        Yc = Yc / col_std[None, :]
+    else:
+        col_std = np.ones_like(col_mean, dtype=np.float32)
+
+    r_eff = max(1, min(r, Yc.shape[0], Yc.shape[1]))
+    # fast truncated SVD (no full covariance). components_: (r, G)
+    try:
+        from sklearn.decomposition import TruncatedSVD
+        svd = TruncatedSVD(n_components=r_eff, random_state=0)
+        T_O = svd.fit_transform(Yc).astype(np.float32)              # (|O|, r)
+        W_r = svd.components_.T.astype(np.float32, copy=True)       # (G, r)
+    except Exception:
+        # fallback to dense SVD
+        U, S, VT = np.linalg.svd(Yc, full_matrices=False)
+        T_O = (U[:, :r_eff] * S[:r_eff]).astype(np.float32)         # (|O|, r)
+        W_r = VT[:r_eff, :].T.astype(np.float32)                    # (G, r)
+
+    return W_r, T_O, col_mean, col_std, perts_O_order
 
 def create_kernel(
     adata_source_int: ad.AnnData,
@@ -731,6 +851,8 @@ def krr_predict_from_external(
     conf_max_var: float = 1.0,
     K_full: np.ndarray = None,
     perts_all: List[str] = None,
+    pca_r: int = 0,
+    pca_gene_zscore: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, list[str], np.ndarray, np.ndarray]:
     """
     Returns:
@@ -781,16 +903,46 @@ def krr_predict_from_external(
     KOO = K[np.ix_(iO, iO)]
     KUO = K[np.ix_(iU, iO)]
 
-    # ---- KRR: \hat Y_U = K_{UO} (K_{OO} + λI)^{-1} Y_O ----
-    A = np.linalg.solve(KOO + krr_lambda * np.eye(KOO.shape[0], dtype=KOO.dtype), Y_O)  # (|O|, G)
-    # sharpen neighbor mixing at prediction time
-    KUO_sharp = sharpen_neighbors(KUO, tau=kernel_gamma, topk=topk)
-    Y_U_hat_delta = KUO_sharp @ A  # (|U|, G)
-
-    # --- Estimate per-gene residual variance on training perts (noise model)
-    Y_O_hat = KOO @ A                           # (|O|, G), fitted deltas for O
-    resid = Y_O - Y_O_hat                       # (|O|, G)
-    sigma2_gene = (resid ** 2).mean(axis=0)     # (G,)
+    # ---- KRR solve & prediction (full rank or low-rank PCA) ----
+    if pca_r and pca_r > 0:
+        # Learn PCA on TRAIN deltas, project to component scores
+        W_r, T_O, col_mean, col_std, perts_O_pca = _build_pca_basis_from_train(
+            adata_train_target=adata_train,
+            target_label=target_label,
+            control_label=control_label,
+            r=int(pca_r),
+            gene_zscore=bool(pca_gene_zscore),
+        )  # W_r:(G,r), T_O:(|O|,r)
+        # Align T_O rows to the O-order used to form KOO/KUO
+        if perts_O_pca != O:
+            pos = {p:i for i,p in enumerate(perts_O_pca)}
+            T_O = T_O[np.asarray([pos[p] for p in O], dtype=int), :]
+        # Solve once for all components and predict scores for U
+        A_comp = np.linalg.solve(KOO + krr_lambda * np.eye(KOO.shape[0], dtype=KOO.dtype), T_O)  # (|O|, r)
+        KUO_sharp = sharpen_neighbors(KUO, tau=kernel_gamma, topk=topk)
+        Z_U = KUO_sharp @ A_comp                                                                  # (|U|, r)
+        # Reconstruct gene-space deltas for U
+        Y_U_hat_centered = Z_U @ W_r.T                                                            # (|U|, G)
+        if pca_gene_zscore:
+            Y_U_hat_delta = (Y_U_hat_centered * col_std[None, :]) + col_mean[None, :]
+        else:
+            Y_U_hat_delta = Y_U_hat_centered + col_mean[None, :]
+        # Training fit (for variance) in gene space
+        Y_O_hat_centered = (KOO @ A_comp) @ W_r.T                                                 # (|O|, G)
+        if pca_gene_zscore:
+            Y_O_hat = (Y_O_hat_centered * col_std[None, :]) + col_mean[None, :]
+        else:
+            Y_O_hat = Y_O_hat_centered + col_mean[None, :]
+        resid = Y_O - Y_O_hat                                                                      # (|O|, G)
+        sigma2_gene = (resid ** 2).mean(axis=0)                                                    # (G,)
+    else:
+        # Original full-rank path on genes
+        A = np.linalg.solve(KOO + krr_lambda * np.eye(KOO.shape[0], dtype=KOO.dtype), Y_O)         # (|O|, G)
+        KUO_sharp = sharpen_neighbors(KUO, tau=kernel_gamma, topk=topk)
+        Y_U_hat_delta = KUO_sharp @ A                                                              # (|U|, G)
+        Y_O_hat = KOO @ A                                                                          # (|O|, G)
+        resid = Y_O - Y_O_hat
+        sigma2_gene = (resid ** 2).mean(axis=0)
 
     # --- GP-style scalar uncertainty per eval pert based on kernel geometry
     # s2_raw[u] = k_uu - k_uO @ (KOO+λI)^(-1) @ k_Ou
@@ -1315,6 +1467,22 @@ def main():
     adata_train_int = adata_target_int[adata_target_int.obs.index.isin(adata_train.obs.index)].copy()
     eval_adata_int  = adata_target_int[adata_target_int.obs.index.isin(eval_adata.obs.index)].copy()
 
+    # --- Target TRAIN PCA basis for kernel-in-PC-space (optional) ---
+    if args.kernel_pc_space_r and args.kernel_pc_space_r > 0:
+        W_r_pc, T_O_pc, col_mean_pc, col_std_pc, perts_O_pc = _build_pca_basis_from_train(
+            adata_train_target=adata_train_int,     # use your train split
+            target_label=args.target_label,
+            control_label=args.control_label,
+            r=int(args.kernel_pc_space_r),
+            gene_zscore=bool(args.kernel_pc_gene_zscore),
+        )
+        genes_target_pc = adata_train_int.var_names.astype(str).tolist()
+        print(f"[pc-kernel] Using target TRAIN PCA rank={args.kernel_pc_space_r} "
+              f"({T_O_pc.shape[0]} perts, {len(genes_target_pc)} genes).")
+    else:
+        W_r_pc = col_mean_pc = col_std_pc = None
+        genes_target_pc = []
+
     # ---------------------------
     # Build per-dataset kernels and aggregate
     # ---------------------------
@@ -1328,14 +1496,26 @@ def main():
 
     kernels_and_perts = []
     for src_i in src_list:
-        K_i, perts_i = create_kernel(
-            adata_source_int=src_i,
-            adata_train_target=adata_train_int,   # isotonic is per-dataset vs target train
-            target_label=args.target_label,
-            control_label=args.control_label,
-            kernel_metric=args.kernel_metric,
-            iso_calibrate=args.iso_calibrate,
-        )
+        if args.kernel_pc_space_r and args.kernel_pc_space_r > 0:
+            K_i, perts_i = create_kernel_pc_space(
+                adata_panel=src_i,
+                target_label=args.target_label,
+                control_label=args.control_label,
+                W_r=W_r_pc,
+                col_mean=col_mean_pc,
+                col_std=col_std_pc,
+                genes_target=genes_target_pc,
+                metric=args.kernel_metric,
+            )
+        else:
+            K_i, perts_i = create_kernel(
+                adata_source_int=src_i,
+                adata_train_target=adata_train_int,   # isotonic is per-dataset vs target train
+                target_label=args.target_label,
+                control_label=args.control_label,
+                kernel_metric=args.kernel_metric,
+                iso_calibrate=args.iso_calibrate,
+            )
         if K_i.size and len(perts_i):
             kernels_and_perts.append((K_i, perts_i))
 
@@ -1485,6 +1665,8 @@ def main():
         conf_max_var=args.conf_max_var,
         K_full=K_full,
         perts_all=perts_union,
+        pca_r=args.lowrank_pca_r,
+        pca_gene_zscore=args.lowrank_gene_zscore,
     )
     # Overwrite rows (by pert name) into the AverageKnown baseline (eval split)
     name2row_ev = {p: i for i, p in enumerate(names_ev)}
@@ -1541,6 +1723,8 @@ def main():
             conf_max_var=args.conf_max_var,
             K_full=K_full,
             perts_all=perts_union,
+            pca_r=args.lowrank_pca_r,
+            pca_gene_zscore=args.lowrank_gene_zscore,
         )
         # Overwrite into train baseline
         name2row_tr = {p: i for i, p in enumerate(names_tr)}
