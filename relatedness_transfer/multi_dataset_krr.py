@@ -26,7 +26,7 @@ from load_pathways import load_pathway_sources, make_pathway_matrix  # YAML + pe
 
 
 def parse_arguments():
-    ap = argparse.ArgumentParser(description="Step0-aware MPNN to fit perturbed gene vectors on a small panel.")
+    ap = argparse.ArgumentParser(description="Multi dataset KRR for relatedness transfer.")
     # Basic and I/O options
     ap.add_argument("--in_h5ad", required=True, help="Small input AnnData object.")
     ap.add_argument("--external_h5ad", default="", help="Path to the external pseudobulked AnnData object.")
@@ -46,6 +46,7 @@ def parse_arguments():
     ap.add_argument("--keep_oov_perts", action="store_true", 
                     help="If set, keep perts that are not in the source∩target intersection (left as AverageKnown baseline). "
                          "If unset, drop those rows before evaluation/output.")
+    ap.add_argument("--run_diagnostics", action="store_true", help="Run diagnostic analyses on kernel relatedness.")
 
     # Train/test split and eval options
     ap.add_argument("--test_pct_perts", type=float, default=0.0,
@@ -138,6 +139,136 @@ def parse_arguments():
 
     args = ap.parse_args()
     return args
+
+# ---------- 1) corr-of-corrs (per-pert) ----------
+def report_corr_of_corrs(
+    K_true: np.ndarray,
+    perts_true: List[str],
+    externals: List[Tuple[np.ndarray, List[str], str]],
+    topn_per_pert: int = 5,
+) -> None:
+    """
+    For each perturbation p (from perts_true), compute Pearson correlation between:
+      - the true kernel row K_true[p, *] (excluding self),
+      - each external's kernel row K_ext[p, *] aligned to the same perts (excluding self).
+    Prints per-pert sorted scores to stdout.
+
+    externals: list of (K_ext, perts_ext, name)
+    """
+    perts_true = list(perts_true)
+    pos_true = {p: i for i, p in enumerate(perts_true)}
+    P = len(perts_true)
+
+    def _row_corr(x: np.ndarray, y: np.ndarray) -> float:
+        # Pearson, robust to constants / NaNs
+        m = np.isfinite(x) & np.isfinite(y)
+        m_sum = m.sum()
+        if m_sum < 3:
+            return np.nan
+        xa, ya = x[m], y[m]
+        vx = xa.var()
+        vy = ya.var()
+        if vx <= 1e-12 or vy <= 1e-12:
+            return np.nan
+        return float(np.corrcoef(xa, ya)[0, 1])
+
+    print("\n=== corr-of-corrs per perturbation (higher = better proxy) ===")
+    for p in perts_true:
+        i = pos_true[p]
+        # true reference row excluding self
+        x = K_true[i, :].astype(np.float64)
+        x = np.delete(x, i)  # drop self
+        labels_ref = perts_true[:i] + perts_true[i+1:]
+
+        scores = []
+        for K_ext, perts_ext, name in externals:
+            # align row p to the same non-self column set as in the true vector
+            if p not in perts_ext:
+                scores.append((name, np.nan))
+                continue
+            pos_ext = {q: j for j, q in enumerate(perts_ext)}
+            j = pos_ext[p]
+            # collect ext row over labels_ref intersection
+            cols = [pos_ext[q] for q in labels_ref if q in pos_ext]  # keep true order, skip missing
+            if len(cols) < max(3, int(0.05 * len(labels_ref))):  # too little overlap -> skip
+                scores.append((name, np.nan))
+                continue
+            y = K_ext[j, cols].astype(np.float64)
+            # also cut x to those same perts
+            m_idx = [k for k, q in enumerate(labels_ref) if q in pos_ext]
+            x_cut = x[m_idx]
+            cij = _row_corr(x_cut, y)
+            scores.append((name, cij))
+
+        # sort, print top-N
+        scores_sorted = sorted(scores, key=lambda t: (-(t[1] if np.isfinite(t[1]) else -np.inf)))
+        head = scores_sorted[:topn_per_pert]
+        sline = ", ".join([f"{nm}:{cij:.3f}" if np.isfinite(cij) else f"{nm}:nan" for nm, cij in head])
+        print(f"{p:>12s}  |  {sline}")
+
+# ---------- 2) Manhattan distances (true pairwise; predicted vs true cross) ----------
+def save_manhattan_distances(
+    Y_true: np.ndarray,
+    perts_true: List[str],
+    out_true_csv: str = "true_pairwise_l1.csv",
+    Y_pred: Optional[np.ndarray] = None,
+    perts_pred: Optional[List[str]] = None,
+    out_cross_csv: str = "pred_true_l1.csv",
+) -> Tuple[str, Optional[str]]:
+    """
+    Saves two CSVs:
+      - out_true_csv: P_true x P_true Manhattan (L1) distances between rows of Y_true (aligned to perts_true).
+      - out_cross_csv: if Y_pred is provided, P_pred x P_true L1 distances between Y_pred rows and Y_true rows
+                       over the INTERSECTION of perts (by name) and the SAME gene set (assumed already aligned).
+
+    Returns paths to the written CSVs (second may be None).
+    """
+    perts_true = list(perts_true)
+    # 2a) pairwise L1 on true
+    # Efficient: ||x - y||_1 = sum |x| + sum |y| - 2*sum min(x,y)  (but absolute is fine with vectorization)
+    Yt = np.asarray(Y_true, dtype=np.float32)
+    P_true = Yt.shape[0]
+    # Broadcasted absolute differences: might be large; do it in blocks if needed.
+    block = max(1, 4096 // max(1, Yt.shape[1]))  # simple heuristic to limit memory
+    D_true = np.zeros((P_true, P_true), dtype=np.float32)
+    for start in range(0, P_true, block):
+        end = min(P_true, start + block)
+        # (end-start, 1, G) vs (1, P_true, G) -> (end-start, P_true, G)
+        diffs = np.abs(Yt[start:end, None, :] - Yt[None, :, :])
+        D_true[start:end, :] = diffs.sum(axis=2)
+    df_true = pd.DataFrame(D_true, index=perts_true, columns=perts_true)
+    df_true.to_csv(out_true_csv)
+
+    # 2b) cross L1: predicted (rows) vs true (cols)
+    out2 = None
+    if Y_pred is not None and perts_pred is not None:
+        perts_pred = list(perts_pred)
+        # align to intersection of perts by name (keep true order on columns, pred order on rows)
+        set_true = set(perts_true)
+        rows_keep = [i for i, p in enumerate(perts_pred) if p in set_true]
+        cols_keep = [j for j, p in enumerate(perts_true) if p in set(perts_pred)]
+        if rows_keep and cols_keep:
+            Yp = np.asarray(Y_pred, dtype=np.float32)[rows_keep, :]
+            Yt_sub = Yt[cols_keep, :]
+            # Compute cross distances (P_pred_int x P_true_int)
+            block_r = max(1, 4096 // max(1, Yp.shape[1]))
+            D_cross = np.zeros((Yp.shape[0], Yt_sub.shape[0]), dtype=np.float32)
+            for start in range(0, Yp.shape[0], block_r):
+                end = min(Yp.shape[0], start + block_r)
+                diffs = np.abs(Yp[start:end, None, :] - Yt_sub[None, :, :])
+                D_cross[start:end, :] = diffs.sum(axis=2)
+            row_names = [perts_pred[i] for i in rows_keep]
+            col_names = [perts_true[j] for j in cols_keep]
+            df_cross = pd.DataFrame(D_cross, index=row_names, columns=col_names)
+            df_cross.to_csv(out_cross_csv)
+            out2 = out_cross_csv
+        else:
+            print("[save_manhattan_distances] Warning: no shared perts between predicted and true; skipping cross CSV.")
+
+    print(f"[save_manhattan_distances] wrote: {out_true_csv}" + (f", {out2}" if out2 else ""))
+    return out_true_csv, out2
+
+
 def create_kernel_pc_space(
     adata_panel: ad.AnnData,
     *,
@@ -1803,6 +1934,75 @@ def main():
     )
     with(open('kernel_similarity.pkl', 'wb')) as f:
         pkl.dump(neighbor_obj, f)
+
+    if args.run_diagnostics:
+        print("\n=== Running Diagnostics ===")
+        # ---------------------------
+        # [DIAG] Per-pert "corr-of-corrs" versus target ALL-perts kernel
+        # ---------------------------
+        try:
+            # Build TRUE kernel on ALL perts (train + eval) from target mean-effects
+            Y_all = np.vstack([
+                (true_tr - ctrl_mean_global[None, :]).astype(np.float32),
+                (true_ev - ctrl_mean_global[None, :]).astype(np.float32),
+            ])  # (|O|+|U|, G)
+            names_all = list(names_tr) + list(names_ev)
+
+            if args.kernel_metric == "corr":
+                Z = Y_all - Y_all.mean(axis=1, keepdims=True)
+                Z = Z / (np.linalg.norm(Z, axis=1, keepdims=True) + 1e-8)
+            else:  # cosine
+                Z = Y_all / (np.linalg.norm(Y_all, axis=1, keepdims=True) + 1e-8)
+            K_true_all = Z @ Z.T
+            np.fill_diagonal(K_true_all, 1.0)
+            K_true_all = 0.5 * (K_true_all + K_true_all.T)
+
+            # Labeled external kernels (unchanged)
+            labeled_externals = []
+            for i, (Ki, pertsi) in enumerate(kernels_and_perts):
+                label = (dataset_names[i] if i < len(dataset_names) else f"ds{i}")
+                labeled_externals.append((Ki, pertsi, label))
+
+            # Print corr-of-corrs for ALL perts
+            report_corr_of_corrs(
+                K_true=K_true_all,
+                perts_true=names_all,
+                externals=labeled_externals,
+                topn_per_pert=5,
+            )
+        except Exception as e:
+            print(f"[corr-of-corrs] skipped: {e}")
+
+        # ---------------------------
+        # [DIAG] Manhattan (L1) distance CSVs (ALL perts)
+        # ---------------------------
+        try:
+            # All-perts true deltas
+            Y_true_all = Y_all  # already centered above
+            # 1) Pairwise L1 among ALL perts
+            save_manhattan_distances(
+                Y_true=Y_true_all, perts_true=names_all,
+                out_true_csv="true_L1_all.csv",
+            )
+
+            # 2) Pred (eval-only) vs TRUE (ALL-perts) cross L1, with columns = ALL perts
+            if pred_ev is not None:
+                Y_pred_allrows = (pred_ev - ctrl_mean_global[None, :]).astype(np.float32)  # (|U|, G)
+                # block-wise compute |U| x (|O|+|U|) L1
+                U = Y_pred_allrows.shape[0]
+                P = Y_true_all.shape[0]
+                D = np.zeros((U, P), dtype=np.float32)
+                # simple block to avoid big temporary tensors
+                block = max(1, 4096 // max(1, Y_true_all.shape[1]))
+                for s in range(0, U, block):
+                    e = min(U, s + block)
+                    diffs = np.abs(Y_pred_allrows[s:e, None, :] - Y_true_all[None, :, :])
+                    D[s:e, :] = diffs.sum(axis=2)
+                df_cross = pd.DataFrame(D, index=list(names_ev), columns=list(names_all))
+                df_cross.to_csv("pred_true_L1_all.csv")
+            print("[manhattan] wrote true_L1_all.csv" + (", pred_true_L1_all.csv" if pred_ev is not None else ""))
+        except Exception as e:
+            print(f"[manhattan] skipped: {e}")
 
     print("\n✨ Done!")
 
