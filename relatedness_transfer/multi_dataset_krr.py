@@ -46,6 +46,8 @@ def parse_arguments():
     ap.add_argument("--keep_oov_perts", action="store_true", 
                     help="If set, keep perts that are not in the source∩target intersection (left as AverageKnown baseline). "
                          "If unset, drop those rows before evaluation/output.")
+    ap.add_argument("--external_as_tsv_deltas", action="store_true",
+                    help="If set, entries in --external_list are TSV files with genes as rows and perts as columns; values are already deltas..")
     ap.add_argument("--run_diagnostics", action="store_true", help="Run diagnostic analyses on kernel relatedness.")
 
     # Train/test split and eval options
@@ -139,6 +141,27 @@ def parse_arguments():
 
     args = ap.parse_args()
     return args
+
+def create_kernel_from_tsv_deltas(
+    fname: str,
+    target_perts: list[str],
+) -> tuple[np.ndarray, list[str]]:
+    """
+    Read a TSV where rows=genes, columns=perts, values=delta (already computed).
+    Intersect columns with target_perts, compute perts×perts correlation via df.corr().
+    Returns (K, perts) with K float32, symmetrized, diag=1.
+    """
+    df = pd.read_csv(fname, sep="\t", index_col=0)
+    # columns are perts in this format
+    cols = [str(c) for c in df.columns]
+    keep = [p for p in target_perts if p in cols]
+    if len(keep) < 2:
+        return np.zeros((0, 0), dtype=np.float32), []
+    K = df[keep].corr().to_numpy(dtype=np.float32)
+    K = np.nan_to_num(K, nan=0.0, posinf=0.0, neginf=0.0)
+    K = 0.5 * (K + K.T)
+    np.fill_diagonal(K, 1.0)
+    return K, keep
 
 # ---------- 1) corr-of-corrs (per-pert) ----------
 def report_corr_of_corrs(
@@ -1548,22 +1571,27 @@ def main():
 
     using_external_list = len(external_paths) > 0
     if using_external_list:
-        print(f"Found {len(external_paths)} external dataset(s) from list. Reading & intersecting perts (target unchanged)...")
-        adata_sources_list = [
-            read_and_intersect(
-                ext_path=p,
-                adata_target=adata_target,
-                target_label=args.target_label,
-                control_label=args.control_label,
-                already_logged=args.already_logged,
-            )
-            for p in external_paths
-        ]
-        # For now (until kernel aggregation is wired), use the first as the active external
-        # so the rest of the pipeline remains unchanged.
-        if len(adata_sources_list) == 0:
-            raise ValueError("`--external_list` was provided but no valid paths were found.")
-        adata_source = adata_sources_list[0]
+        if getattr(args, "external_as_tsv_deltas", False):
+            print(f"Found {len(external_paths)} external TSV-delta file(s) from list (target unchanged)...")
+            tsv_sources_list = list(external_paths)  # keep as paths; we build kernels later
+            adata_sources_list = []                  # unused in TSV mode
+            # Set a placeholder so downstream branches that expect 'adata_source' don’t fail
+            adata_source = None
+        else:
+            print(f"Found {len(external_paths)} external dataset(s) from list. Reading & intersecting perts (target unchanged)...")
+            adata_sources_list = [
+                read_and_intersect(
+                    ext_path=p,
+                    adata_target=adata_target,
+                    target_label=args.target_label,
+                    control_label=args.control_label,
+                    already_logged=args.already_logged,
+                )
+                for p in external_paths
+            ]
+            if len(adata_sources_list) == 0:
+                raise ValueError("`--external_list` was provided but no valid paths were found.")
+            adata_source = adata_sources_list[0]
     else:
         # Legacy single-external path, but route through read_and_intersect for consistency.
         adata_source = read_and_intersect(
@@ -1621,32 +1649,45 @@ def main():
     perts_U = pert_list(eval_adata_int,  args.target_label, args.control_label)
     # which externals to use
     if using_external_list:
-        src_list = adata_sources_list
+        if getattr(args, "external_as_tsv_deltas", False):
+            src_list = tsv_sources_list  # list of file paths (TSV deltas)
+        else:
+            src_list = adata_sources_list  # list of AnnData externals
     else:
         src_list = [adata_source]
 
     kernels_and_perts = []
     for src_i in src_list:
-        if args.kernel_pc_space_r and args.kernel_pc_space_r > 0:
-            K_i, perts_i = create_kernel_pc_space(
-                adata_panel=src_i,
-                target_label=args.target_label,
-                control_label=args.control_label,
-                W_r=W_r_pc,
-                col_mean=col_mean_pc,
-                col_std=col_std_pc,
-                genes_target=genes_target_pc,
-                metric=args.kernel_metric,
+        if using_external_list and getattr(args, "external_as_tsv_deltas", False):
+            # Build kernel directly from a TSV of precomputed deltas (rows=genes, cols=perts)
+            # Intersect to *target* perts (O∪U) so ordering matches downstream expectations.
+            perts_all = list(dict.fromkeys(list(perts_O) + list(perts_U)))  # O∪U, order-preserving
+            K_i, perts_i = create_kernel_from_tsv_deltas(
+                fname=src_i,
+                target_perts=perts_all,
             )
         else:
-            K_i, perts_i = create_kernel(
-                adata_source_int=src_i,
-                adata_train_target=adata_train_int,   # isotonic is per-dataset vs target train
-                target_label=args.target_label,
-                control_label=args.control_label,
-                kernel_metric=args.kernel_metric,
-                iso_calibrate=args.iso_calibrate,
-            )
+            if args.kernel_pc_space_r and args.kernel_pc_space_r > 0:
+                K_i, perts_i = create_kernel_pc_space(
+                    adata_panel=src_i,
+                    adata_train_target=adata_train_int,
+                    target_label=args.target_label,
+                    control_label=args.control_label,
+                    kernel_metric=args.kernel_metric,
+                    iso_calibrate=args.iso_calibrate,
+                    W_r_pc=W_r_pc, T_O_pc=T_O_pc, col_mean_pc=col_mean_pc, col_std_pc=col_std_pc,
+                    perts_O_pc=perts_O_pc, genes_target_pc=genes_target_pc,
+                    gene_zscore=bool(args.kernel_pc_gene_zscore),
+                )
+            else:
+                K_i, perts_i = create_kernel(
+                    adata_source_int=src_i,
+                    adata_train_target=adata_train_int,   # isotonic is per-dataset vs target train
+                    target_label=args.target_label,
+                    control_label=args.control_label,
+                    kernel_metric=args.kernel_metric,
+                    iso_calibrate=args.iso_calibrate,
+                )
         if K_i.size and len(perts_i):
             kernels_and_perts.append((K_i, perts_i))
 
