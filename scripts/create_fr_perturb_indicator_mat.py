@@ -29,8 +29,18 @@ def create_indicator_matrix(adata_file, target_label, control_label, output_file
 
     print(f"Using '{target_label}' column to create matrix.")
     
-    # Ensure the column is treated as strings, handling potential NaNs
-    pert_series = adata.obs[target_label].fillna('').astype(str)
+    # Get the series
+    pert_series = adata.obs[target_label]
+
+    # Handle categorical type, which errors on fillna with new category
+    if pd.api.types.is_categorical_dtype(pert_series):
+        print("  Column is categorical. Converting to generic object type before filling NaNs.")
+        # Convert to generic object type *first*
+        # This keeps NaNs as np.nan, which fillna can then handle
+        pert_series = pert_series.astype(object) 
+    
+    # Now it's safe to fill NaNs with '' and convert to string
+    pert_series = pert_series.fillna('').astype(str)
 
     # --- 3. Create Binary Matrix using get_dummies ---
     # This is the most efficient way to do this.
