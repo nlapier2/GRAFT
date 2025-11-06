@@ -139,6 +139,8 @@ def parse_arguments():
     ap.add_argument("--kernel_pc_gene_zscore", action="store_true",
                     help="Z-score genes across TRAIN perts when fitting PCA (apply same transform to externals before projection).")
 
+    ap.add_argument("--impute_missing_from_first", action="store_true", help="KRR-impute missing perturbation rows using first external.")
+
     args = ap.parse_args()
     return args
 
@@ -411,6 +413,8 @@ def create_kernel(
     kernel_metric: str = "corr",     # {"corr","cosine"}
     iso_calibrate: bool = False,     # match current flag semantics
     eps: float = 1e-6,               # tiny PSD nudge
+    impute_from_main: Optional[ad.AnnData] = None,  # NEW: donor AnnData (first external) or None
+    impute_lambda: float = 0.01,                     # NEW: regularization for KRR imputation
 ) -> tuple[np.ndarray, list[str]]:
     """
     Build a perturbation kernel from ONE external dataset, with optional isotonic calibration
@@ -432,6 +436,69 @@ def create_kernel(
     # Keep only perts that truly exist in this source's delta dict (paranoia)
     perts = [p for p in perts if p in deltas_src_dict]
     D_src = np.stack([np.asarray(deltas_src_dict[p]).ravel() for p in perts], axis=0).astype(np.float32)
+    genes_src = adata_source_int.var_names.astype(str).tolist()
+
+    # --- Optional: KRR-impute missing perts from the first external (donor) ---
+    if impute_from_main is not None:
+        try:
+            # Donor deltas
+            deltas_main_dict, _ = compute_deltas(impute_from_main, target_label, control_label)
+            perts_main = [p for p in deltas_main_dict.keys()]
+            genes_main = impute_from_main.var_names.astype(str).tolist()
+            # Missing perts (present in donor, absent here) and overlap perts
+            set_src = set(perts)
+            perts_missing = [p for p in perts_main if p not in set_src]
+            perts_overlap = [p for p in perts if p in deltas_main_dict]
+
+            if len(perts_missing) > 0 and len(perts_overlap) >= 2:
+                # Gene intersection (preserve source order)
+                set_gm = set(genes_main)
+                genes_int = [g for g in genes_src if g in set_gm]
+                if len(genes_int) >= 5:
+                    # Build aligned matrices over genes_int
+                    pos_g_src  = {g: j for j, g in enumerate(genes_src)}
+                    pos_g_main = {g: j for j, g in enumerate(genes_main)}
+                    Jg_src  = [pos_g_src[g]  for g in genes_int]
+                    Jg_main = [pos_g_main[g] for g in genes_int]
+
+                    # Y_O: current panel deltas for overlap perts (|O| x G_int)
+                    Y_O = np.stack([np.asarray(deltas_src_dict[p]).ravel() for p in perts_overlap], axis=0).astype(np.float32)[:, Jg_src]
+                    # Donor matrices for kernel construction
+                    Y_M = np.stack([np.asarray(deltas_main_dict[p]).ravel() for p in perts_overlap], axis=0).astype(np.float32)[:, Jg_main]  # (|O| x G_int)
+                    Y_U_donor = np.stack([np.asarray(deltas_main_dict[p]).ravel() for p in perts_missing], axis=0).astype(np.float32)[:, Jg_main]  # (|U| x G_int)
+
+                    # Build donor kernel blocks (metric-aligned with your kernel path)
+                    if kernel_metric == "corr":
+                        Z_O = Y_M - Y_M.mean(axis=1, keepdims=True)
+                        Z_O = Z_O / (np.linalg.norm(Z_O, axis=1, keepdims=True) + 1e-8)
+                        Z_U = Y_U_donor - Y_U_donor.mean(axis=1, keepdims=True)
+                        Z_U = Z_U / (np.linalg.norm(Z_U, axis=1, keepdims=True) + 1e-8)
+                        K_OO = (Z_O @ Z_O.T).astype(np.float32)
+                        K_UO = (Z_U @ Z_O.T).astype(np.float32)
+                    else:  # cosine
+                        Z_O = Y_M / (np.linalg.norm(Y_M, axis=1, keepdims=True) + 1e-8)
+                        Z_U = Y_U_donor / (np.linalg.norm(Y_U_donor, axis=1, keepdims=True) + 1e-8)
+                        K_OO = (Z_O @ Z_O.T).astype(np.float32)
+                        K_UO = (Z_U @ Z_O.T).astype(np.float32)
+
+                    # KRR in pert space to impute missing rows in CURRENT panel gene space (genes_int)
+                    A = np.linalg.solve(
+                        K_OO + float(impute_lambda) * np.eye(K_OO.shape[0], dtype=np.float32),
+                        Y_O
+                    ).astype(np.float32)  # (|O| x G_int)
+                    Y_U_hat = (K_UO @ A).astype(np.float32)  # (|U| x G_int)
+
+                    # Append each imputed row into D_src (zeros outside genes_int to preserve width)
+                    for k, p in enumerate(perts_missing):
+                        row = np.zeros((len(genes_src),), dtype=np.float32)
+                        row[Jg_src] = Y_U_hat[k, :]
+                        D_src = np.vstack([D_src, row[None, :]])
+                        perts.append(p)
+            # else: nothing to impute or insufficient overlap; silently skip
+        except Exception:
+            # Be forgiving—if anything fails, continue without imputation
+            print('Exception during impuration: ', Exception)
+            pass
 
     # --- similarity on source deltas ---
     if kernel_metric == "corr":
@@ -1657,7 +1724,7 @@ def main():
         src_list = [adata_source]
 
     kernels_and_perts = []
-    for src_i in src_list:
+    for idx_src, src_i in enumerate(src_list):
         if using_external_list and getattr(args, "external_as_tsv_deltas", False):
             # Build kernel directly from a TSV of precomputed deltas (rows=genes, cols=perts)
             # Intersect to *target* perts (O∪U) so ordering matches downstream expectations.
@@ -1667,6 +1734,12 @@ def main():
                 target_perts=perts_all,
             )
         else:
+            # h5ad mode
+            # Choose donor (first external) only for subsequent externals
+            donor_main = None
+            if using_external_list and args.impute_missing_from_first and len(adata_sources_list) > 0:
+                donor_main = adata_sources_list[0] if idx_src > 0 else None
+
             if args.kernel_pc_space_r and args.kernel_pc_space_r > 0:
                 K_i, perts_i = create_kernel_pc_space(
                     adata_panel=src_i,
@@ -1687,6 +1760,8 @@ def main():
                     control_label=args.control_label,
                     kernel_metric=args.kernel_metric,
                     iso_calibrate=args.iso_calibrate,
+                    impute_from_main=donor_main,   # (None for the first dataset or if flag off)
+                    impute_lambda=float(args.krr_lambda),
                 )
         if K_i.size and len(perts_i):
             kernels_and_perts.append((K_i, perts_i))
