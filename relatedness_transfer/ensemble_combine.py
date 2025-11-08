@@ -3,7 +3,9 @@ import argparse
 from types import SimpleNamespace
 import numpy as np
 import scanpy as sc
-from multi_dataset_krr import evaluate_model  # same call sites throughout your code
+from multi_dataset_krr import evaluate_model, write_cell_level_predictions  # same call sites throughout your code
+import scipy.sparse as sp
+import pandas as pd
 
 def _pseudobulk_and_ctrl_mean(adata: sc.AnnData, target_label: str, control_label: str):
     """
@@ -111,6 +113,9 @@ def main():
     ap.add_argument("--control_label", required=True, help="Name used for control rows in target_label.")
     ap.add_argument("--mode", choices=["mean", "sum", "maxmag", "maxrank"], default="mean",
                     help="Rule for combining the two predicted delta matrices.")
+    ap.add_argument("--out_h5ad", default=None,
+                    help="If set, write a synthetic predicted AnnData here.")
+    ap.add_argument("--seed", type=int, default=0, help="Random seed for control-cell sampling.")
     args = ap.parse_args()
 
     # Load inputs
@@ -124,7 +129,7 @@ def main():
     pT, gT, cT, bulkT = _pseudobulk_and_ctrl_mean(AT, args.target_label, args.control_label)
 
     # Align across the three
-    perts, genes = _align_three(p1, g1, p2, g2, pT, gT)
+    perts, genes = pT, gT  # _align_three(p1, g1, p2, g2, pT, gT)
 
     # Build DELTAS in aligned order
     D1 = _deltas_from_bulk(perts, genes, c1, bulk1)       # (N,G)
@@ -147,6 +152,21 @@ def main():
         args=eval_args,
         pred_bundle=(E_pred, E_true, perts, cT.astype(np.float32)),
     )
+
+    # === Optional: write synthetic predicted AnnData (use proven helper) ===
+    if args.out_h5ad:
+        write_cell_level_predictions(
+            adata_test_orig=AT,              # ORIGINAL single-cell target AnnData
+            eval_gene_names=genes,           # column order of E_pred / D_ens
+            pred_mat_eval=E_pred.astype(np.float32),  # (N,G) expression, genes in `genes`
+            names_eval=perts,                # row order
+            ctrl_mean_eval=cT.astype(np.float32),     # control mean in `genes` order
+            target_label=args.target_label,
+            control_label=args.control_label,
+            out_path=args.out_h5ad,
+            random_state=args.seed,
+        )
+        print(f"[ensemble] wrote synthetic predicted AnnData → {args.out_h5ad}")
 
 if __name__ == "__main__":
     main()
