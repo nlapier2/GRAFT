@@ -12,7 +12,7 @@ from scipy import sparse
 from collections import defaultdict
 from sklearn.metrics import pairwise_distances
 
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import HuberRegressor, Ridge
 import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
@@ -46,6 +46,7 @@ def parse_arguments():
     ap.add_argument("--keep_oov_perts", action="store_true", 
                     help="If set, keep perts that are not in the source∩target intersection (left as AverageKnown baseline). "
                          "If unset, drop those rows before evaluation/output.")
+    ap.add_argument("--umi_median_csv", type=str, default=None, help='CSV of median UMI counts per perturbation.')
     ap.add_argument("--external_as_tsv_deltas", action="store_true",
                     help="If set, entries in --external_list are TSV files with genes as rows and perts as columns; values are already deltas..")
     ap.add_argument("--run_diagnostics", action="store_true", help="Run diagnostic analyses on kernel relatedness.")
@@ -1453,6 +1454,96 @@ def collect_top_neighbors_per_u(
 
     return out
 
+def umi_median_rescale(args,
+    names_tr: list[str],
+    names_ev: list[str],
+    pred_ev: np.ndarray,
+    true_tr: np.ndarray,
+    ctrl_mean_global: np.ndarray):
+    """
+    Rescale predicted test perturbation expression deltas based on UMI median per cell information.
+    """
+    df_umi = pd.read_csv(args.umi_median_csv)
+
+    required_cols = {"target_gene", "median_umi_per_cell"}
+    if not required_cols.issubset(set(df_umi.columns)):
+        print("[umi-mag-nn] CSV missing required columns "
+                f"{required_cols}; found {list(df_umi.columns)}. Skipping.")
+    else:
+        df_umi["target_gene"] = df_umi["target_gene"].astype(str)
+        umi_map = {
+            g: float(u)
+            for g, u in zip(
+                df_umi["target_gene"].tolist(),
+                df_umi["median_umi_per_cell"].astype(float).tolist(),
+            )
+        }
+
+        ctrl_label = str(args.control_label)
+        if ctrl_label not in umi_map:
+            print(f"[umi-mag-nn] Control label {ctrl_label!r} not found in UMI CSV; skipping.")
+        else:
+            umi_ctrl = float(umi_map[ctrl_label])
+
+            # --- Training magnitudes and |UMI diff| ---
+            # True deltas on train perts (rows aligned with names_tr)
+            d_true_tr = (true_tr - ctrl_mean_global[None, :]).astype(np.float32)  # (|O|, G)
+            m_true_tr = np.linalg.norm(d_true_tr, ord=1, axis=1)                  # true L1 magnitudes
+
+            train_diffs = []
+            train_mags = []
+            for i, p in enumerate(names_tr):
+                ps = str(p)
+                if ps == ctrl_label:
+                    continue
+                if ps not in umi_map:
+                    continue
+                diff = abs(umi_map[ps] - umi_ctrl)
+                train_diffs.append(diff)
+                train_mags.append(m_true_tr[i])
+
+            train_diffs = np.asarray(train_diffs, dtype=np.float32)
+            train_mags = np.asarray(train_mags, dtype=np.float32)
+
+            if train_diffs.size == 0:
+                print("[umi-mag-nn] No train perts with UMI info; skipping calibration.")
+            else:
+                # --- Test predicted deltas ---
+                d_pred_ev = (pred_ev - ctrl_mean_global[None, :]).astype(np.float32)  # (|U|, G)
+                m_pred_ev = np.linalg.norm(d_pred_ev, ord=1, axis=1)                  # (|U|,)
+
+                n_scaled = 0
+                for i, p in enumerate(names_ev):
+                    ps = str(p)
+                    if ps == ctrl_label:
+                        continue
+                    if ps not in umi_map:
+                        continue
+                    if train_diffs.size == 0:
+                        break
+
+                    diff_u = abs(umi_map[ps] - umi_ctrl)
+                    # distances in "UMI diff space" to all train perts
+                    dist = np.abs(train_diffs - diff_u)
+                    k = min(5, dist.size)
+                    if k == 0:
+                        continue
+                    # indices of k nearest train perts
+                    idx_nn = np.argpartition(dist, k - 1)[:k]
+                    target_mag = float(np.median(train_mags[idx_nn]))
+                    cur_mag = float(m_pred_ev[i])
+                    if cur_mag <= 0.0:
+                        continue
+                    s = target_mag / (cur_mag + 1e-8)
+                    d_pred_ev[i, :] *= s
+                    n_scaled += 1
+
+                pred_ev = (d_pred_ev + ctrl_mean_global[None, :]).astype(np.float32)
+                print(f"[umi-mag-nn] Scaled predicted TEST deltas for {n_scaled} perts "
+                        "using 5-NN in |median_umi - ctrl|.")
+    return pred_ev
+
+
 def evaluate_model(
     adata: ad.AnnData,
     args,
@@ -1927,6 +2018,34 @@ def main():
         names_ev = [p for (p, k) in zip(names_ev, keep) if k]
     # Use the AnnData with matching gene space for target overwrite indexing
     ad_train_for_eff = adata_train_int if args.intersect_genes else adata_train
+
+    # ------------------------------------------------------------------
+    # UMI-based magnitude calibration (simple NN on |median_umi - ctrl|)
+    # ------------------------------------------------------------------
+    if args.umi_median_csv is not None:
+        pred_ev = umi_median_rescale(args, names_tr, names_ev, pred_ev, true_tr, ctrl_mean_global)
+
+    # # === (One-off diagnostic) Rescale predicted DELTAS to match true DELTA L1 per-pert ===
+    # try:
+    #     # Helper to rescale in DELTA space, then map back to expression space
+    #     def _rescale_by_delta_l1(pred_X, true_X, ctrl_mean):
+    #         d_pred = (pred_X - ctrl_mean[None, :]).astype(np.float32)
+    #         d_true = (true_X - ctrl_mean[None, :]).astype(np.float32)
+    #         denom  = np.linalg.norm(d_pred, ord=1, axis=1) + 1e-8  # (N,)
+    #         target = np.linalg.norm(d_true, ord=1, axis=1)         # (N,)
+    #         scale  = (target / denom).astype(np.float32)           # (N,)
+    #         print("[cheat-rescale-delta] denom:", dict(zip(names_krr_ev, denom)))
+    #         print("[cheat-rescale-delta] target:", dict(zip(names_krr_ev, target)))
+    #         print("[cheat-rescale-delta] scales:", dict(zip(names_krr_ev, scale)))
+    #         d_pred_scaled = d_pred * scale[:, None]
+    #         return (d_pred_scaled + ctrl_mean[None, :]).astype(np.float32)
+
+    #     # Eval set
+    #     if 'pred_ev' in locals() and pred_ev is not None and 'true_ev' in locals() and true_ev is not None:
+    #         pred_ev = _rescale_by_delta_l1(pred_ev, true_ev, ctrl_mean_global)
+    #         print("[cheat-rescale-delta] matched DELTA L1 magnitudes for EVAL perts.")
+    # except Exception as e:
+    #     print(f"[cheat-rescale-delta] skipped: {e}")
 
     # Optional PDS sharpening in effect space (pred → Δ → sharpen → pred)
     if args.pds_sharpen != "none" and pred_ev.shape[0] > 0:
