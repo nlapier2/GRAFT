@@ -122,6 +122,18 @@ def main():
     A1 = sc.read_h5ad(args.pred1_h5ad)
     A2 = sc.read_h5ad(args.pred2_h5ad)
     AT = sc.read_h5ad(args.true_h5ad)
+    if np.max(A1.X) > 100:
+        print("[ensemble] normalizing/log1p first predicted AnnData")
+        sc.pp.normalize_total(A1, inplace=True)
+        sc.pp.log1p(A1)
+    if np.max(A2.X) > 100:
+        print("[ensemble] normalizing/log1p second predicted AnnData")
+        sc.pp.normalize_total(A2, inplace=True)
+        sc.pp.log1p(A2)
+    if np.max(AT.X) > 100:
+        print("[ensemble] normalizing/log1p true target AnnData")
+        sc.pp.normalize_total(AT, inplace=True)
+        sc.pp.log1p(AT)
 
     # Pseudobulk + control mean for each
     p1, g1, c1, bulk1 = _pseudobulk_and_ctrl_mean(A1, args.target_label, args.control_label)

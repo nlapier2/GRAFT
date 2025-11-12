@@ -2249,9 +2249,9 @@ def main():
 
         # Eval set
         if 'pred_ev' in locals() and pred_ev is not None and 'true_ev' in locals() and true_ev is not None:
-            pred_ev_cheat = _rescale_by_delta_l1(pred_ev, true_ev, ctrl_mean_global)
+            pred_ev_cheat = pred_ev  # _rescale_by_delta_l1(pred_ev, true_ev, ctrl_mean_global)
             pred_ev = pred_ev_cheat.copy() # Re-assign for next step, matches user logic
-            print("[cheat-rescale-delta] matched DELTA L1 magnitudes for EVAL perts.")
+            # print("[cheat-rescale-delta] matched DELTA L1 magnitudes for EVAL perts.")
     except Exception as e:
         print(f"[cheat-rescale-delta] skipped: {e}")
 
