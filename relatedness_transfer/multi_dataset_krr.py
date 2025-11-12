@@ -50,7 +50,12 @@ def parse_arguments():
     ap.add_argument("--external_as_tsv_deltas", action="store_true",
                     help="If set, entries in --external_list are TSV files with genes as rows and perts as columns; values are already deltas..")
     ap.add_argument("--run_diagnostics", action="store_true", help="Run diagnostic analyses on kernel relatedness.")
-
+    ap.add_argument("--sampling_var_topk_frac", type=float, default=0.0,
+                    help="Fraction of genes (by |delta|) to apply --sampling_var_topk_shrink to. 0.0 disables.")
+    ap.add_argument("--sampling_var_topk_shrink", type=float, default=0.1,
+                    help="Variance shrink factor (beta) for top-k genes.")
+    ap.add_argument("--sampling_var_other_inflate", type=float, default=1.0,
+                    help="Variance inflation/shrink factor (beta) for non-top-k genes. (Default 1.0 = keep original).")
     # Train/test split and eval options
     ap.add_argument("--test_pct_perts", type=float, default=0.0,
                     help="Fraction of perturbation labels (excluding control) to hold out for testing. 0.0 = no holdout.")
@@ -1245,6 +1250,9 @@ def write_cell_level_predictions(
     control_label: str,
     out_path: str,
     random_state: int | None = None,
+    sampling_var_topk_frac: float = 0.0,
+    sampling_var_topk_shrink: float = 0.1,
+    sampling_var_other_inflate: float = 1.0,
 ):
     """
     Build a cell-level predicted AnnData for the TEST set by:
@@ -1318,12 +1326,32 @@ def write_cell_level_predictions(
             print(f"[cells] WARNING: no prediction for pert '{p}' in pred_mat_eval; skipping synthesis for this pert.")
             continue
         pred_expr = pred_mat_eval[row]          # (G,)
-        delta_p = ctrl_mean_eval - pred_expr    # (G,)
         # sample control indices (with replacement if needed)
         replace = n_p > n_ctrl
         idx = rng.choice(n_ctrl, size=n_p, replace=replace)
         X_base = X_ctrl[idx]                    # (n_p, G)
-        X_syn = X_base - delta_p[None, :]       # subtract learned delta
+        ctrl_noise = X_base - ctrl_mean_eval[None, :] # (n_p, G)
+        # Determine per-gene variance scaling factor (beta_g)
+        beta_g = None
+        use_topk_variance = sampling_var_topk_frac > 0 and sampling_var_topk_frac <= 1.0
+        if use_topk_variance:
+            delta_p = ctrl_mean_eval - pred_expr
+            A = np.abs(delta_p)
+            k = np.maximum(1, int(round(sampling_var_topk_frac * G)))
+            if k < G:
+                idx_topk = np.argpartition(A, G - k)[-k:]
+                beta_g = np.full(G, float(sampling_var_other_inflate), dtype=np.float32)
+                beta_g[idx_topk] = float(sampling_var_topk_shrink)
+            # else: k=G, just use the 'topk' beta for all
+ 
+        if beta_g is None:
+            # No topk, or k=G: use a single global beta
+            global_beta = float(sampling_var_topk_shrink) if (use_topk_variance and k == G) else float(sampling_var_other_inflate)
+            beta_g = np.full(G, global_beta, dtype=np.float32) if global_beta != 1.0 else None
+
+        # Synthesize: X_syn = pred_expr + (X_base - ctrl_mean) * beta_g
+        X_syn = pred_expr[None, :] + (ctrl_noise * beta_g[None, :]) if beta_g is not None else pred_expr[None, :] + ctrl_noise
+
         np.maximum(X_syn, 0.0, out=X_syn)       # clamp
         # clone obs rows from sampled controls but set pert label to p
         obs_p = ctrl_obs.iloc[idx].copy()
@@ -1337,6 +1365,7 @@ def write_cell_level_predictions(
     obs_out = obs_out.loc[:, ~obs_out.columns.duplicated(keep="first")]
     # Build AnnData and write
     ad_out = ad.AnnData(X_out, obs=obs_out, var=var_df.copy())
+    ad_out.X = np.clip(ad_out.X, a_min=0.0, a_max=14.999)
     ad_out.layers = {}  # keep minimal; add if you want raw etc.
     print(f"[cells] Writing synthesized test predictions: {out_path} "
           f"(controls={ctrl_mask.sum()}, synthesized={X_out.shape[0] - ctrl_mask.sum()}, genes={G})")
@@ -1692,6 +1721,176 @@ def evaluate_model(
         "PDS_scores": dict(zip(perts, PDS_scores)),
     }
 
+def save_magnitude_diagnostics(
+    args,
+    names_tr: list[str], true_tr: np.ndarray, pred_tr: np.ndarray,
+    names_ev: list[str], true_ev: np.ndarray,
+    pred_ev_orig: np.ndarray | None,
+    pred_ev_umi: np.ndarray | None,
+    pred_ev_cheat: np.ndarray | None,
+    ctrl_mean_global: np.ndarray
+):
+    """
+    Calculates L1/L2 norms, raw sums, and percent positive signs for all
+    perturbation deltas (train and test) across all prediction versions
+    (true, orig, umi, cheat) and saves to a CSV.
+    """
+    print("[diag-mag] Collecting extended magnitudes for diagnostic CSV...")
+    
+    # --- Load UMI Info ---
+    umi_map = {}
+    umi_ctrl = np.nan
+    if args.umi_median_csv:
+        try:
+            df_umi = pd.read_csv(args.umi_median_csv)
+            required_cols = {"target_gene", "median_umi_per_cell"}
+            if required_cols.issubset(set(df_umi.columns)):
+                df_umi["target_gene"] = df_umi["target_gene"].astype(str)
+                umi_map = {
+                    g: float(u)
+                    for g, u in zip(
+                        df_umi["target_gene"].tolist(),
+                        df_umi["median_umi_per_cell"].astype(float).tolist(),
+                    )
+                }
+                ctrl_label = str(args.control_label)
+                if ctrl_label in umi_map:
+                    umi_ctrl = float(umi_map[ctrl_label])
+        except Exception as e:
+            print(f"[diag-mag] Warning: could not load UMI CSV: {e}")
+
+    # --- Helper to compute all stats for a matrix ---
+    def get_all_delta_stats(pred_mat, ctrl_mean):
+        """
+        Takes an (N, G) expression matrix and returns a dict of (N,) stat vectors.
+        """
+        if pred_mat is None:
+            return {"l1": None, "l2": None, "sum": None, "pct_pos": None}
+        
+        # Handle empty matrix (e.g., if pred_tr is None or empty)
+        if pred_mat.shape[0] == 0:
+            return {
+                "l1": np.array([]), "l2": np.array([]),
+                "sum": np.array([]), "pct_pos": np.array([])
+            }
+        
+        d_mat = (pred_mat - ctrl_mean[None, :]).astype(np.float32)
+        
+        mag_l1 = np.linalg.norm(d_mat, ord=1, axis=1)
+        mag_l2 = np.linalg.norm(d_mat, ord=2, axis=1)
+        raw_sum = np.sum(d_mat, axis=1)
+        # Use a small tolerance for "positive" to avoid float noise at zero
+        pct_pos = np.mean(d_mat > 1e-6, axis=1) * 100.0
+        
+        return {
+            "l1": mag_l1, "l2": mag_l2,
+            "sum": raw_sum, "pct_pos": pct_pos
+        }
+
+    # --- Process Train Set ---
+    diag_data = []
+    ctrl_label = str(args.control_label)
+    
+    stats_true_tr = get_all_delta_stats(true_tr, ctrl_mean_global)
+    stats_pred_tr = get_all_delta_stats(pred_tr, ctrl_mean_global) # From eval_on_train
+
+    for i, p in enumerate(names_tr):
+        ps = str(p)
+        umi_diff = np.nan
+        if ps in umi_map and not np.isnan(umi_ctrl):
+            umi_diff = abs(umi_map[ps] - umi_ctrl)
+            
+        row_data = {
+            "pert": ps,
+            "split": "train",
+            "umi_diff": umi_diff,
+            
+            "mag_true_l1": stats_true_tr["l1"][i],
+            "mag_true_l2": stats_true_tr["l2"][i],
+            "sum_true": stats_true_tr["sum"][i],
+            "pct_pos_true": stats_true_tr["pct_pos"][i],
+            
+            "mag_pred_orig_l1": stats_pred_tr["l1"][i] if stats_pred_tr["l1"] is not None else np.nan,
+            "mag_pred_orig_l2": stats_pred_tr["l2"][i] if stats_pred_tr["l2"] is not None else np.nan,
+            "sum_pred_orig": stats_pred_tr["sum"][i] if stats_pred_tr["sum"] is not None else np.nan,
+            "pct_pos_pred_orig": stats_pred_tr["pct_pos"][i] if stats_pred_tr["pct_pos"] is not None else np.nan,
+        }
+        # Add NaNs for UMI/Cheat columns in the train split
+        for model in ["umi", "cheat"]:
+            row_data[f"mag_pred_{model}_l1"] = np.nan
+            row_data[f"mag_pred_{model}_l2"] = np.nan
+            row_data[f"sum_pred_{model}"] = np.nan
+            row_data[f"pct_pos_pred_{model}"] = np.nan
+            
+        diag_data.append(row_data)
+
+    # --- Process Test Set ---
+    stats_true_ev = get_all_delta_stats(true_ev, ctrl_mean_global)
+    stats_pred_orig = get_all_delta_stats(pred_ev_orig, ctrl_mean_global)
+    stats_pred_umi = get_all_delta_stats(pred_ev_umi, ctrl_mean_global)
+    stats_pred_cheat = get_all_delta_stats(pred_ev_cheat, ctrl_mean_global)
+    
+    stats_sets = {
+        "true": stats_true_ev,
+        "orig": stats_pred_orig,
+        "umi": stats_pred_umi,
+        "cheat": stats_pred_cheat
+    }
+
+    for i, p in enumerate(names_ev):
+        ps = str(p)
+        umi_diff = np.nan
+        if ps in umi_map and not np.isnan(umi_ctrl):
+            umi_diff = abs(umi_map[ps] - umi_ctrl)
+            
+        row_data = {
+            "pert": ps,
+            "split": "test",
+            "umi_diff": umi_diff,
+        }
+        
+        # Add all stats for true, orig, umi, cheat
+        for model, stats in stats_sets.items():
+            model_key = "true" if model == "true" else f"pred_{model}"
+            for stat in ["l1", "l2", "sum", "pct_pos"]:
+                col_name = f"mag_{model_key}_{stat}" if stat.startswith("l") else f"{stat.replace('_','_')}_{model_key}"
+                
+                # Adjust column naming to match request
+                if stat == "l1": col_name = f"mag_{model_key}_l1"
+                elif stat == "l2": col_name = f"mag_{model_key}_l2"
+                elif stat == "sum": col_name = f"sum_{model_key}"
+                elif stat == "pct_pos": col_name = f"pct_pos_{model_key}"
+
+                row_data[col_name] = stats[stat][i] if (stats[stat] is not None) else np.nan
+        
+        diag_data.append(row_data)
+
+    # --- Save CSV ---
+    try:
+        df_diag = pd.DataFrame(diag_data)
+        
+        # Define the full column order
+        column_order = [
+            "pert", "split", "umi_diff",
+            
+            "mag_true_l1", "mag_true_l2", "sum_true", "pct_pos_true",
+            
+            "mag_pred_orig_l1", "mag_pred_orig_l2", "sum_pred_orig", "pct_pos_pred_orig",
+            
+            "mag_pred_umi_l1", "mag_pred_umi_l2", "sum_pred_umi", "pct_pos_pred_umi",
+            
+            "mag_pred_cheat_l1", "mag_pred_cheat_l2", "sum_pred_cheat", "pct_pos_pred_cheat",
+        ]
+        
+        # Filter to only columns that exist (in case one was all NaNs)
+        final_cols = [c for c in column_order if c in df_diag.columns]
+        df_diag = df_diag[final_cols]
+        
+        df_diag.to_csv("magnitude_diagnostics.csv", index=False)
+        print("[diag-mag] Saved extended magnitude_diagnostics.csv")
+    except Exception as e:
+        print(f"[diag-mag] FAILED to save diagnostic CSV: {e}")
+
 
 def main():
     args = parse_arguments()
@@ -1983,6 +2182,10 @@ def main():
     # Evaluate on the Test Set
     # ---------------------------
     print("\n=== Evaluation on {} set ===".format("TEST" if adata_test is not None else "TRAIN"))
+    # --- Placeholders for diagnostic snapshots ---
+    pred_ev_orig = None
+    pred_ev_umi = None
+    pred_ev_cheat = None
     if args.method != "krr":
         raise ValueError(f"Unknown method: {args.method}")
     # Run KRR ONLY on the intersected views; get predictions for intersected perts
@@ -2016,6 +2219,7 @@ def main():
         keep = np.array([p in set(names_krr_ev) for p in names_ev])
         pred_ev, true_ev = pred_ev[keep], true_ev[keep]
         names_ev = [p for (p, k) in zip(names_ev, keep) if k]
+    pred_ev_orig = pred_ev.copy() # Store original KRR predictions
     # Use the AnnData with matching gene space for target overwrite indexing
     ad_train_for_eff = adata_train_int if args.intersect_genes else adata_train
 
@@ -2024,28 +2228,32 @@ def main():
     # ------------------------------------------------------------------
     if args.umi_median_csv is not None:
         pred_ev = umi_median_rescale(args, names_tr, names_ev, pred_ev, true_tr, ctrl_mean_global)
+        pred_ev_umi = pred_ev.copy() # Store UMI-scaled predictions
 
-    # # === (One-off diagnostic) Rescale predicted DELTAS to match true DELTA L1 per-pert ===
-    # try:
-    #     # Helper to rescale in DELTA space, then map back to expression space
-    #     def _rescale_by_delta_l1(pred_X, true_X, ctrl_mean):
-    #         d_pred = (pred_X - ctrl_mean[None, :]).astype(np.float32)
-    #         d_true = (true_X - ctrl_mean[None, :]).astype(np.float32)
-    #         denom  = np.linalg.norm(d_pred, ord=1, axis=1) + 1e-8  # (N,)
-    #         target = np.linalg.norm(d_true, ord=1, axis=1)         # (N,)
-    #         scale  = (target / denom).astype(np.float32)           # (N,)
-    #         print("[cheat-rescale-delta] denom:", dict(zip(names_krr_ev, denom)))
-    #         print("[cheat-rescale-delta] target:", dict(zip(names_krr_ev, target)))
-    #         print("[cheat-rescale-delta] scales:", dict(zip(names_krr_ev, scale)))
-    #         d_pred_scaled = d_pred * scale[:, None]
-    #         return (d_pred_scaled + ctrl_mean[None, :]).astype(np.float32)
+    # === (One-off diagnostic) Rescale predicted DELTAS to match true DELTA L1 per-pert ===
+    try:
+        # Helper to rescale in DELTA space, then map back to expression space
+        def _rescale_by_delta_l1(pred_X, true_X, ctrl_mean):
+            d_pred = (pred_X - ctrl_mean[None, :]).astype(np.float32)
+            d_true = (true_X - ctrl_mean[None, :]).astype(np.float32)
+            denom  = np.linalg.norm(d_pred, ord=1, axis=1) + 1e-8  # (N,)
+            target = np.linalg.norm(d_true, ord=1, axis=1)         # (N,)
+            scale  = (target / denom).astype(np.float32)           # (N,)
+            print("[cheat-rescale-delta] denom:", dict(zip(names_krr_ev, denom)))
+            print("[cheat-rescale-delta] target:", dict(zip(names_krr_ev, target)))
+            print("[cheat-rescale-delta] scales:", dict(zip(names_krr_ev, scale)))
+            print("Mean rescale:", float(np.mean(scale)))
+            print("Median rescale:", float(np.median(scale)))
+            d_pred_scaled = d_pred * scale[:, None]
+            return (d_pred_scaled + ctrl_mean[None, :]).astype(np.float32)
 
-    #     # Eval set
-    #     if 'pred_ev' in locals() and pred_ev is not None and 'true_ev' in locals() and true_ev is not None:
-    #         pred_ev = _rescale_by_delta_l1(pred_ev, true_ev, ctrl_mean_global)
-    #         print("[cheat-rescale-delta] matched DELTA L1 magnitudes for EVAL perts.")
-    # except Exception as e:
-    #     print(f"[cheat-rescale-delta] skipped: {e}")
+        # Eval set
+        if 'pred_ev' in locals() and pred_ev is not None and 'true_ev' in locals() and true_ev is not None:
+            pred_ev_cheat = _rescale_by_delta_l1(pred_ev, true_ev, ctrl_mean_global)
+            pred_ev = pred_ev_cheat.copy() # Re-assign for next step, matches user logic
+            print("[cheat-rescale-delta] matched DELTA L1 magnitudes for EVAL perts.")
+    except Exception as e:
+        print(f"[cheat-rescale-delta] skipped: {e}")
 
     # Optional PDS sharpening in effect space (pred → Δ → sharpen → pred)
     if args.pds_sharpen != "none" and pred_ev.shape[0] > 0:
@@ -2070,6 +2278,7 @@ def main():
     # ---------------------------
     # (Optional) Evaluate on the Train Set
     # ---------------------------
+    pred_tr_for_diag = None # Placeholder for train-set diagnostics
     if args.eval_on_train and (adata_test is not None):
         print("\n=== Evaluation on TRAIN set ===")
         pred_krr_tr, _true_krr_tr, names_krr_tr, _ctrl_ignored, _pred_delta_var_tr = krr_predict_from_external(
@@ -2134,6 +2343,17 @@ def main():
             control_label=args.control_label,
         )
 
+    # --- Save Magnitude Diagnostics ---
+    save_magnitude_diagnostics(
+        args=args,
+        names_tr=names_tr, true_tr=true_tr, pred_tr=pred_tr_for_diag,
+        names_ev=names_ev, true_ev=true_ev,
+        pred_ev_orig=pred_ev_orig,
+        pred_ev_umi=pred_ev_umi,
+        pred_ev_cheat=pred_ev_cheat,
+        ctrl_mean_global=ctrl_mean_global
+    )
+
     # single cell predictions and output
     if (args.test_predict_out is not None and args.test_predict_out != "") and (adata_test_orig is not None):
         # Use the same evaluation gene space that pred_ev uses
@@ -2150,6 +2370,9 @@ def main():
             control_label=args.control_label,
             out_path=args.test_predict_out,
             random_state=getattr(args, "seed", None),
+            sampling_var_topk_frac=args.sampling_var_topk_frac,
+            sampling_var_topk_shrink=args.sampling_var_topk_shrink,
+            sampling_var_other_inflate=args.sampling_var_other_inflate,
         )
 
     # Optional human-readable names for each kernel (same order as kernels_and_perts):
