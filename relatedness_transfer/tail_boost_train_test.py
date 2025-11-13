@@ -272,27 +272,49 @@ def apply_boost_once(pred_delta: np.ndarray,
 
 
 def selection_accuracy(true_delta: np.ndarray,
+                       pred_delta: np.ndarray,
                        pos_selected: list[np.ndarray],
                        neg_selected: list[np.ndarray],
                        K_pos: int,
                        K_neg: int,
                        pert_names: list[str] | None = None) -> pd.DataFrame:
     """
-    Compute fraction of selected middle genes that truly belong to the top/bottom K for each perturbation.
-    Returns per-pert rows plus an 'overall' row with means (NaNs ignored).
+    Compute selection accuracy **against a middle-restricted oracle**:
+    - Freeze top-K_pos and bottom-K_neg by *predicted* deltas (same as the method).
+    - Define middle = all other genes.
+    - Oracle positive set = top-K_pos by *true* delta within the middle.
+      Oracle negative set = bottom-K_neg by *true* delta within the middle.
+    Report the fraction of your selected genes that match these oracle sets.
     """
     P, G = true_delta.shape
     assert len(pos_selected) == P and len(neg_selected) == P, "Selections must align with P."
     rows = []
     for i in range(P):
         td = true_delta[i]
-        top_idx = np.argpartition(-td, K_pos-1)[:K_pos] if K_pos > 0 else np.array([], dtype=int)
-        bot_idx = np.argpartition(td, K_neg-1)[:K_neg] if K_neg > 0 else np.array([], dtype=int)
-        top_set = set(map(int, top_idx)); bot_set = set(map(int, bot_idx))
+        xd = pred_delta[i]
+        # Freeze by predicted deltas (same as algorithm)
+        pos_frozen = topk_indices_desc(xd, K_pos)
+        neg_frozen = bottomk_indices_asc(xd, K_neg)
+        middle_mask = np.ones(G, dtype=bool)
+        middle_mask[pos_frozen] = False
+        middle_mask[neg_frozen] = False
+        middle = np.where(middle_mask)[0]
+        # Oracle sets: top-K_pos and bottom-K_neg within the middle by *true* delta
+        if K_pos > 0 and middle.size > 0:
+            mid_pos = middle[np.argsort(-td[middle], kind="mergesort")]
+            oracle_pos = mid_pos[:min(K_pos, mid_pos.size)]
+        else:
+            oracle_pos = np.array([], dtype=int)
+        if K_neg > 0 and middle.size > 0:
+            mid_neg = middle[np.argsort(td[middle], kind="mergesort")]
+            oracle_neg = mid_neg[:min(K_neg, mid_neg.size)]
+        else:
+            oracle_neg = np.array([], dtype=int)
+        pos_set = set(map(int, oracle_pos)); neg_set = set(map(int, oracle_neg))
         sel_pos = np.asarray(pos_selected[i], dtype=int)
         sel_neg = np.asarray(neg_selected[i], dtype=int)
-        pos_acc = np.nan if sel_pos.size == 0 else (np.isin(sel_pos, list(top_set)).sum() / sel_pos.size)
-        neg_acc = np.nan if sel_neg.size == 0 else (np.isin(sel_neg, list(bot_set)).sum() / sel_neg.size)
+        pos_acc = np.nan if sel_pos.size == 0 else (np.isin(sel_pos, list(pos_set)).sum() / sel_pos.size)
+        neg_acc = np.nan if sel_neg.size == 0 else (np.isin(sel_neg, list(neg_set)).sum() / sel_neg.size)
         rows.append({
             "pert_idx": i,
             "pert": pert_names[i] if pert_names is not None else i,
@@ -300,6 +322,8 @@ def selection_accuracy(true_delta: np.ndarray,
             "neg_sel": int(sel_neg.size),
             "pos_correct": np.nan if np.isnan(pos_acc) else float(pos_acc),
             "neg_correct": np.nan if np.isnan(neg_acc) else float(neg_acc),
+            "pos_oracle_size": int(len(pos_set)),
+            "neg_oracle_size": int(len(neg_set)),
         })
     df = pd.DataFrame(rows)
     overall = {
@@ -398,7 +422,7 @@ def main():
     if args.evaluate:
         true_delta_test = true_delta_all[test_idx, :]
         # Save selection accuracy regardless of evaluator availability
-        acc_df = selection_accuracy(true_delta_test, pos_boost_list, neg_boost_list,
+        acc_df = selection_accuracy(true_delta_test, pred_delta_test, pos_boost_list, neg_boost_list,
                                     K_pos=args.K, K_neg=args.K, pert_names=perts_test)
         acc_path = os.path.join(args.out_dir, f"selection_accuracy_TEST_{args.method}.csv")
         acc_df.to_csv(acc_path, index=False)
