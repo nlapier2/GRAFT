@@ -26,7 +26,10 @@ import argparse
 import numpy as np
 import pandas as pd
 import anndata as ad
-from typing import Tuple, List
+from typing import Tuple, List, Optional, Dict
+from load_pathways import load_pathway_sources, make_pathway_matrix
+from sklearn.decomposition import PCA
+
 
 # Optional evaluation import
 _EVAL_AVAILABLE = False
@@ -113,6 +116,93 @@ def load_gene_pathway_matrix(pathways_yaml: str, genes: List[str]) -> pd.DataFra
         var_names=genes,
     )
     return (gp > 0).astype(float)
+
+# ---- Pathways: read ALL sources and build PCA gene embeddings ----
+def load_all_pathway_matrices(pathways_yaml: str, genes: List[str]) -> Dict[str, pd.DataFrame]:
+    """
+    Returns dict {source_name: gene x pathways DataFrame} for ALL sources in YAML.
+    Keeps numeric values if present (no forced binarization).
+    """
+    srcs = load_pathway_sources(pathways_yaml)
+    if not srcs:
+        raise ValueError("No pathway sources found in YAML.")
+    out = {}
+    for name, meta in srcs.items():
+        m = make_pathway_matrix(
+            file_name=meta["file"],
+            gene_col=meta["gene_col"],
+            pathway_col=meta["pathway_col"],
+            format=meta["format"],
+            var_names=genes,
+        )
+        out[name] = m  # keep as-is (numeric or binary)
+    return out
+
+def build_gene_embeddings_all_sources(
+    genes: List[str],
+    perts_train: List[str],
+    perts_test: List[str],
+    pathways_yaml: str,
+    n_pcs: int = 256,
+    gamma_size_norm: float = 0.0,
+) -> Tuple[np.ndarray, float, pd.Index, List[str]]:
+    """
+    Concatenate all sources (column-wise) after filtering:
+      - keep only pathway columns that (i) appear in >=1 gene overall,
+        (ii) are present in at least one TRAIN perturbed gene and at least one TEST perturbed gene.
+    Optionally size-normalize columns by (#genes)^gamma_size_norm (default 0.0 = off).
+    Returns:
+      - PCs (G x n_pcs), cumulative variance explained (float 0..1),
+      - gene index (same order as 'genes'),
+      - list of kept pathway column names with source prefixes.
+    """
+    src2mtx = load_all_pathway_matrices(pathways_yaml, genes)
+    gene_index = pd.Index(genes)
+    # concat with source prefix to avoid column name collisions
+    mats = []
+    colnames = []
+    for src, df in src2mtx.items():
+        df = df.copy()
+        df.columns = [f"{src}::{c}" for c in df.columns]
+        mats.append(df.values)
+        colnames.extend(df.columns.tolist())
+    if not mats:
+        raise ValueError("No pathway matrices constructed.")
+    M = np.concatenate(mats, axis=1)           # shape (G, K_total)
+    colnames = list(colnames)                  # length K_total
+
+    # Presence-by-gene
+    gene_presence = np.any(M != 0, axis=0)     # K_total
+
+    # Determine presence in TRAIN and TEST perturbed genes
+    def rows_for(perts: List[str]) -> np.ndarray:
+        idx = gene_index.get_indexer(perts)
+        idx = idx[idx >= 0]
+        return idx
+    tr_rows = rows_for(perts_train)
+    te_rows = rows_for(perts_test)
+    present_train = np.any(M[tr_rows, :] != 0, axis=0) if tr_rows.size else np.zeros(M.shape[1], dtype=bool)
+    present_test  = np.any(M[te_rows, :] != 0, axis=0) if te_rows.size else np.zeros(M.shape[1], dtype=bool)
+
+    keep = gene_presence & present_train & present_test
+    if not np.any(keep):
+        raise ValueError("After filtering, no pathway columns remain that are present in both TRAIN and TEST.")
+    M = M[:, keep]
+    kept_cols = [c for c, k in zip(colnames, keep) if k]
+
+    # Optional size normalization: divide each column by (#genes with nonzero)^gamma
+    if gamma_size_norm and gamma_size_norm != 0.0:
+        sizes = np.sum(M != 0, axis=0).astype(float)
+        sizes = np.maximum(sizes, 1.0)
+        M = M / (sizes ** gamma_size_norm)[None, :]
+
+    # Center columns, do PCA
+    M_centered = M - np.mean(M, axis=0, keepdims=True)
+    n_pcs_eff = min(n_pcs, M_centered.shape[1])
+    pca = PCA(n_components=n_pcs_eff, svd_solver="auto", random_state=0)
+    PCs = pca.fit_transform(M_centered)        # shape (G, n_pcs_eff)
+    var_explained = float(np.sum(pca.explained_variance_ratio_))
+    return PCs, var_explained, gene_index, kept_cols
 
 
 # ---- Modular selectors ----
@@ -255,6 +345,182 @@ class PairScoreTailSelector(BaseTailSelector):
         pos_order = middle[np.argsort(-score[middle], kind="mergesort")]
         neg_order = middle[np.argsort(score[middle],  kind="mergesort")]
         return pos_order[:k_eff], neg_order[:k_eff]
+    
+
+# ---- NEW: Supervised selector with XGBoost over PCA gene embeddings ----
+class XGBTailSelector(BaseTailSelector):
+    """
+    Learn to pick middle genes for + and - tails with two XGBoost classifiers:
+      - Train labels from TRAIN perts only, using middle-restricted oracle top-K/bottom-K.
+      - Features: [x_p || x_g || x_p * x_g] where x_* are PCA embeddings of genes across ALL pathway sources.
+    Inference on TEST uses ONLY predicted deltas (for freezing) + learned model (no test truth).
+    """
+    def __init__(self,
+                 K: int,
+                 rng: np.random.Generator,
+                 PCs: np.ndarray,                 # (G, d)
+                 gene_index: pd.Index,
+                 xgb_params: dict):
+        super().__init__(K)
+        self.rng = rng
+        self.PCs = PCs
+        self.gene_index = gene_index
+        self.xgb_params = xgb_params
+        self.model_pos = None
+        self.model_neg = None
+        self.d = PCs.shape[1]
+
+    def _feat_pair(self, p_idx: int, g_idx: int) -> np.ndarray:
+        xp = self.PCs[p_idx]
+        xg = self.PCs[g_idx]
+        return np.concatenate([xp, xg, xp * xg], axis=0)
+
+    def _oracle_labels_for_train(self, pred_delta: np.ndarray, true_delta: np.ndarray) -> tuple:
+        """
+        Build training rows only from TRAIN perts, middle genes only.
+        Returns (X_pos, y_pos), (X_neg, y_neg), where y_* are {0,1}, with strong negative subsampling for balance.
+        """
+        P_train, G = pred_delta.shape
+        d = self.d
+        Xp_pos, yp_pos = [], []
+        Xp_neg, yp_neg = [], []
+        # subsample rate for negatives to keep ~K positives vs ~4K negatives manageable
+        neg_downsample = max(1, int(G / (8 * self.K)))
+
+        for i in range(P_train):
+            xd = pred_delta[i]; td = true_delta[i]
+            pos_frozen = topk_indices_desc(xd, self.K)
+            neg_frozen = bottomk_indices_asc(xd, self.K)
+            middle = np.ones(G, dtype=bool); middle[pos_frozen] = False; middle[neg_frozen] = False
+            mid_idx = np.where(middle)[0]
+            if mid_idx.size == 0:
+                continue
+            # oracle-in-middle
+            pos_oracle = mid_idx[np.argsort(-td[mid_idx], kind="mergesort")][:min(self.K, mid_idx.size)]
+            neg_oracle = mid_idx[np.argsort(td[mid_idx],  kind="mergesort")][:min(self.K, mid_idx.size)]
+            pos_set = set(map(int, pos_oracle))
+            neg_set = set(map(int, neg_oracle))
+            # indices: perturbed gene row (by name equals label)
+            # if pert name isn't found in gene list, skip
+            # (caller ensures perts are gene symbols)
+            # we infer p_idx here:
+            # NOTE: the i-th row corresponds to perts_train[i] externally; we pass p_idx at select-time by name.
+            # At train time we can recover p_idx by name list we pass into fit.
+            # We'll store perts_train_gene_indices during fit.
+            pass
+        # We'll assemble using perts_train_gene_indices we stored in fit().
+        return (None, None), (None, None)
+
+    def fit(self,
+            pred_delta_train: np.ndarray,
+            true_delta_train: np.ndarray,
+            perts_train: List[str]):
+        # map pert labels to gene indices (skip perts not in var_names)
+        self.perts_train_gene_indices = []
+        for p in perts_train:
+            if p in self.gene_index:
+                self.perts_train_gene_indices.append(self.gene_index.get_loc(p))
+            else:
+                self.perts_train_gene_indices.append(-1)
+
+        # Build TRAIN datasets
+        P_train, G = pred_delta_train.shape
+        X_pos, y_pos = [], []
+        X_neg, y_neg = [], []
+
+        for i in range(P_train):
+            p_idx = self.perts_train_gene_indices[i]
+            if p_idx < 0:
+                continue
+            xd = pred_delta_train[i]; td = true_delta_train[i]
+            pos_frozen = topk_indices_desc(xd, self.K)
+            neg_frozen = bottomk_indices_asc(xd, self.K)
+            middle = np.ones(G, dtype=bool); middle[pos_frozen] = False; middle[neg_frozen] = False
+            mid_idx = np.where(middle)[0]
+            if mid_idx.size == 0:
+                continue
+            # oracle-in-middle
+            k_eff = min(self.K, mid_idx.size)
+            pos_oracle = mid_idx[np.argsort(-td[mid_idx], kind="mergesort")][:k_eff]
+            neg_oracle = mid_idx[np.argsort(td[mid_idx],  kind="mergesort")][:k_eff]
+            pos_set = set(map(int, pos_oracle))
+            neg_set = set(map(int, neg_oracle))
+
+            # build examples; subsample negatives to control size
+            # target prevalence ~ K / (G-2K); set ratio ~ 1:4 (pos:neg) per pert for stability
+            # pick at most 4*k_eff negatives from the middle
+            self.rng.shuffle(mid_idx)
+            neg_pool = [g for g in mid_idx if (g not in pos_set and g not in neg_set)]
+            neg_pool = np.array(neg_pool, dtype=int)
+            n_neg_cap = 4 * k_eff
+            if neg_pool.size > n_neg_cap:
+                neg_pool = neg_pool[:n_neg_cap]
+
+            for g in pos_oracle:
+                X_pos.append(self._feat_pair(p_idx, int(g))); y_pos.append(1)
+            # draw equal number of hard negatives for pos-head: sample from middle not in pos_oracle
+            # (we already truncated neg_pool)
+            for g in neg_pool:
+                X_pos.append(self._feat_pair(p_idx, int(g))); y_pos.append(0)
+
+            for g in neg_oracle:
+                X_neg.append(self._feat_pair(p_idx, int(g))); y_neg.append(1)
+            # negatives for neg-head: reuse the same pool
+            for g in neg_pool:
+                X_neg.append(self._feat_pair(p_idx, int(g))); y_neg.append(0)
+
+        if not X_pos or not X_neg:
+            raise ValueError("[xgb] No training examples built. Check K and TRAIN size.")
+        X_pos = np.vstack(X_pos); y_pos = np.asarray(y_pos, dtype=int)
+        X_neg = np.vstack(X_neg); y_neg = np.asarray(y_neg, dtype=int)
+
+        # Fit two XGB classifiers
+        try:
+            import xgboost as xgb
+        except Exception as e:
+            raise ImportError("xgboost not available. Please `pip install xgboost`.") from e
+
+        self.model_pos = xgb.XGBClassifier(**self.xgb_params)
+        self.model_neg = xgb.XGBClassifier(**self.xgb_params)
+
+        self.model_pos.fit(X_pos, y_pos)
+        self.model_neg.fit(X_neg, y_neg)
+        return self
+
+    def select(self,
+               pred_delta_vec: np.ndarray,
+               pos_frozen: np.ndarray,
+               neg_frozen: np.ndarray,
+               pert_label: str):
+        """
+        Score only middle genes for this test perturbation; pick top-K for + and bottom-K for - by probability.
+        """
+        assert self.model_pos is not None and self.model_neg is not None
+        G = pred_delta_vec.size
+        # middle mask
+        middle = np.ones(G, dtype=bool); middle[pos_frozen] = False; middle[neg_frozen] = False
+        mid_idx = np.where(middle)[0]
+        if mid_idx.size == 0:
+            return np.array([], dtype=int), np.array([], dtype=int)
+        # map pert label to gene index (if not found, fall back to random middle)
+        if pert_label in self.gene_index:
+            p_idx = self.gene_index.get_loc(pert_label)
+        else:
+            # fallback
+            k_eff = min(self.K, mid_idx.size)
+            pos_boost = self.rng.choice(mid_idx, size=k_eff, replace=(mid_idx.size < k_eff))
+            neg_boost = self.rng.choice(mid_idx, size=k_eff, replace=(mid_idx.size < k_eff))
+            return np.array(pos_boost, dtype=int), np.array(neg_boost, dtype=int)
+
+        # build features for all mid candidates
+        feats = np.vstack([self._feat_pair(p_idx, int(g)) for g in mid_idx])
+        pos_prob = self.model_pos.predict_proba(feats)[:, 1]
+        neg_prob = self.model_neg.predict_proba(feats)[:, 1]
+
+        k_eff = min(self.K, mid_idx.size)
+        pos_order = mid_idx[np.argsort(-pos_prob, kind="mergesort")][:k_eff]
+        neg_order = mid_idx[np.argsort(-neg_prob, kind="mergesort")][:k_eff]
+        return pos_order, neg_order
 
 
 # ---- Boost application ----
@@ -345,12 +611,20 @@ def main():
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--K", type=int, default=1500, help="Top-K size for each tail to freeze and to boost.")
     ap.add_argument("--test_pct_pert", type=float, default=0.2, help="Fraction of perturbations in TEST (0..1).")
-    ap.add_argument("--method", choices=["random", "pair_score"], default="random")
+    ap.add_argument("--method", choices=["random", "pair_score", "xgb"], default="random")
     ap.add_argument("--pathways_yaml", type=str, default="", help="Required for method=pair_score.")
     ap.add_argument("--topL", type=int, default=100, help="Sparsity for v_p: keep top-|v| entries per test pert.")
     ap.add_argument("--gamma", type=float, default=0.5, help="Pathway size normalization exponent (0..1).")
     ap.add_argument("--seed", type=int, default=0, help="Random seed.")
     ap.add_argument("--evaluate", type=int, default=1, help="If 1 and evaluator importable, compute TEST metrics.")
+    ap.add_argument("--n_pcs", type=int, default=256, help="Number of PCA components for gene embeddings (all sources).")
+    ap.add_argument("--emb_gamma", type=float, default=0.0, help="Size normalization exponent for embedding columns (0..1).")
+    # XGBoost knobs (safe, light defaults)
+    ap.add_argument("--xgb_max_depth", type=int, default=4)
+    ap.add_argument("--xgb_estimators", type=int, default=400)
+    ap.add_argument("--xgb_lr", type=float, default=0.05)
+    ap.add_argument("--xgb_subsample", type=float, default=0.9)
+    ap.add_argument("--xgb_colsample", type=float, default=0.8)
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -385,7 +659,7 @@ def main():
     # Build selector
     if args.method == "random":
         selector = RandomTailSelector(K=args.K, rng=rng)
-    else:
+    elif args.method == "pair_score":
         if not args.pathways_yaml:
             raise ValueError("--pathways_yaml is required for method=pair_score.")
         selector = PairScoreTailSelector(K=args.K, rng=rng, topL=args.topL, gamma=args.gamma)
@@ -394,6 +668,43 @@ def main():
                      perts_train=perts_train,
                      genes=list(pred.var_names),
                      pathways_yaml=args.pathways_yaml)
+    else:  # xgb
+        if not args.pathways_yaml:
+            raise ValueError("--pathways_yaml is required for method=xgb.")
+        # Build gene embeddings (ALL sources) once
+        PCs, var_expl, gene_index, kept_cols = build_gene_embeddings_all_sources(
+            genes=list(pred.var_names),
+            perts_train=perts_train,
+            perts_test=perts_test,
+            pathways_yaml=args.pathways_yaml,
+            n_pcs=args.n_pcs,
+            gamma_size_norm=args.emb_gamma,
+        )
+        print(f"[embeddings] Using {PCs.shape[1]} PCs; variance explained = {100.0*var_expl:.2f}% "
+              f"(columns kept: {len(kept_cols)})")
+        # Import and construct the XGBTailSelector (defined below)
+        selector = XGBTailSelector(
+            K=args.K,
+            rng=rng,
+            PCs=PCs,
+            gene_index=gene_index,
+            xgb_params=dict(
+                max_depth=args.xgb_max_depth,
+                n_estimators=args.xgb_estimators,
+                learning_rate=args.xgb_lr,
+                subsample=args.xgb_subsample,
+                colsample_bytree=args.xgb_colsample,
+                n_jobs=0,
+                random_state=args.seed,
+                tree_method="hist",
+            ),
+        )
+        # Fit on TRAIN only (labels come from oracle-in-middle)
+        selector.fit(
+            pred_delta_train=pred_delta_all[train_idx, :],
+            true_delta_train=true_delta_all[train_idx, :],
+            perts_train=perts_train,
+        )
 
     # Apply to TEST
     pred_delta_test = pred_delta_all[test_idx, :].copy()
@@ -407,8 +718,15 @@ def main():
         neg_frozen = bottomk_indices_asc(x, args.K)
         if args.method == "random":
             pos_boost, neg_boost = selector.select(x, pos_frozen=pos_frozen, neg_frozen=neg_frozen)
-        else:
+        elif args.method == "pair_score":
             pos_boost, neg_boost = selector.select(x, pos_frozen=pos_frozen, neg_frozen=neg_frozen, pert_label=pert_label)
+        else:  # xgb
+            pos_boost, neg_boost = selector.select(
+                pred_delta_vec=x,
+                pos_frozen=pos_frozen,
+                neg_frozen=neg_frozen,
+                pert_label=pert_label,
+            )
         pred_delta_test_boosted[i, :] = apply_boost_once(x, pos_frozen, neg_frozen, pos_boost, neg_boost)
         pos_boost_list.append(np.asarray(pos_boost, dtype=int))
         neg_boost_list.append(np.asarray(neg_boost, dtype=int))
