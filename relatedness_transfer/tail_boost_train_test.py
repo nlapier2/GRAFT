@@ -389,8 +389,9 @@ class GOTermCountTailSelector(BaseTailSelector):
         self.P_test_kept:  np.ndarray | None = None  # (P_test, Kkeep)
         self.perts_train_kept: list[str] | None = None
         self.perts_test: list[str] | None = None
-        # map pert label -> row of kept-term membership (as bool vector) for TEST perts
+        # map pert label -> row of kept-term membership (as bool vector)
         self._test_term_rows: dict[str, np.ndarray] = {}
+        self._train_term_rows: dict[str, np.ndarray] = {}
 
     def fit(self,
             pred_delta_train: np.ndarray,
@@ -495,13 +496,14 @@ class GOTermCountTailSelector(BaseTailSelector):
         self.frac_neg = (neg_counts / den[:, None]).astype(np.float32)
 
         # --- Cache TEST perturbed-gene term rows for fast selection ---
-        self.P_test_kept = P_test
+        self.P_test_kept  = P_test
         self.P_train_kept = P_train
         self.perts_train_kept = perts_train_kept
-        self.perts_test = perts_test
-        self._test_term_rows = {}
-        for i, p in enumerate(perts_test):
-            self._test_term_rows[p] = P_test[i, :].astype(bool)
+        self.perts_test  = perts_test
+        # cache TEST term rows
+        self._test_term_rows = {p: P_test[i, :].astype(bool) for i, p in enumerate(perts_test)}
+        # cache TRAIN term rows (only for perts we kept after the ≤1-term filter)
+        self._train_term_rows = {p: P_train[i, :].astype(bool) for i, p in enumerate(perts_train_kept)}
 
         kept_terms = int(Kkeep)
         used_terms = int((term_den > 0).sum())
@@ -526,7 +528,10 @@ class GOTermCountTailSelector(BaseTailSelector):
             return np.array([], dtype=int), np.array([], dtype=int)
 
         # test pert's GO-term membership over kept terms
+        # try TEST mapping first; if not found, try TRAIN mapping (used when --eval_train=1)
         terms_mask = self._test_term_rows.get(pert_label, None)
+        if terms_mask is None:
+            terms_mask = self._train_term_rows.get(pert_label, None)
         if terms_mask is None:
             # unseen label (not in TEST list): select nothing (no fallback/random)
             return np.array([], dtype=int), np.array([], dtype=int)
@@ -817,6 +822,7 @@ def main():
     ap.add_argument("--evaluate", type=int, default=1, help="If 1 and evaluator importable, compute TEST metrics.")
     ap.add_argument("--n_pcs", type=int, default=256, help="Number of PCA components for gene embeddings (all sources).")
     ap.add_argument("--emb_gamma", type=float, default=0.0, help="Size normalization exponent for embedding columns (0..1).")
+    ap.add_argument("--eval_train", type=int, default=0, help="If 1, also evaluate on TRAIN perts with current model (no retrain).")
     # XGBoost knobs (safe, light defaults)
     ap.add_argument("--xgb_max_depth", type=int, default=4)
     ap.add_argument("--xgb_estimators", type=int, default=400)
@@ -961,10 +967,19 @@ def main():
                                     K_pos=args.K, K_neg=args.K, pert_names=perts_test)
         acc_path = os.path.join(args.out_dir, f"selection_accuracy_TEST_{args.method}.csv")
         acc_df.to_csv(acc_path, index=False)
+        # print per-pert accuracies (all rows except the final 'overall')
+        for _, r in acc_df.iloc[:-1].iterrows():
+            try:
+                print(f"[selection-accuracy][TEST][pert={r['pert']}] "
+                      f"pos={float(r['pos_correct']):.4f} neg={float(r['neg_correct']):.4f} "
+                      f"(pos_sel={int(r['pos_sel'])}, neg_sel={int(r['neg_sel'])})")
+            except Exception:
+                continue
+        # print overall summary
         try:
             overall_row = acc_df.iloc[-1]
-            print(f"[selection-accuracy][TEST] pos_correct={overall_row['pos_correct']:.4f} "
-                  f"neg_correct={overall_row['neg_correct']:.4f} (K={args.K})")
+            print(f"[selection-accuracy][TEST][overall] "
+                  f"pos={overall_row['pos_correct']:.4f} neg={overall_row['neg_correct']:.4f} (K={args.K})")
         except Exception:
             pass
         if _EVAL_AVAILABLE:
@@ -978,6 +993,63 @@ def main():
             # print("[metrics][TEST]", metrics)
     elif args.evaluate and not _EVAL_AVAILABLE:
         print("[warn] evaluate_model not found; skipping TEST metrics.")
+
+    # -------- Optional: evaluate on TRAIN using the existing selector (no retraining) --------
+    if args.eval_train:
+        pred_delta_train_only = pred_delta_all[train_idx, :].copy()
+        pred_delta_train_boosted = np.empty_like(pred_delta_train_only)
+        pos_boost_list_tr: list[np.ndarray] = []
+        neg_boost_list_tr: list[np.ndarray] = []
+
+        for i, pert_label in enumerate(perts_train):
+            x = pred_delta_train_only[i, :]
+            pos_frozen = topk_indices_desc(x, args.K)
+            neg_frozen = bottomk_indices_asc(x, args.K)
+            if args.method == "random":
+                pos_boost, neg_boost = selector.select(x, pos_frozen=pos_frozen, neg_frozen=neg_frozen)
+            elif args.method in ("pair_score", "xgb", "go_score"):
+                pos_boost, neg_boost = selector.select(
+                    pred_delta_vec=x,
+                    pos_frozen=pos_frozen,
+                    neg_frozen=neg_frozen,
+                    pert_label=pert_label,
+                )
+            else:
+                # Should not happen, but keep safe default
+                pos_boost, neg_boost = np.array([], dtype=int), np.array([], dtype=int)
+            pred_delta_train_boosted[i, :] = apply_boost_once(x, pos_frozen, neg_frozen, pos_boost, neg_boost)
+            pos_boost_list_tr.append(np.asarray(pos_boost, dtype=int))
+            neg_boost_list_tr.append(np.asarray(neg_boost, dtype=int))
+
+        # Save boosted TRAIN predictions
+        pred_expr_train_boosted = pred_delta_train_boosted + ctrl[None, :]
+        out_h5ad_tr = os.path.join(args.out_dir, f"tail_boost_TRAIN_only_{args.method}.h5ad")
+        ad.AnnData(pred_expr_train_boosted, obs=pd.DataFrame({args.target_label: perts_train}), var=pred.var).write(out_h5ad_tr)
+        print("[done][TRAIN] Wrote:", out_h5ad_tr)
+
+        # Selection accuracy on TRAIN (middle-restricted oracle) and metrics (if available)
+        true_delta_train_only = true_delta_all[train_idx, :]
+        acc_df_tr = selection_accuracy(true_delta_train_only, pred_delta_train_only, pos_boost_list_tr, neg_boost_list_tr,
+                                       K_pos=args.K, K_neg=args.K, pert_names=perts_train)
+        acc_path_tr = os.path.join(args.out_dir, f"selection_accuracy_TRAIN_{args.method}.csv")
+        acc_df_tr.to_csv(acc_path_tr, index=False)
+        try:
+            overall_row_tr = acc_df_tr.iloc[-1]
+            print(f"[selection-accuracy][TRAIN] pos_correct={overall_row_tr['pos_correct']:.4f} "
+                  f"neg_correct={overall_row_tr['neg_correct']:.4f} (K={args.K})")
+        except Exception:
+            pass
+
+        if _EVAL_AVAILABLE:
+            metrics_tr = evaluate_model(
+                adata=true,
+                args=type("A", (), {"target_label": args.target_label, "control_label": args.control_label})(),
+                pred_bundle=(pred_expr_train_boosted, true_delta_train_only + ctrl[None, :], perts_train, ctrl)
+            )
+            pd.DataFrame(metrics_tr, index=[0]).to_csv(os.path.join(args.out_dir, f"metrics_TRAIN_only_{args.method}.csv"), index=False)
+            # print("[metrics][TRAIN]", metrics_tr)
+        else:
+            print("[warn] evaluate_model not found; wrote TRAIN selection accuracy only.")
 
     pd.DataFrame({"pert": perts_train, "split": "train"}).to_csv(os.path.join(args.out_dir, "perts_train.csv"), index=False)
     pd.DataFrame({"pert": perts_test,  "split": "test" }).to_csv(os.path.join(args.out_dir, "perts_test.csv"),  index=False)
