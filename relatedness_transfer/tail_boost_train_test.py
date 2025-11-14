@@ -347,6 +347,204 @@ class PairScoreTailSelector(BaseTailSelector):
         return pos_order[:k_eff], neg_order[:k_eff]
     
 
+class GOTermCountTailSelector(BaseTailSelector):
+    """
+    Simple GO-term counting baseline (first pathway file only).
+
+    TRAIN:
+      - Load first pathway source (assumed GO) and take rows only for perturbed genes (TRAIN+TEST perts).
+      - Keep GO terms present in ≥1 TRAIN pert and ≥1 TEST pert.
+      - Drop TRAIN perts that have ≤1 GO term after filtering.
+      - For each remaining TRAIN pert i:
+          * Freeze ±K by predicted deltas.
+          * Consider middle genes; define oracle top-K (+tail) and bottom-K (−tail) by TRUE deltas within the middle.
+          * For each GO term t present in this pert, increment:
+                pos_counts[t, g] for g ∈ oracle_plus
+                neg_counts[t, g] for g ∈ oracle_minus
+            and term_den[t] += 1
+      - Fractions:
+            frac_pos[t, g] = pos_counts[t, g] / term_den[t]
+            frac_neg[t, g] = neg_counts[t, g] / term_den[t]
+
+    TEST:
+      - For a test pert with GO terms T_p:
+            score_pos[g] = sum_{t ∈ T_p} frac_pos[t, g]
+            score_neg[g] = sum_{t ∈ T_p} frac_neg[t, g]
+        Select top-K from middle by score_pos (for +tail) and by score_neg (for −tail).
+
+    Notes:
+      - Only perturbed-gene GO membership matrices are kept in memory (TRAIN+TEST).
+      - If a TEST pert has 0 kept GO terms (rare after your filtering), it will select nothing for that pert.
+    """
+    def __init__(self, K: int, rng: np.random.Generator):
+        super().__init__(K)
+        self.rng = rng
+        # learned artifacts
+        self.frac_pos: np.ndarray | None = None   # (Kkeep, G)
+        self.frac_neg: np.ndarray | None = None   # (Kkeep, G)
+        self.term_cols: list[str] | None = None   # kept GO term names
+        self.gene_index: pd.Index | None = None   # index over all genes (var_names order)
+        # perturbed-gene GO membership (kept terms only)
+        self.P_train_kept: np.ndarray | None = None  # (P_train_kept, Kkeep)
+        self.P_test_kept:  np.ndarray | None = None  # (P_test, Kkeep)
+        self.perts_train_kept: list[str] | None = None
+        self.perts_test: list[str] | None = None
+        # map pert label -> row of kept-term membership (as bool vector) for TEST perts
+        self._test_term_rows: dict[str, np.ndarray] = {}
+
+    def fit(self,
+            pred_delta_train: np.ndarray,
+            true_delta_train: np.ndarray,
+            perts_train: list[str],
+            perts_test: list[str],
+            genes: list[str],
+            pathways_yaml: str):
+        # --- Load first pathway source and get gene x GO matrix (binary) ---
+        from load_pathways import load_pathway_sources, make_pathway_matrix
+        srcs = load_pathway_sources(pathways_yaml)
+        if not srcs:
+            raise ValueError("[go_score] No pathway sources found in YAML.")
+        first_name = list(srcs.keys())[0]
+        meta = srcs[first_name]
+        gp_full = make_pathway_matrix(
+            file_name=meta["file"],
+            gene_col=meta["gene_col"],
+            pathway_col=meta["pathway_col"],
+            format=meta["format"],
+            var_names=genes,
+        )
+        gp_full = (gp_full > 0).astype(np.float32)  # ensure binary
+        G, Kraw = gp_full.shape
+        self.gene_index = pd.Index(genes)
+
+        # --- Build perturbed-gene membership rows for TRAIN and TEST ---
+        def rows_for(perts: list[str]) -> np.ndarray:
+            idx = self.gene_index.get_indexer(perts)
+            return idx[idx >= 0]
+
+        tr_rows_all = rows_for(perts_train)
+        te_rows_all = rows_for(perts_test)
+
+        # GO terms present in ≥1 TRAIN pert and ≥1 TEST pert
+        present_train = np.any(gp_full.iloc[tr_rows_all, :].values > 0, axis=0) if tr_rows_all.size else np.zeros(Kraw, bool)
+        present_test  = np.any(gp_full.iloc[te_rows_all, :].values > 0, axis=0) if te_rows_all.size else np.zeros(Kraw, bool)
+        keep_terms_mask = present_train & present_test
+        if not np.any(keep_terms_mask):
+            raise ValueError("[go_score] After filtering, no GO terms remain that are present in both TRAIN and TEST perts.")
+
+        gp_kept_terms = gp_full.loc[:, keep_terms_mask].copy()  # (G, Kkeep)
+        self.term_cols = list(gp_kept_terms.columns)
+        Kkeep = gp_kept_terms.shape[1]
+
+        # Slice perturbed-gene rows (TRAIN and TEST) on kept terms
+        P_train = np.zeros((len(perts_train), Kkeep), dtype=np.float32)
+        for i, p in enumerate(perts_train):
+            ridx = self.gene_index.get_loc(p) if p in self.gene_index else -1
+            if ridx >= 0:
+                P_train[i, :] = gp_kept_terms.iloc[ridx, :].values
+
+        P_test  = np.zeros((len(perts_test), Kkeep), dtype=np.float32)
+        for i, p in enumerate(perts_test):
+            ridx = self.gene_index.get_loc(p) if p in self.gene_index else -1
+            if ridx >= 0:
+                P_test[i, :] = gp_kept_terms.iloc[ridx, :].values
+
+        # --- Drop TRAIN perts with ≤1 kept GO term ---
+        keep_train_mask = (P_train.sum(axis=1) > 1.0)
+        n_before = P_train.shape[0]
+        P_train = P_train[keep_train_mask, :]
+        pred_delta_train = pred_delta_train[keep_train_mask, :]
+        true_delta_train = true_delta_train[keep_train_mask, :]
+        perts_train_kept = [p for p, k in zip(perts_train, keep_train_mask) if k]
+        n_after = P_train.shape[0]
+        print(f"[go_score] Dropped {n_before - n_after} TRAIN perts with ≤1 kept GO term; kept {n_after}.")
+
+        # (We do not drop TEST perts; if a TEST pert has 0–1 terms post-filter, it will naturally select nothing.)
+
+        # --- Count tables over TRAIN perts (middle-restricted oracle) ---
+        pos_counts = np.zeros((Kkeep, G), dtype=np.float32)
+        neg_counts = np.zeros((Kkeep, G), dtype=np.float32)
+        term_den   = np.zeros((Kkeep,), dtype=np.float32)  # number of TRAIN perts where term is present
+
+        Pn = pred_delta_train.shape[0]
+        for i in range(Pn):
+            terms_i = np.where(P_train[i, :] > 0)[0]
+            if terms_i.size == 0:
+                continue
+            xd = pred_delta_train[i]; td = true_delta_train[i]
+            # build middle (freeze ±K)
+            pos_frozen = topk_indices_desc(xd, self.K)
+            neg_frozen = bottomk_indices_asc(xd, self.K)
+            middle = np.ones(G, dtype=bool); middle[pos_frozen] = False; middle[neg_frozen] = False
+            mid_idx = np.where(middle)[0]
+            if mid_idx.size == 0:
+                continue
+            k_eff = min(self.K, mid_idx.size)
+            pos_oracle = mid_idx[np.argsort(-td[mid_idx], kind="mergesort")][:k_eff]
+            neg_oracle = mid_idx[np.argsort(td[mid_idx],  kind="mergesort")][:k_eff]
+
+            # update counts for each term present in this TRAIN pert
+            for t in terms_i:
+                term_den[t] += 1.0
+                pos_counts[t, pos_oracle] += 1.0
+                neg_counts[t, neg_oracle] += 1.0
+
+        # Fractions per term per gene
+        den = np.maximum(term_den, 1.0).astype(np.float32)  # safe divide
+        self.frac_pos = (pos_counts / den[:, None]).astype(np.float32)  # (Kkeep, G)
+        self.frac_neg = (neg_counts / den[:, None]).astype(np.float32)
+
+        # --- Cache TEST perturbed-gene term rows for fast selection ---
+        self.P_test_kept = P_test
+        self.P_train_kept = P_train
+        self.perts_train_kept = perts_train_kept
+        self.perts_test = perts_test
+        self._test_term_rows = {}
+        for i, p in enumerate(perts_test):
+            self._test_term_rows[p] = P_test[i, :].astype(bool)
+
+        kept_terms = int(Kkeep)
+        used_terms = int((term_den > 0).sum())
+        print(f"[go_score] kept_terms={kept_terms}, terms_with_train_support={used_terms}, "
+              f"G={G}, train_kept={len(perts_train_kept)}, test={len(perts_test)}")
+        return self
+
+    def select(self,
+               pred_delta_vec: np.ndarray,
+               pos_frozen: np.ndarray,
+               neg_frozen: np.ndarray,
+               pert_label: str) -> tuple[np.ndarray, np.ndarray]:
+        assert self.frac_pos is not None and self.frac_neg is not None
+        assert self.gene_index is not None
+        assert self.P_test_kept is not None and self._test_term_rows is not None
+
+        G = pred_delta_vec.size
+        # compute middle indices
+        middle = np.ones(G, dtype=bool); middle[pos_frozen] = False; middle[neg_frozen] = False
+        mid_idx = np.where(middle)[0]
+        if mid_idx.size == 0:
+            return np.array([], dtype=int), np.array([], dtype=int)
+
+        # test pert's GO-term membership over kept terms
+        terms_mask = self._test_term_rows.get(pert_label, None)
+        if terms_mask is None:
+            # unseen label (not in TEST list): select nothing (no fallback/random)
+            return np.array([], dtype=int), np.array([], dtype=int)
+
+        if not terms_mask.any():
+            # no kept GO terms: select nothing
+            return np.array([], dtype=int), np.array([], dtype=int)
+
+        # scores: sum rows of frac_* over terms this pert has
+        score_pos = self.frac_pos[terms_mask, :].sum(axis=0)  # (G,)
+        score_neg = self.frac_neg[terms_mask, :].sum(axis=0)  # (G,)
+
+        k_eff = min(self.K, mid_idx.size)
+        pos_order = mid_idx[np.argsort(-score_pos[mid_idx], kind="mergesort")][:k_eff]
+        neg_order = mid_idx[np.argsort(-score_neg[mid_idx], kind="mergesort")][:k_eff]
+        return pos_order, neg_order
+    
+
 # ---- NEW: Supervised selector with XGBoost over PCA gene embeddings ----
 class XGBTailSelector(BaseTailSelector):
     """
@@ -611,7 +809,7 @@ def main():
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--K", type=int, default=1500, help="Top-K size for each tail to freeze and to boost.")
     ap.add_argument("--test_pct_pert", type=float, default=0.2, help="Fraction of perturbations in TEST (0..1).")
-    ap.add_argument("--method", choices=["random", "pair_score", "xgb"], default="random")
+    ap.add_argument("--method", choices=["random", "pair_score", "xgb", "go_score"], default="random")
     ap.add_argument("--pathways_yaml", type=str, default="", help="Required for method=pair_score.")
     ap.add_argument("--topL", type=int, default=100, help="Sparsity for v_p: keep top-|v| entries per test pert.")
     ap.add_argument("--gamma", type=float, default=0.5, help="Pathway size normalization exponent (0..1).")
@@ -668,6 +866,18 @@ def main():
                      perts_train=perts_train,
                      genes=list(pred.var_names),
                      pathways_yaml=args.pathways_yaml)
+    elif args.method == "go_score":
+        if not args.pathways_yaml:
+            raise ValueError("--pathways_yaml is required for method=go_score.")
+        selector = GOTermCountTailSelector(K=args.K, rng=rng)
+        selector.fit(
+            pred_delta_train=pred_delta_all[train_idx, :],
+            true_delta_train=true_delta_all[train_idx, :],
+            perts_train=perts_train,
+            perts_test=perts_test,
+            genes=list(pred.var_names),
+            pathways_yaml=args.pathways_yaml,
+        )
     else:  # xgb
         if not args.pathways_yaml:
             raise ValueError("--pathways_yaml is required for method=xgb.")
@@ -720,6 +930,13 @@ def main():
             pos_boost, neg_boost = selector.select(x, pos_frozen=pos_frozen, neg_frozen=neg_frozen)
         elif args.method == "pair_score":
             pos_boost, neg_boost = selector.select(x, pos_frozen=pos_frozen, neg_frozen=neg_frozen, pert_label=pert_label)
+        elif args.method == "go_score":
+            pos_boost, neg_boost = selector.select(
+                pred_delta_vec=x,
+                pos_frozen=pos_frozen,
+                neg_frozen=neg_frozen,
+                pert_label=pert_label,
+            )
         else:  # xgb
             pos_boost, neg_boost = selector.select(
                 pred_delta_vec=x,
