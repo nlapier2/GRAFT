@@ -147,8 +147,107 @@ def parse_arguments():
 
     ap.add_argument("--impute_missing_from_first", action="store_true", help="KRR-impute missing perturbation rows using first external.")
 
+   # Optional sparsification of predicted deltas / fold-changes (for DE-style metrics)
+    ap.add_argument("--keep_delta_pct", type=float, default=0.0, help="If >0, per perturbation keep this fraction (0-1) of genes with largest |Δ|")
+    ap.add_argument("--keep_foldchange_pct", type=float, default=0.0, help="If >0, per perturbation keep this fraction (0-1) of genes with largest |log2 FC|.")
     args = ap.parse_args()
     return args
+
+def apply_keep_delta_and_foldchange(
+    pred_mat: np.ndarray,
+    ctrl_mean: np.ndarray,
+    keep_delta_pct: float = 0.0,
+    keep_foldchange_pct: float = 0.0,
+) -> np.ndarray:
+    """
+    Sparsify predicted effects per perturbation based on |Δ| and/or |log2 FC|.
+
+    Parameters
+    ----------
+    pred_mat
+        (P, G) predictions in the same (log1p-normalized) space as ctrl_mean.
+    ctrl_mean
+        (G,) global control mean in the same space.
+    keep_delta_pct
+        Fraction (0-1) of genes to keep per perturbation by largest |Δ|.
+    keep_foldchange_pct
+        Fraction (0-1) of genes to keep per perturbation by largest |log2 FC|.
+
+    Returns
+    -------
+    A new (P, G) array with the same dtype as pred_mat, where genes not selected
+    by either criterion are reset to ctrl_mean (i.e., Δ = 0).
+    """
+    if pred_mat is None:
+        return pred_mat
+    pred_arr = np.asarray(pred_mat)
+    if pred_arr.size == 0:
+        return pred_mat
+
+    if keep_delta_pct is None:
+        keep_delta_pct = 0.0
+    if keep_foldchange_pct is None:
+        keep_foldchange_pct = 0.0
+
+    if keep_delta_pct <= 0.0 and keep_foldchange_pct <= 0.0:
+        return pred_mat
+
+    # Clamp fractions into [0,1]
+    keep_delta_pct = float(max(0.0, min(1.0, keep_delta_pct)))
+    keep_foldchange_pct = float(max(0.0, min(1.0, keep_foldchange_pct)))
+
+    P, G = pred_arr.shape
+    ctrl = np.asarray(ctrl_mean, dtype=np.float32).ravel()
+    if ctrl.shape[0] != G:
+        raise ValueError(f"ctrl_mean has length {ctrl.shape[0]} but pred_mat has G={G} genes.")
+
+    # Work in float32 for numerical stability; preserve original dtype at the end.
+    pred_f = pred_arr.astype(np.float32, copy=False)
+    delta = pred_f - ctrl[None, :]
+
+    mask_delta = np.zeros_like(delta, dtype=bool)
+    mask_fc = np.zeros_like(delta, dtype=bool)
+
+    # --- |Δ| based mask ----------------------------------------------------
+    if keep_delta_pct > 0.0:
+        k = max(1, min(G, int(math.ceil(keep_delta_pct * G))))
+        A = np.abs(delta)
+        for i in range(P):
+            row = A[i]
+            if k >= G:
+                mask_delta[i, :] = True
+            else:
+                # threshold at the k-th largest |Δ| in this row
+                thresh = np.partition(row, G - k)[G - k]
+                mask_delta[i, row >= thresh] = True
+
+    # --- |log2 FC| based mask ----------------------------------------------
+    if keep_foldchange_pct > 0.0:
+        k_fc = max(1, min(G, int(math.ceil(keep_foldchange_pct * G))))
+        eps = 1e-8
+        # Convert from log1p space back to (approximate) counts before FC
+        ctrl_counts = np.expm1(ctrl.astype(np.float64))  # (G,)
+        pred_counts = np.expm1(pred_f.astype(np.float64))  # (P, G)
+        denom = ctrl_counts[None, :] + eps
+        lfc = np.log2((pred_counts + eps) / denom)  # (P, G)
+        A_fc = np.abs(lfc)
+        for i in range(P):
+            row = A_fc[i]
+            if k_fc >= G:
+                mask_fc[i, :] = True
+            else:
+                # threshold at the k_fc-th largest |log2 FC|
+                thresh = np.partition(row, G - k_fc)[G - k_fc]
+                mask_fc[i, row >= thresh] = True
+
+    # Union of the two criteria
+    mask = mask_delta | mask_fc
+    if not mask.any():
+        # If nothing was selected, fall back to the original predictions
+        return pred_mat
+
+    out = ctrl[None, :] + delta * mask.astype(np.float32)
+    return out.astype(pred_mat.dtype)
 
 def create_kernel_from_tsv_deltas(
     fname: str,
@@ -2264,6 +2363,15 @@ def main():
             sigmoid_B=args.pds_sigmoid_B, preserve_q=args.pds_preserve_quantile
         )
 
+    # Optional sparsification of predicted effects before target overwrite / eval
+    if (args.keep_delta_pct > 0.0 or args.keep_foldchange_pct > 0.0) and pred_ev.shape[0] > 0:
+        pred_ev = apply_keep_delta_and_foldchange(
+            pred_mat=pred_ev,
+            ctrl_mean=ctrl_mean_global,
+            keep_delta_pct=args.keep_delta_pct,
+            keep_foldchange_pct=args.keep_foldchange_pct,
+        )
+
     # Post-processing on the FULL eval predictions (target overwrite + clamp)
     apply_target_overwrite_and_clamp(
         pred_mat=pred_ev, pert_names=names_ev,
@@ -2320,6 +2428,15 @@ def main():
                 gamma=args.pds_gamma, topk_frac=args.pds_topk_frac,
                 alpha=args.pds_alpha, beta=args.pds_beta,
                 sigmoid_B=args.pds_sigmoid_B, preserve_q=args.pds_preserve_quantile
+            )
+
+        # Apply the same delta/logFC-based sparsification on train predictions (if requested)
+        if (args.keep_delta_pct > 0.0 or args.keep_foldchange_pct > 0.0) and pred_tr.shape[0] > 0:
+            pred_tr = apply_keep_delta_and_foldchange(
+                pred_mat=pred_tr,
+                ctrl_mean=ctrl_mean_global,
+                keep_delta_pct=args.keep_delta_pct,
+                keep_foldchange_pct=args.keep_foldchange_pct,
             )
 
         apply_target_overwrite_and_clamp(
