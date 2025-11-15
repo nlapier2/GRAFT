@@ -392,6 +392,9 @@ class GOTermCountTailSelector(BaseTailSelector):
         # map pert label -> row of kept-term membership (as bool vector)
         self._test_term_rows: dict[str, np.ndarray] = {}
         self._train_term_rows: dict[str, np.ndarray] = {}
+        # for diagnostics / Jaccard:
+        self.P_train_all_keptTerms: np.ndarray | None = None  # (len(perts_train), Kkeep) BEFORE dropping ≤1-term perts
+        self.perts_train_all: list[str] | None = None
 
     def fit(self,
             pred_delta_train: np.ndarray,
@@ -449,6 +452,10 @@ class GOTermCountTailSelector(BaseTailSelector):
             ridx = self.gene_index.get_loc(p) if p in self.gene_index else -1
             if ridx >= 0:
                 P_test[i, :] = gp_kept_terms.iloc[ridx, :].values
+
+        # --- Save TRAIN membership before dropping low-term perts (used for Jaccard & diagnostics) ---
+        self.P_train_all_keptTerms = P_train.copy()            # shape: (len(perts_train), Kkeep)
+        self.perts_train_all = list(perts_train)
 
         # --- Drop TRAIN perts with ≤1 kept GO term ---
         keep_train_mask = (P_train.sum(axis=1) > 1.0)
@@ -548,6 +555,372 @@ class GOTermCountTailSelector(BaseTailSelector):
         pos_order = mid_idx[np.argsort(-score_pos[mid_idx], kind="mergesort")][:k_eff]
         neg_order = mid_idx[np.argsort(-score_neg[mid_idx], kind="mergesort")][:k_eff]
         return pos_order, neg_order
+
+
+class GOModuleTailSelector(BaseTailSelector):
+    """
+    Idea #1: Cluster responder genes into modules, learn term->module fractions on TRAIN, score modules at TEST,
+    then pick genes within the selected modules.
+
+    - Modules: k-means over responder-gene vectors = kept GO columns (binary) for ALL genes.
+    - Train: for each train pert i and its terms, update pos/neg counts per term->module using middle-restricted oracle.
+    - Fractions: frac_pos_mod[term, module], frac_neg_mod[term, module].
+    - Test: score modules by summing frac over the pert's terms; allocate K across top modules; within each module rank
+      genes by a simple within-module gene score (sum frac_pos over pert's terms for +tail, similarly for -tail).
+    """
+    def __init__(self, K: int, rng: np.random.Generator, k_modules: int = 300, topm_per: int = 50):
+        super().__init__(K)
+        self.rng = rng
+        self.k_modules = k_modules
+        self.topm_per = topm_per
+        self.gene_index: pd.Index | None = None
+        self.term_cols: list[str] | None = None
+
+        # module artifacts
+        self.module_labels: np.ndarray | None = None   # (G,)
+        self.M = 0
+        self.frac_pos_mod: np.ndarray | None = None    # (Kkeep, M)
+        self.frac_neg_mod: np.ndarray | None = None    # (Kkeep, M)
+        self.P_train_kept: np.ndarray | None = None    # (P_train_kept, Kkeep)
+        self.P_test_kept:  np.ndarray | None = None    # (P_test, Kkeep)
+        self._test_term_rows: dict[str, np.ndarray] = {}
+        self._train_term_rows: dict[str, np.ndarray] = {}
+        self.perts_train_kept: list[str] | None = None
+        self.perts_test: list[str] | None = None
+        self.gp_kept_binary: np.ndarray | None = None  # (G, Kkeep) for cluster/run-time within-module ranking
+
+    def fit(self, pred_delta_train, true_delta_train, perts_train, perts_test, genes, pathways_yaml):
+        from load_pathways import load_pathway_sources, make_pathway_matrix
+        srcs = load_pathway_sources(pathways_yaml)
+        first_name = list(srcs.keys())[0]
+        meta = srcs[first_name]
+        gp_full = make_pathway_matrix(
+            file_name=meta["file"], gene_col=meta["gene_col"],
+            pathway_col=meta["pathway_col"], format=meta["format"], var_names=genes
+        )
+        gp_full = (gp_full > 0).astype(np.float32)
+        G, Kraw = gp_full.shape
+        self.gene_index = pd.Index(genes)
+
+        # term filtering: present in ≥1 TRAIN pert and ≥1 TEST pert; and drop >50% prevalence (as you asked earlier)
+        def rows_for(perts: list[str]) -> np.ndarray:
+            idx = self.gene_index.get_indexer(perts)
+            return idx[idx >= 0]
+        tr_rows_all = rows_for(perts_train)
+        te_rows_all = rows_for(perts_test)
+        present_train = np.any(gp_full.iloc[tr_rows_all, :].values > 0, axis=0) if tr_rows_all.size else np.zeros(Kraw, bool)
+        present_test  = np.any(gp_full.iloc[te_rows_all, :].values > 0, axis=0) if te_rows_all.size else np.zeros(Kraw, bool)
+        in_train_counts = (gp_full.iloc[tr_rows_all, :].values > 0).sum(axis=0) if tr_rows_all.size else np.zeros(Kraw, int)
+        in_test_counts  = (gp_full.iloc[te_rows_all, :].values > 0).sum(axis=0) if te_rows_all.size else np.zeros(Kraw, int)
+        in_any_counts = in_train_counts + in_test_counts
+        prevalence_mask = (in_any_counts <= (0.5 * max(1, len(perts_train)+len(perts_test))))
+        keep_terms_mask = present_train & present_test & prevalence_mask
+
+        gp = gp_full.loc[:, keep_terms_mask].copy()
+        self.term_cols = list(gp.columns)
+        Kkeep = gp.shape[1]
+        self.gp_kept_binary = gp.values.astype(np.float32)
+
+        # Module assignment (k-means on gene x kept_terms)
+        from sklearn.cluster import KMeans
+        km = KMeans(n_clusters=min(self.k_modules, max(2, min(G, Kkeep))), n_init=10, random_state=0)
+        self.module_labels = km.fit_predict(self.gp_kept_binary)  # (G,)
+        self.M = int(self.module_labels.max()) + 1
+
+        # Build perturbed-gene kept-term rows
+        P_train = np.zeros((len(perts_train), Kkeep), dtype=np.float32)
+        for i, p in enumerate(perts_train):
+            ridx = self.gene_index.get_loc(p) if p in self.gene_index else -1
+            if ridx >= 0:
+                P_train[i, :] = gp.iloc[ridx, :].values
+        P_test  = np.zeros((len(perts_test), Kkeep), dtype=np.float32)
+        for i, p in enumerate(perts_test):
+            ridx = self.gene_index.get_loc(p) if p in self.gene_index else -1
+            if ridx >= 0:
+                P_test[i, :] = gp.iloc[ridx, :].values
+
+        # Drop TRAIN perts with ≤1 term (post-filter)
+        keep_train = (P_train.sum(axis=1) > 1.0)
+        P_train = P_train[keep_train, :]
+        pred_delta_train = pred_delta_train[keep_train, :]
+        true_delta_train = true_delta_train[keep_train, :]
+        self.perts_train_kept = [p for p, k in zip(perts_train, keep_train) if k]
+        self.perts_test = perts_test
+
+        # Count term->module oracle tallies
+        pos_counts = np.zeros((Kkeep, self.M), dtype=np.float32)
+        neg_counts = np.zeros((Kkeep, self.M), dtype=np.float32)
+        term_den   = np.zeros((Kkeep,), dtype=np.float32)
+
+        Pn, G = pred_delta_train.shape
+        for i in range(Pn):
+            terms_i = np.where(P_train[i, :] > 0)[0]
+            if terms_i.size == 0:
+                continue
+            xd = pred_delta_train[i]; td = true_delta_train[i]
+            pos_frozen = topk_indices_desc(xd, self.K)
+            neg_frozen = bottomk_indices_asc(xd, self.K)
+            middle = np.ones(G, dtype=bool); middle[pos_frozen] = False; middle[neg_frozen] = False
+            mid_idx = np.where(middle)[0]
+            if mid_idx.size == 0:
+                continue
+            k_eff = min(self.K, mid_idx.size)
+            pos_oracle = mid_idx[np.argsort(-td[mid_idx], kind="mergesort")][:k_eff]
+            neg_oracle = mid_idx[np.argsort( td[mid_idx],  kind="mergesort")][:k_eff]
+            # map to modules
+            mod_pos = self.module_labels[pos_oracle]
+            mod_neg = self.module_labels[neg_oracle]
+            for t in terms_i:
+                term_den[t] += 1.0
+                # add 1 for each selected gene's module
+                np.add.at(pos_counts, (t, mod_pos), 1.0)
+                np.add.at(neg_counts, (t, mod_neg), 1.0)
+
+        den = np.maximum(term_den, 1.0)
+        self.frac_pos_mod = (pos_counts / den[:, None]).astype(np.float32)  # (Kkeep, M)
+        self.frac_neg_mod = (neg_counts / den[:, None]).astype(np.float32)
+
+        # Cache term rows for test/train maps
+        self.P_test_kept = P_test
+        self.P_train_kept = P_train
+        self._test_term_rows = {p: P_test[i, :].astype(bool) for i, p in enumerate(perts_test)}
+        self._train_term_rows = {p: P_train[i, :].astype(bool) for i, p in enumerate(self.perts_train_kept)}
+
+    def select(self, pred_delta_vec, pos_frozen, neg_frozen, pert_label):
+        assert self.frac_pos_mod is not None and self.frac_neg_mod is not None
+        G = pred_delta_vec.size
+        middle = np.ones(G, dtype=bool); middle[pos_frozen] = False; middle[neg_frozen] = False
+        mid_idx = np.where(middle)[0]
+        if mid_idx.size == 0:
+            return np.array([], int), np.array([], int)
+
+        # pert term mask
+        terms_mask = self._test_term_rows.get(pert_label, None)
+        if terms_mask is None:
+            terms_mask = self._train_term_rows.get(pert_label, None)
+        if terms_mask is None or not terms_mask.any():
+            return np.array([], int), np.array([], int)
+
+        # module scores (sum rows for pert's terms)
+        s_pos_mod = self.frac_pos_mod[terms_mask, :].sum(axis=0)   # (M,)
+        s_neg_mod = self.frac_neg_mod[terms_mask, :].sum(axis=0)   # (M,)
+
+        # allocate K across modules proportional to scores (soft cap per module)
+        def pick_from_modules(s_mod, sign="+"):
+            order_mod = np.argsort(-s_mod, kind="mergesort")
+            k_left = min(self.K, mid_idx.size)
+            picks = []
+            # within-module gene ranking by “gene score = sum frac over pert terms” in the sign direction
+            if sign == "+":
+                gene_score = (self.frac_pos_mod[terms_mask, :].sum(axis=0))  # per module score; need gene-level
+                # derive per-gene by projecting module score back via membership mask:
+                g_score = np.zeros(G, dtype=np.float32)
+                # approximate: each gene inherits its module's score
+                g_score = s_mod[self.module_labels]
+            else:
+                g_score = s_neg_mod[self.module_labels]
+
+            # restrict to middle
+            g_score_mid = g_score.copy()
+            g_score_mid[~middle] = -1e9
+
+            for m in order_mod:
+                if k_left <= 0:
+                    break
+                in_m = np.where((self.module_labels == m) & middle)[0]
+                if in_m.size == 0:
+                    continue
+                # rank by g_score_mid within module
+                order_g = in_m[np.argsort(-g_score_mid[in_m], kind="mergesort")]
+                take = min(self.topm_per, k_left, order_g.size)
+                picks.extend(order_g[:take].tolist())
+                k_left -= take
+            return np.array(picks[:min(self.K, len(picks))], dtype=int)
+
+        pos_boost = pick_from_modules(s_pos_mod, sign="+")
+        neg_boost = pick_from_modules(s_neg_mod, sign="-")
+        return pos_boost, neg_boost
+
+
+class GOMotifTailSelector(BaseTailSelector):
+    """
+    Idea #2: Learn low-rank 'motifs' (per tail) from TRAIN oracle matrices; regress GO-term vectors -> motif weights.
+    Test: predict motif weights from GO, reconstruct soft gene scores via W @ H.
+
+    - Build TRAIN oracle matrices (P_train_kept x G) for + and - tails (middle-restricted).
+    - Factorize with TruncatedSVD (fast, works on binary); B ≈ W H with rank r.
+    - Fit Ridge: GO_kept_terms -> W (per tail).
+    - Test: predict W_test from GO terms of pert, compute scores = W_test @ H, pick top-K from middle.
+    """
+    def __init__(self, K: int, rng: np.random.Generator, rank: int = 256,
+                 factorizer: str = "nmf", use_tfidf: bool = True,
+                 enet_alpha: float = 0.1, enet_l1_ratio: float = 0.2):
+        super().__init__(K)
+        self.rng = rng
+        self.rank = rank
+        self.factorizer = factorizer
+        self.use_tfidf = use_tfidf
+        self.enet_alpha = enet_alpha
+        self.enet_l1_ratio = enet_l1_ratio
+        self.gene_index: pd.Index | None = None
+        self.term_cols: list[str] | None = None
+        self.H_pos: np.ndarray | None = None  # (r, G)
+        self.H_neg: np.ndarray | None = None  # (r, G)
+        self.reg_pos = None
+        self.reg_neg = None
+        self.P_train_kept: np.ndarray | None = None   # (P_train_kept, Kkeep)
+        self.P_test_kept:  np.ndarray | None = None   # (P_test, Kkeep)
+        self._test_term_rows: dict[str, np.ndarray] = {}
+        self._train_term_rows: dict[str, np.ndarray] = {}
+        self.perts_train_kept: list[str] | None = None
+        self.perts_test: list[str] | None = None
+        self.idf_vec: np.ndarray | None = None   # (Kkeep,) TF-IDF weights for GO features
+
+    def fit(self, pred_delta_train, true_delta_train, perts_train, perts_test, genes, pathways_yaml):
+        from load_pathways import load_pathway_sources, make_pathway_matrix
+        from sklearn.decomposition import TruncatedSVD, NMF
+        from sklearn.linear_model import ElasticNet
+
+        # kept GO terms (same filtering as before, incl. >50% prevalence drop)
+        srcs = load_pathway_sources(pathways_yaml)
+        first_name = list(srcs.keys())[0]
+        meta = srcs[first_name]
+        gp_full = make_pathway_matrix(
+            file_name=meta["file"], gene_col=meta["gene_col"],
+            pathway_col=meta["pathway_col"], format=meta["format"], var_names=genes
+        )
+        gp_full = (gp_full > 0).astype(np.float32)
+        G, Kraw = gp_full.shape
+        self.gene_index = pd.Index(genes)
+
+        def rows_for(perts: list[str]) -> np.ndarray:
+            idx = self.gene_index.get_indexer(perts)
+            return idx[idx >= 0]
+        tr_rows_all = rows_for(perts_train); te_rows_all = rows_for(perts_test)
+        present_train = np.any(gp_full.iloc[tr_rows_all, :].values > 0, axis=0) if tr_rows_all.size else np.zeros(Kraw, bool)
+        present_test  = np.any(gp_full.iloc[te_rows_all, :].values > 0, axis=0) if te_rows_all.size else np.zeros(Kraw, bool)
+        in_train_counts = (gp_full.iloc[tr_rows_all, :].values > 0).sum(axis=0) if tr_rows_all.size else np.zeros(Kraw, int)
+        in_test_counts  = (gp_full.iloc[te_rows_all, :].values > 0).sum(axis=0) if te_rows_all.size else np.zeros(Kraw, int)
+        in_any_counts = in_train_counts + in_test_counts
+        prevalence_mask = (in_any_counts <= (0.5 * max(1, len(perts_train)+len(perts_test))))
+        keep_terms_mask = present_train & present_test & prevalence_mask
+
+        gp = gp_full.loc[:, keep_terms_mask].copy()
+        self.term_cols = list(gp.columns)
+        Kkeep = gp.shape[1]
+
+        # GO membership rows for TRAIN/TEST perts (kept terms)
+        P_train = np.zeros((len(perts_train), Kkeep), dtype=np.float32)
+        for i, p in enumerate(perts_train):
+            ridx = self.gene_index.get_loc(p) if p in self.gene_index else -1
+            if ridx >= 0: P_train[i, :] = gp.iloc[ridx, :].values
+        P_test  = np.zeros((len(perts_test), Kkeep), dtype=np.float32)
+        for i, p in enumerate(perts_test):
+            ridx = self.gene_index.get_loc(p) if p in self.gene_index else -1
+            if ridx >= 0: P_test[i, :] = gp.iloc[ridx, :].values
+
+        # drop TRAIN perts with ≤1 term
+        keep_train = (P_train.sum(axis=1) > 1.0)
+        P_train = P_train[keep_train, :]
+        pred_delta_train = pred_delta_train[keep_train, :]
+        true_delta_train = true_delta_train[keep_train, :]
+        self.perts_train_kept = [p for p, k in zip(perts_train, keep_train) if k]
+        self.perts_test = perts_test
+
+        # Build TRAIN oracle matrices (middle-restricted), separate tails
+        Pn, G = pred_delta_train.shape
+        Bpos = np.zeros((Pn, G), dtype=np.float32)
+        Bneg = np.zeros((Pn, G), dtype=np.float32)
+        for i in range(Pn):
+            xd = pred_delta_train[i]; td = true_delta_train[i]
+            pos_frozen = topk_indices_desc(xd, self.K)
+            neg_frozen = bottomk_indices_asc(xd, self.K)
+            middle = np.ones(G, dtype=bool); middle[pos_frozen] = False; middle[neg_frozen] = False
+            mid_idx = np.where(middle)[0]
+            if mid_idx.size == 0:
+                continue
+            k_eff = min(self.K, mid_idx.size)
+            pos_oracle = mid_idx[np.argsort(-td[mid_idx], kind="mergesort")][:k_eff]
+            neg_oracle = mid_idx[np.argsort( td[mid_idx],  kind="mergesort")][:k_eff]
+            Bpos[i, pos_oracle] = 1.0
+            Bneg[i, neg_oracle] = 1.0
+
+        r = min(self.rank, max(2, min(Bpos.shape[0], Bpos.shape[1])))
+        if self.factorizer == "nmf":
+            nmf_pos = NMF(n_components=r, init="nndsvda", max_iter=400, random_state=0)
+            nmf_neg = NMF(n_components=r, init="nndsvda", max_iter=400, random_state=0)
+            Wpos = nmf_pos.fit_transform(np.maximum(Bpos, 0))  # (Pn, r)
+            Hpos = nmf_pos.components_                        # (r, G)
+            Wneg = nmf_neg.fit_transform(np.maximum(Bneg, 0))
+            Hneg = nmf_neg.components_
+        else:
+            svd_pos = TruncatedSVD(n_components=r, random_state=0)
+            svd_neg = TruncatedSVD(n_components=r, random_state=0)
+            Wpos = svd_pos.fit_transform(Bpos)   # (Pn, r)
+            Hpos = svd_pos.components_          # (r, G)
+            Wneg = svd_neg.fit_transform(Bneg)
+            Hneg = svd_neg.components_
+
+        # Optional TF-IDF on GO features (fit on TRAIN, apply to TRAIN+TEST)
+        if self.use_tfidf:
+            # df counts on TRAIN (after filtering)
+            df = (P_train > 0).sum(axis=0).astype(np.float32)  # (Kkeep,)
+            N = float(P_train.shape[0])
+            # Smooth IDF (log((N+1)/(df+1)) + 1) to avoid negatives/inf
+            idf = np.log((N + 1.0) / (df + 1.0)) + 1.0
+            self.idf_vec = idf.astype(np.float32)
+            X_train = P_train * self.idf_vec[None, :]
+            X_test  = P_test  * self.idf_vec[None, :]
+        else:
+            self.idf_vec = None
+            X_train, X_test = P_train, P_test
+
+        # Elastic Net: GO (kept terms, TF-IDF if enabled) -> motif weights
+        self.reg_pos = ElasticNet(alpha=self.enet_alpha, l1_ratio=self.enet_l1_ratio,
+                                  fit_intercept=True, random_state=0, max_iter=2000)
+        self.reg_neg = ElasticNet(alpha=self.enet_alpha, l1_ratio=self.enet_l1_ratio,
+                                  fit_intercept=True, random_state=0, max_iter=2000)
+        self.reg_pos.fit(X_train, Wpos)
+        self.reg_neg.fit(X_train, Wneg)
+        self.H_pos = Hpos.astype(np.float32); self.H_neg = Hneg.astype(np.float32)
+
+        # cache term rows
+        self.P_test_kept = P_test
+        self.P_train_kept = P_train
+        self._test_term_rows = {p: P_test[i, :].astype(bool) for i, p in enumerate(perts_test)}
+        self._train_term_rows = {p: P_train[i, :].astype(bool) for i, p in enumerate(self.perts_train_kept)}
+
+    def select(self, pred_delta_vec, pos_frozen, neg_frozen, pert_label):
+        assert self.H_pos is not None and self.H_neg is not None
+        G = pred_delta_vec.size
+        middle = np.ones(G, dtype=bool); middle[pos_frozen] = False; middle[neg_frozen] = False
+        mid_idx = np.where(middle)[0]
+        if mid_idx.size == 0:
+            return np.array([], int), np.array([], int)
+
+        # GO vector of this pert (kept terms)
+        if pert_label in self._test_term_rows:
+            x = self.P_test_kept[list(self._test_term_rows.keys()).index(pert_label), :]
+        elif pert_label in self._train_term_rows:
+            x = self.P_train_kept[list(self._train_term_rows.keys()).index(pert_label), :]
+        else:
+            return np.array([], int), np.array([], int)
+
+        # TF-IDF for TEST row if enabled
+        if self.idf_vec is not None:
+            x = x * self.idf_vec
+
+        # predict motif weights and reconstruct scores
+        Wp = self.reg_pos.predict(x[None, :])  # (1, r)
+        Wn = self.reg_neg.predict(x[None, :])
+        s_pos = (Wp @ self.H_pos).ravel().astype(np.float32)  # (G,)
+        s_neg = (Wn @ self.H_neg).ravel().astype(np.float32)
+
+        k_eff = min(self.K, mid_idx.size)
+        pos_order = mid_idx[np.argsort(-s_pos[mid_idx], kind="mergesort")][:k_eff]
+        neg_order = mid_idx[np.argsort(-s_neg[mid_idx], kind="mergesort")][:k_eff]
+        return pos_order, neg_order
+
     
 
 # ---- NEW: Supervised selector with XGBoost over PCA gene embeddings ----
@@ -814,7 +1187,7 @@ def main():
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--K", type=int, default=1500, help="Top-K size for each tail to freeze and to boost.")
     ap.add_argument("--test_pct_pert", type=float, default=0.2, help="Fraction of perturbations in TEST (0..1).")
-    ap.add_argument("--method", choices=["random", "pair_score", "xgb", "go_score"], default="random")
+    ap.add_argument("--method", choices=["random", "pair_score", "xgb", "go_score", "go_score_modules", "go_score_motifs"], default="go_score")
     ap.add_argument("--pathways_yaml", type=str, default="", help="Required for method=pair_score.")
     ap.add_argument("--topL", type=int, default=100, help="Sparsity for v_p: keep top-|v| entries per test pert.")
     ap.add_argument("--gamma", type=float, default=0.5, help="Pathway size normalization exponent (0..1).")
@@ -829,6 +1202,19 @@ def main():
     ap.add_argument("--xgb_lr", type=float, default=0.05)
     ap.add_argument("--xgb_subsample", type=float, default=0.9)
     ap.add_argument("--xgb_colsample", type=float, default=0.8)
+    # Modules (for go_score_modules)
+    ap.add_argument("--modules_k", type=int, default=300, help="Number of responder-gene modules (k-means over kept GO columns).")
+    ap.add_argument("--modules_topm_per", type=int, default=50, help="Max genes to pick per selected module (soft cap).")
+    # Motifs (for go_score_motifs)
+    ap.add_argument("--motifs_rank", type=int, default=256, help="Rank (number of motifs) (per tail).")
+    ap.add_argument("--motifs_factorizer", choices=["nmf","svd"], default="nmf",
+                    help="Factorizer for oracle matrices (default: nmf).")
+    ap.add_argument("--motifs_tfidf", type=int, default=1,
+                    help="If 1, apply TF-IDF to GO features (IDF fit on TRAIN) before regression.")
+    ap.add_argument("--enet_alpha", type=float, default=0.1,
+                    help="ElasticNet alpha (overall regularization strength).")
+    ap.add_argument("--enet_l1_ratio", type=float, default=0.2,
+                    help="ElasticNet l1_ratio (0=ridge, 1=lasso).")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -884,6 +1270,58 @@ def main():
             genes=list(pred.var_names),
             pathways_yaml=args.pathways_yaml,
         )
+        # --- Write GO-term Jaccard index across all perts (train ∪ test) ---
+        try:
+            # Build membership rows using the exact cached matrices & exact row orders
+            # Use exactly the kept-term membership cached in the selector to avoid any column/row mismatch
+            P_train_bool = selector.P_train_all_keptTerms.astype(bool)
+            P_test_bool  = selector.P_test_kept.astype(bool)
+            perts_all = list(selector.perts_train_all) + list(perts_test)
+
+            B = np.vstack([P_train_bool, P_test_bool]).astype(np.uint8)  # (N_perts, K_terms_kept)
+            inter = B @ B.T                                               # |A ∩ B|
+            row_sums = B.sum(axis=1)[:, None]                             # |A|
+            union = row_sums + row_sums.T - inter                         # |A ∪ B|
+            with np.errstate(divide="ignore", invalid="ignore"):
+                jacc = (inter / union).astype(float)
+                jacc[~np.isfinite(jacc)] = 0.0  # handles 0/0 rows (no kept terms)
+            jacc_df = pd.DataFrame(jacc, index=perts_all, columns=perts_all)
+            jacc_path = os.path.join(args.out_dir, "go_term_jaccard_perts.csv")
+            jacc_df.to_csv(jacc_path)
+            print(f"[go_score] Wrote GO-term Jaccard matrix: {jacc_path}")
+        except Exception as e:
+            print(f"[go_score][warn] Could not write Jaccard matrix: {e}")
+
+    elif args.method == "go_score_modules":
+        if not args.pathways_yaml:
+            raise ValueError("--pathways_yaml is required for method=go_score_modules.")
+        selector = GOModuleTailSelector(K=args.K, rng=rng, k_modules=args.modules_k, topm_per=args.modules_topm_per)
+        selector.fit(
+            pred_delta_train=pred_delta_all[train_idx, :],
+            true_delta_train=true_delta_all[train_idx, :],
+            perts_train=perts_train,
+            perts_test=perts_test,
+            genes=list(pred.var_names),
+            pathways_yaml=args.pathways_yaml,
+        )
+    elif args.method == "go_score_motifs":
+        if not args.pathways_yaml:
+            raise ValueError("--pathways_yaml is required for method=go_score_motifs.")
+        selector = GOMotifTailSelector(
+            K=args.K, rng=rng, rank=args.motifs_rank,
+            factorizer=args.motifs_factorizer,
+            use_tfidf=bool(args.motifs_tfidf),
+            enet_alpha=args.enet_alpha, enet_l1_ratio=args.enet_l1_ratio,
+        )
+        selector.fit(
+            pred_delta_train=pred_delta_all[train_idx, :],
+            true_delta_train=true_delta_all[train_idx, :],
+            perts_train=perts_train,
+            perts_test=perts_test,
+            genes=list(pred.var_names),
+            pathways_yaml=args.pathways_yaml,
+        )
+
     else:  # xgb
         if not args.pathways_yaml:
             raise ValueError("--pathways_yaml is required for method=xgb.")
@@ -934,7 +1372,7 @@ def main():
         neg_frozen = bottomk_indices_asc(x, args.K)
         if args.method == "random":
             pos_boost, neg_boost = selector.select(x, pos_frozen=pos_frozen, neg_frozen=neg_frozen)
-        elif args.method == "pair_score":
+        elif args.method in ("pair_score", "xgb", "go_score", "go_score_modules", "go_score_motifs"):
             pos_boost, neg_boost = selector.select(x, pos_frozen=pos_frozen, neg_frozen=neg_frozen, pert_label=pert_label)
         elif args.method == "go_score":
             pos_boost, neg_boost = selector.select(
@@ -1007,7 +1445,7 @@ def main():
             neg_frozen = bottomk_indices_asc(x, args.K)
             if args.method == "random":
                 pos_boost, neg_boost = selector.select(x, pos_frozen=pos_frozen, neg_frozen=neg_frozen)
-            elif args.method in ("pair_score", "xgb", "go_score"):
+            elif args.method in ("pair_score", "xgb", "go_score", "go_score_modules", "go_score_motifs"):
                 pos_boost, neg_boost = selector.select(
                     pred_delta_vec=x,
                     pos_frozen=pos_frozen,
@@ -1054,6 +1492,108 @@ def main():
     pd.DataFrame({"pert": perts_train, "split": "train"}).to_csv(os.path.join(args.out_dir, "perts_train.csv"), index=False)
     pd.DataFrame({"pert": perts_test,  "split": "test" }).to_csv(os.path.join(args.out_dir, "perts_test.csv"),  index=False)
 
+
+    # ----------------------------------------------------------------------
+    # NEW: Pairwise Jaccard of ground-truth "middle genes that should shift to tails"
+    #      computed over the intersection of the two perts' middle sets.
+    #      Saves 3 matrices: +tail, -tail, and union(+ ∪ -).
+    # ----------------------------------------------------------------------
+    try:
+        # Build per-pert middle masks and oracle-in-middle sets for ALL perts
+        # Order: train_idx rows followed by test_idx rows (match perts_train + perts_test)
+        perts_all = perts_train + perts_test
+        pred_all  = np.vstack([pred_delta_all[train_idx, :], pred_delta_all[test_idx, :]])
+        true_all  = np.vstack([true_delta_all[train_idx, :], true_delta_all[test_idx, :]])
+        P, G = pred_all.shape
+
+        # Middle masks and oracle sets
+        mid_mask = np.ones((P, G), dtype=bool)
+        pos_orcl = np.zeros((P, G), dtype=bool)
+        neg_orcl = np.zeros((P, G), dtype=bool)
+        for i in range(P):
+            xd = pred_all[i]; td = true_all[i]
+            # freeze tails by predicted deltas
+            pos_frozen = topk_indices_desc(xd, args.K)
+            neg_frozen = bottomk_indices_asc(xd, args.K)
+            m = np.ones(G, dtype=bool); m[pos_frozen] = False; m[neg_frozen] = False
+            mid_mask[i, :] = m
+            if np.any(m):
+                k_eff = min(args.K, int(m.sum()))
+                mid_idx = np.where(m)[0]
+                pos_pick = mid_idx[np.argsort(-td[mid_idx], kind="mergesort")][:k_eff]
+                neg_pick = mid_idx[np.argsort( td[mid_idx],  kind="mergesort")][:k_eff]
+                pos_orcl[i, pos_pick] = True
+                neg_orcl[i, neg_pick] = True
+
+        # Restrict oracle rows to their own middles (so pairwise intersection implicitly enforces common middle)
+        B_pos = pos_orcl & mid_mask
+        B_neg = neg_orcl & mid_mask
+        B_both = (pos_orcl | neg_orcl) & mid_mask
+
+        def jaccard_from_binary(B: np.ndarray) -> np.ndarray:
+            # Ensure integer arithmetic for true intersection COUNTS (avoid boolean semiring!)
+            B_int = B.astype(np.int32, copy=False)
+            inter = (B_int @ B_int.T).astype(np.float64)   # |A ∩ B|
+            row_sums = B_int.sum(axis=1).astype(np.float64)  # |A|
+            union = row_sums[:, None] + row_sums[None, :] - inter
+            with np.errstate(divide="ignore", invalid="ignore"):
+                J = inter / union
+                J[~np.isfinite(J)] = 0.0  # rows with no middle-oracle picks yield 0/0
+            return J
+
+        method_space = args.method
+        if method_space == "go_score_modules" and hasattr(selector, "module_labels"):
+            # map gene-sets -> module-sets
+            labels = selector.module_labels  # (G,)
+            M = int(labels.max()) + 1
+            def to_module_rows(B):
+                # B: (P,G) boolean; return (P,M) boolean: module selected if any oracle gene falls in it
+                rows = np.zeros((B.shape[0], M), dtype=bool)
+                for i in range(B.shape[0]):
+                    idx = np.where(B[i])[0]
+                    if idx.size:
+                        rows[i, np.unique(labels[idx])] = True
+                return rows
+            Mb_pos  = to_module_rows(B_pos)
+            Mb_neg  = to_module_rows(B_neg)
+            Mb_both = to_module_rows(B_both)
+            J_pos  = jaccard_from_binary(Mb_pos)
+            J_neg  = jaccard_from_binary(Mb_neg)
+            J_both = jaccard_from_binary(Mb_both)
+        elif method_space == "go_score_motifs" and hasattr(selector, "H_pos"):
+            # project oracle onto motif axis H and pick top-L motifs per pert
+            L = max(5, min(32, getattr(args, "motifs_rank", 64)//4))  # small, fixed shortlist
+            def topL_motifs(B, H):
+                # B: (P,G) boolean -> real activations via B @ H.T ; pick top-L indices per row
+                A = (B.astype(np.float32) @ H.T)  # (P, r)
+                R = np.zeros_like(A, dtype=bool)
+                for i in range(A.shape[0]):
+                    if A.shape[1] == 0: continue
+                    order = np.argsort(-A[i], kind="mergesort")[:min(L, A.shape[1])]
+                    R[i, order] = True
+                return R
+            R_pos  = topL_motifs(B_pos, selector.H_pos)
+            R_neg  = topL_motifs(B_neg, selector.H_neg)
+            R_both = R_pos | R_neg
+            J_pos  = jaccard_from_binary(R_pos)
+            J_neg  = jaccard_from_binary(R_neg)
+            J_both = jaccard_from_binary(R_both)
+        else:
+            # gene-space (original)
+            J_pos  = jaccard_from_binary(B_pos)
+            J_neg  = jaccard_from_binary(B_neg)
+            J_both = jaccard_from_binary(B_both)
+
+        # Save to CSVs
+        jpos_path  = os.path.join(args.out_dir, "jaccard_middle_oracle_pos.csv")
+        jneg_path  = os.path.join(args.out_dir, "jaccard_middle_oracle_neg.csv")
+        jboth_path = os.path.join(args.out_dir, "jaccard_middle_oracle_both.csv")
+        pd.DataFrame(J_pos,  index=perts_all, columns=perts_all).to_csv(jpos_path)
+        pd.DataFrame(J_neg,  index=perts_all, columns=perts_all).to_csv(jneg_path)
+        pd.DataFrame(J_both, index=perts_all, columns=perts_all).to_csv(jboth_path)
+        print(f"[middle→tail Jaccard] Wrote: {jpos_path}, {jneg_path}, {jboth_path}")
+    except Exception as e:
+        print(f"[warn] Failed to write middle→tail Jaccard matrices: {e}")
 
 if __name__ == "__main__":
     main()
