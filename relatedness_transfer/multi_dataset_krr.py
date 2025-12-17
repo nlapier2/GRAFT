@@ -150,8 +150,33 @@ def parse_arguments():
    # Optional sparsification of predicted deltas / fold-changes (for DE-style metrics)
     ap.add_argument("--keep_delta_pct", type=float, default=0.0, help="If >0, per perturbation keep this fraction (0-1) of genes with largest |Δ|")
     ap.add_argument("--keep_foldchange_pct", type=float, default=0.0, help="If >0, per perturbation keep this fraction (0-1) of genes with largest |log2 FC|.")
+
+    ap.add_argument("--external_as_sim_csv", action="store_true",
+        help="Treat paths in --external_list as CSV files of precomputed perturbation similarities.")
+
     args = ap.parse_args()
     return args
+
+def create_kernel_from_similarity_csv(fname: str, target_perts: list[str]) -> tuple[np.ndarray, list[str]]:
+    """
+    Read a precomputed similarity matrix CSV (rows/cols = perts, index_col=0),
+    align to the provided target_perts (order-preserving intersection), and return (K, perts).
+    """
+    df = pd.read_csv(fname, index_col=0)
+    df.index = df.index.astype(str)
+    df.columns = df.columns.astype(str)
+    # intersection in the order of target_perts
+    perts = [p for p in target_perts if p in df.index and p in df.columns]
+    if len(perts) == 0:
+        return np.ones((0, 0), dtype=np.float32), []
+    K = df.loc[perts, perts].to_numpy(dtype=np.float32, copy=True)
+    # numeric hygiene
+    K = np.nan_to_num(K, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    # symmetrize & fix diagonal
+    K = 0.5 * (K + K.T)
+    np.fill_diagonal(K, 1.0)
+    return K, perts
+
 
 def apply_keep_delta_and_foldchange(
     pred_mat: np.ndarray,
@@ -2033,6 +2058,11 @@ def main():
             adata_sources_list = []                  # unused in TSV mode
             # Set a placeholder so downstream branches that expect 'adata_source' don’t fail
             adata_source = None
+        elif getattr(args, "external_as_sim_csv", False):
+            print(f"Found {len(external_paths)} external SIM-CSV file(s) from list (precomputed similarities)...")
+            sim_sources_list = list(external_paths)
+            adata_sources_list = []
+            adata_source = None
         else:
             print(f"Found {len(external_paths)} external dataset(s) from list. Reading & intersecting perts (target unchanged)...")
             adata_sources_list = [
@@ -2106,9 +2136,11 @@ def main():
     # which externals to use
     if using_external_list:
         if getattr(args, "external_as_tsv_deltas", False):
-            src_list = tsv_sources_list  # list of file paths (TSV deltas)
+            src_list = tsv_sources_list  # TSV deltas
+        elif getattr(args, "external_as_sim_csv", False):
+            src_list = sim_sources_list  # SIM CSVs
         else:
-            src_list = adata_sources_list  # list of AnnData externals
+            src_list = adata_sources_list  # AnnData externals
     else:
         src_list = [adata_source]
 
@@ -2119,6 +2151,13 @@ def main():
             # Intersect to *target* perts (O∪U) so ordering matches downstream expectations.
             perts_all = list(dict.fromkeys(list(perts_O) + list(perts_U)))  # O∪U, order-preserving
             K_i, perts_i = create_kernel_from_tsv_deltas(
+                fname=src_i,
+                target_perts=perts_all,
+            )
+        elif using_external_list and getattr(args, "external_as_sim_csv", False):
+            # Precomputed similarity CSVs → use directly as kernels (aligned to O∪U)
+            perts_all = list(dict.fromkeys(list(perts_O) + list(perts_U)))
+            K_i, perts_i = create_kernel_from_similarity_csv(
                 fname=src_i,
                 target_perts=perts_all,
             )
