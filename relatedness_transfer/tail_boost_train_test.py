@@ -921,7 +921,263 @@ class GOMotifTailSelector(BaseTailSelector):
         neg_order = mid_idx[np.argsort(-s_neg[mid_idx], kind="mergesort")][:k_eff]
         return pos_order, neg_order
 
-    
+
+class GOProfileCombinerTailSelector(BaseTailSelector):
+    """
+    Per-test-pert pathway-profile combiner:
+      For a given test pert p*, restrict to its kept GO terms, learn tiny sparse nonnegative
+      weights (per tail) over those terms using TRAIN oracle labels (middle-restricted),
+      then apply the weights to score middle genes for p*.
+    """
+    def __init__(self, K: int, rng: np.random.Generator,
+                 use_idf: bool = True, sim_weight: bool = True, min_shared_terms: int = 1,
+                 l1: float = 0.05, l2: float = 0.0, simplex: bool = True):
+        super().__init__(K)
+        self.rng = rng
+        self.use_idf = use_idf
+        self.sim_weight = sim_weight
+        self.min_shared_terms = int(min_shared_terms)
+        self.l1 = float(l1)
+        self.l2 = float(l2)
+        self.simplex = bool(simplex)
+        # caches
+        self.gene_index: pd.Index | None = None
+        self.term_cols: list[str] | None = None
+        self.idf_vec: np.ndarray | None = None     # (Kkeep,)
+        self.P_train_kept: np.ndarray | None = None
+        self.P_test_kept:  np.ndarray | None = None
+        self._train_term_rows: dict[str, np.ndarray] = {}
+        self._test_term_rows: dict[str, np.ndarray] = {}
+        # term->gene fractions learned on TRAIN (kept terms x genes)
+        self.frac_pos_TG: np.ndarray | None = None
+        self.frac_neg_TG: np.ndarray | None = None
+        # TRAIN perts actually kept after ≤1-term filter
+        self.perts_train_kept: list[str] | None = None
+        self.perts_test: list[str] | None = None
+        # store copies to recompute oracles quickly
+        self._pred_train: np.ndarray | None = None
+        self._true_train: np.ndarray | None = None
+        # cached TRAIN masks (after ≤1-term filter), shape: (P_train_kept, G)
+        self._train_mid_mask: np.ndarray | None = None
+        self._train_pos_oracle: np.ndarray | None = None
+        self._train_neg_oracle: np.ndarray | None = None
+
+    def _load_kept_terms(self, pathways_yaml: str, genes: list[str],
+                         perts_train: list[str], perts_test: list[str]) -> tuple[np.ndarray, np.ndarray, list[str]]:
+        from load_pathways import load_pathway_sources, make_pathway_matrix
+        srcs = load_pathway_sources(pathways_yaml)
+        first_name = list(srcs.keys())[0]
+        meta = srcs[first_name]
+        gp_full = make_pathway_matrix(
+            file_name=meta["file"], gene_col=meta["gene_col"],
+            pathway_col=meta["pathway_col"], format=meta["format"], var_names=genes
+        )
+        gp_full = (gp_full > 0).astype(np.float32)
+        G, Kraw = gp_full.shape
+        self.gene_index = pd.Index(genes)
+        def rows_for(perts: list[str]) -> np.ndarray:
+            idx = self.gene_index.get_indexer(perts)
+            return idx[idx >= 0]
+        tr_rows_all = rows_for(perts_train)
+        te_rows_all = rows_for(perts_test)
+        present_train = np.any(gp_full.iloc[tr_rows_all, :].values > 0, axis=0) if tr_rows_all.size else np.zeros(Kraw, bool)
+        present_test  = np.any(gp_full.iloc[te_rows_all, :].values > 0, axis=0) if te_rows_all.size else np.zeros(Kraw, bool)
+        # Drop GO terms in >50% of (train ∪ test) perts
+        in_train_counts = (gp_full.iloc[tr_rows_all, :].values > 0).sum(axis=0) if tr_rows_all.size else np.zeros(Kraw, int)
+        in_test_counts  = (gp_full.iloc[te_rows_all, :].values > 0).sum(axis=0) if te_rows_all.size else np.zeros(Kraw, int)
+        in_any_counts = in_train_counts + in_test_counts
+        prevalence_mask = (in_any_counts <= (0.5 * max(1, len(perts_train)+len(perts_test))))
+        keep_mask = present_train & present_test & prevalence_mask
+        gp = gp_full.loc[:, keep_mask].copy()
+        self.term_cols = list(gp.columns)
+        return gp.values.astype(np.float32), gp.index.tolist(), self.term_cols
+
+    def fit(self, pred_delta_train: np.ndarray, true_delta_train: np.ndarray,
+            perts_train: list[str], perts_test: list[str],
+            genes: list[str], pathways_yaml: str):
+        # kept terms matrix (G x Kkeep)
+        GP, gene_index_list, _ = self._load_kept_terms(pathways_yaml, genes, perts_train, perts_test)
+        G, Kkeep = GP.shape
+        self.perts_test = perts_test
+        self._pred_train = pred_delta_train.copy()
+        self._true_train = true_delta_train.copy()
+        self.gene_index = pd.Index(genes)
+        # perturbed-gene term rows (TRAIN/TEST)
+        def build_P(perts: list[str]) -> np.ndarray:
+            P = np.zeros((len(perts), Kkeep), dtype=np.float32)
+            for i, p in enumerate(perts):
+                if p in self.gene_index:
+                    ridx = self.gene_index.get_loc(p)
+                    P[i, :] = GP[ridx, :]
+            return P
+        P_train = build_P(perts_train)
+        P_test  = build_P(perts_test)
+        # keep TRAIN perts with >1 term
+        keep_tr = (P_train.sum(axis=1) > 1.0)
+        self.P_train_kept = P_train[keep_tr, :]
+        self.perts_train_kept = [p for p, k in zip(perts_train, keep_tr) if k]
+        pred_train = pred_delta_train[keep_tr, :]
+        true_train = true_delta_train[keep_tr, :]
+        self.P_test_kept = P_test
+        self._train_term_rows = {p: self.P_train_kept[i, :].astype(bool) for i, p in enumerate(self.perts_train_kept)}
+        self._test_term_rows  = {p: self.P_test_kept[i, :].astype(bool)  for i, p in enumerate(perts_test)}
+        # IDF on TRAIN perts (optional) — used later inside select(), applied to columns
+        if self.use_idf:
+            df = (self.P_train_kept > 0).sum(axis=0).astype(np.float32)
+            N = float(self.P_train_kept.shape[0])
+            self.idf_vec = (np.log((N + 1.0) / (df + 1.0)) + 1.0).astype(np.float32)
+        else:
+            self.idf_vec = None
+        # Compute term->gene fractions on TRAIN (middle-restricted)
+        pos_counts = np.zeros((Kkeep, G), dtype=np.float32)
+        neg_counts = np.zeros((Kkeep, G), dtype=np.float32)
+        term_den   = np.zeros((Kkeep,), dtype=np.float32)
+        Pn = pred_train.shape[0]
+        for i in range(Pn):
+            terms_i = np.where(self.P_train_kept[i, :] > 0)[0]
+            if terms_i.size == 0:
+                continue
+            xd = pred_train[i]; td = true_train[i]
+            pos_frozen = topk_indices_desc(xd, self.K)
+            neg_frozen = bottomk_indices_asc(xd, self.K)
+            middle = np.ones(G, dtype=bool); middle[pos_frozen] = False; middle[neg_frozen] = False
+            mid_idx = np.where(middle)[0]
+            if mid_idx.size == 0:
+                continue
+            k_eff = min(self.K, mid_idx.size)
+            pos_oracle = mid_idx[np.argsort(-td[mid_idx], kind="mergesort")][:k_eff]
+            neg_oracle = mid_idx[np.argsort( td[mid_idx],  kind="mergesort")][:k_eff]
+            # update counts for each term present in this pert
+            np.add.at(pos_counts, (terms_i[:, None], pos_oracle[None, :]), 1.0)
+            np.add.at(neg_counts, (terms_i[:, None], neg_oracle[None, :]), 1.0)
+            term_den[terms_i] += 1.0
+        den = np.maximum(term_den, 1.0)
+        self.frac_pos_TG = (pos_counts / den[:, None]).astype(np.float32)  # (Kkeep, G)
+        self.frac_neg_TG = (neg_counts / den[:, None]).astype(np.float32)
+
+        # ------------------------------------------------------------------
+        # Precompute TRAIN perts' middle masks and oracle (+/−) masks ONCE
+        # ------------------------------------------------------------------
+        Pn = pred_train.shape[0]
+        G = pred_train.shape[1]
+        mid_mask = np.zeros((Pn, G), dtype=bool)
+        pos_orc  = np.zeros((Pn, G), dtype=bool)
+        neg_orc  = np.zeros((Pn, G), dtype=bool)
+        for i in range(Pn):
+            xd = pred_train[i]; td = true_train[i]
+            pos_frozen = topk_indices_desc(xd, self.K)
+            neg_frozen = bottomk_indices_asc(xd, self.K)
+            m = np.ones(G, dtype=bool); m[pos_frozen] = False; m[neg_frozen] = False
+            mid_idx = np.where(m)[0]
+            mid_mask[i, :] = m
+            if mid_idx.size > 0:
+                k_eff = min(self.K, mid_idx.size)
+                pos_oracle = mid_idx[np.argsort(-td[mid_idx], kind="mergesort")][:k_eff]
+                neg_oracle = mid_idx[np.argsort( td[mid_idx],  kind="mergesort")][:k_eff]
+                pos_orc[i, pos_oracle] = True
+                neg_orc[i, neg_oracle] = True
+        self._train_mid_mask = mid_mask
+        self._train_pos_oracle = pos_orc
+        self._train_neg_oracle = neg_orc
+
+    def _similarity(self, mask_train: np.ndarray, mask_test: np.ndarray) -> float:
+        # Jaccard over test's active terms: |∩|/|∪|
+        a = mask_train.astype(bool); b = mask_test.astype(bool)
+        inter = np.logical_and(a, b).sum()
+        union = np.logical_or(a, b).sum()
+        if union == 0: return 0.0
+        return float(inter) / float(union)
+
+    def _fit_nnls(self, X: np.ndarray, y: np.ndarray) -> np.ndarray:
+        """
+        Tiny projected-gradient NNLS with optional L1/L2 reg and simplex renorm.
+        Solves: min_w ||X w - y||^2 + l2*||w||^2 + l1*||w||_1  s.t. w>=0
+        """
+        d = X.shape[1]
+        w = np.full(d, 1.0 / max(1, d), dtype=np.float32)
+        Xt = X.T.astype(np.float32)
+        # Precompute for speed
+        lipschitz = float(np.linalg.norm(X, ord=2)**2 + self.l2 + 1e-6)
+        step = 1.0 / lipschitz
+        for _ in range(200):  # few iterations suffice (d ~ 20)
+            # grad = 2 X^T (Xw - y) + 2 l2 w + l1 * sign (subgrad -> +l1 since w>=0)
+            r = X @ w - y
+            grad = 2.0 * (Xt @ r) + 2.0 * self.l2 * w + self.l1
+            w = w - step * grad
+            # project to nonnegative orthant
+            np.maximum(w, 0.0, out=w)
+            # (optional) early stop on small grad
+            if np.linalg.norm(grad) < 1e-5:
+                break
+        if self.simplex:
+            s = w.sum()
+            if s > 0:
+                w = w / s
+        return w.astype(np.float32)
+
+    def select(self, pred_delta_vec: np.ndarray, pos_frozen: np.ndarray, neg_frozen: np.ndarray, pert_label: str):
+        assert self.frac_pos_TG is not None and self.frac_neg_TG is not None
+        assert self._train_mid_mask is not None and self._train_pos_oracle is not None and self._train_neg_oracle is not None
+        G = pred_delta_vec.size
+        # middle genes for THIS test pert
+        middle = np.ones(G, dtype=bool); middle[pos_frozen] = False; middle[neg_frozen] = False
+        mid_idx = np.where(middle)[0]
+        if mid_idx.size == 0:
+            return np.array([], int), np.array([], int)
+        # term mask for THIS pert
+        tmask = self._test_term_rows.get(pert_label, None)
+        if tmask is None:
+            tmask = self._train_term_rows.get(pert_label, None)
+        if tmask is None or not tmask.any():
+            return np.array([], int), np.array([], int)
+        term_idx = np.where(tmask)[0]
+        # TRAIN subset by shared terms
+        keep_rows = []
+        weights_q = []
+        for p, m in self._train_term_rows.items():
+            inter = (m & tmask).sum()
+            if inter >= self.min_shared_terms:
+                keep_rows.append(p)
+                weights_q.append(self._similarity(m, tmask) if self.sim_weight else 1.0)
+        if len(keep_rows) == 0:
+            return np.array([], int), np.array([], int)
+        wq = np.asarray(weights_q, dtype=np.float32)
+        wq = np.where(wq > 0, wq, 1e-6)
+        # Map perts -> row indices in cached masks
+        p2i = {p: i for i, p in enumerate(self.perts_train_kept)}
+        idx_rows = np.array([p2i[p] for p in keep_rows], dtype=int)
+        # Aggregate WEIGHTED targets across selected TRAIN perts
+        mid_mat = self._train_mid_mask[idx_rows, :]      # (R, G)
+        pos_mat = self._train_pos_oracle[idx_rows, :]    # (R, G)
+        neg_mat = self._train_neg_oracle[idx_rows, :]    # (R, G)
+        # denominator: sum_q wq * 1[g in middle_q]
+        denom = (wq[:, None] * mid_mat.astype(np.float32)).sum(axis=0)  # (G,)
+        # numerators: sum_q wq * 1[g in pos/neg oracle]
+        num_pos = (wq[:, None] * pos_mat.astype(np.float32)).sum(axis=0)
+        num_neg = (wq[:, None] * neg_mat.astype(np.float32)).sum(axis=0)
+        eps = 1e-8
+        ybar_pos = (num_pos / (denom + eps)).astype(np.float32)  # (G,)
+        ybar_neg = (num_neg / (denom + eps)).astype(np.float32)
+        # Build TEST design on THIS test pert's middle genes only
+        Xp_test = self.frac_pos_TG[term_idx, :][:, mid_idx].T  # (|mid|, d)
+        Xn_test = self.frac_neg_TG[term_idx, :][:, mid_idx].T
+        if (self.idf_vec is not None):
+            idf = self.idf_vec[term_idx]
+            Xp_test = Xp_test * idf[None, :]
+            Xn_test = Xn_test * idf[None, :]
+        y_pos_mid = ybar_pos[mid_idx]
+        y_neg_mid = ybar_neg[mid_idx]
+        # Fit tiny NNLS-like weights (nonnegative, optional simplex)
+        wp_vec = self._fit_nnls(Xp_test, y_pos_mid)
+        wn_vec = self._fit_nnls(Xn_test, y_neg_mid)
+        # Score and pick top-K within THIS test pert's middle
+        s_pos = (Xp_test @ wp_vec).astype(np.float32)
+        s_neg = (Xn_test @ wn_vec).astype(np.float32)
+        k_eff = min(self.K, mid_idx.size)
+        pos_boost = mid_idx[np.argsort(-s_pos, kind="mergesort")][:k_eff]
+        neg_boost = mid_idx[np.argsort(-s_neg, kind="mergesort")][:k_eff]
+        return pos_boost, neg_boost
+
 
 # ---- NEW: Supervised selector with XGBoost over PCA gene embeddings ----
 class XGBTailSelector(BaseTailSelector):
@@ -1187,7 +1443,7 @@ def main():
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--K", type=int, default=1500, help="Top-K size for each tail to freeze and to boost.")
     ap.add_argument("--test_pct_pert", type=float, default=0.2, help="Fraction of perturbations in TEST (0..1).")
-    ap.add_argument("--method", choices=["random", "pair_score", "xgb", "go_score", "go_score_modules", "go_score_motifs"], default="go_score")
+    ap.add_argument("--method", choices=["random", "pair_score", "xgb", "go_score", "go_score_modules", "go_score_motifs", "go_profile_combiner"], default="go_score")
     ap.add_argument("--pathways_yaml", type=str, default="", help="Required for method=pair_score.")
     ap.add_argument("--topL", type=int, default=100, help="Sparsity for v_p: keep top-|v| entries per test pert.")
     ap.add_argument("--gamma", type=float, default=0.5, help="Pathway size normalization exponent (0..1).")
@@ -1215,6 +1471,13 @@ def main():
                     help="ElasticNet alpha (overall regularization strength).")
     ap.add_argument("--enet_l1_ratio", type=float, default=0.2,
                     help="ElasticNet l1_ratio (0=ridge, 1=lasso).")
+    # Profile combiner (per-test tiny learner over that test pert's terms)
+    ap.add_argument("--combiner_use_idf", type=int, default=1, help="Apply IDF weighting to GO columns (fit on TRAIN).")
+    ap.add_argument("--combiner_sim_weight", type=int, default=1, help="Weight TRAIN perts by profile similarity to the test pert.")
+    ap.add_argument("--combiner_min_shared_terms", type=int, default=1, help="Min # shared terms with the test pert to include a TRAIN pert.")
+    ap.add_argument("--combiner_l1", type=float, default=0.05, help="L1 strength for sparse nonnegative weights.")
+    ap.add_argument("--combiner_l2", type=float, default=0.0, help="L2 strength (small ridge) for stability.")
+    ap.add_argument("--combiner_simplex", type=int, default=1, help="Renormalize weights to sum to 1 after nonneg clipping.")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -1321,6 +1584,27 @@ def main():
             genes=list(pred.var_names),
             pathways_yaml=args.pathways_yaml,
         )
+    elif args.method == "go_profile_combiner":
+        if not args.pathways_yaml:
+            raise ValueError("--pathways_yaml is required for method=go_profile_combiner.")
+        selector = GOProfileCombinerTailSelector(
+            K=args.K,
+            rng=rng,
+            use_idf=bool(args.combiner_use_idf),
+            sim_weight=bool(args.combiner_sim_weight),
+            min_shared_terms=int(args.combiner_min_shared_terms),
+            l1=args.combiner_l1,
+            l2=args.combiner_l2,
+            simplex=bool(args.combiner_simplex),
+        )
+        selector.fit(
+            pred_delta_train=pred_delta_all[train_idx, :],
+            true_delta_train=true_delta_all[train_idx, :],
+            perts_train=perts_train,
+            perts_test=perts_test,
+            genes=list(pred.var_names),
+            pathways_yaml=args.pathways_yaml,
+        )
 
     else:  # xgb
         if not args.pathways_yaml:
@@ -1372,7 +1656,7 @@ def main():
         neg_frozen = bottomk_indices_asc(x, args.K)
         if args.method == "random":
             pos_boost, neg_boost = selector.select(x, pos_frozen=pos_frozen, neg_frozen=neg_frozen)
-        elif args.method in ("pair_score", "xgb", "go_score", "go_score_modules", "go_score_motifs"):
+        elif args.method in ("pair_score", "xgb", "go_score", "go_score_modules", "go_score_motifs", "go_profile_combiner"):
             pos_boost, neg_boost = selector.select(x, pos_frozen=pos_frozen, neg_frozen=neg_frozen, pert_label=pert_label)
         elif args.method == "go_score":
             pos_boost, neg_boost = selector.select(
