@@ -50,6 +50,8 @@ def parse_arguments():
     ap.add_argument("--external_as_tsv_deltas", action="store_true",
                     help="If set, entries in --external_list are TSV files with genes as rows and perts as columns; values are already deltas..")
     ap.add_argument("--run_diagnostics", action="store_true", help="Run diagnostic analyses on kernel relatedness.")
+    ap.add_argument("--diagnostics_dir", type=str, default=".",
+        help="Where to write diagnostic CSV/NPZ files when --run_diagnostics is set.")
     ap.add_argument("--sampling_var_topk_frac", type=float, default=0.0,
                     help="Fraction of genes (by |delta|) to apply --sampling_var_topk_shrink to. 0.0 disables.")
     ap.add_argument("--sampling_var_topk_shrink", type=float, default=0.1,
@@ -2016,6 +2018,463 @@ def save_magnitude_diagnostics(
         print(f"[diag-mag] FAILED to save diagnostic CSV: {e}")
 
 
+def compute_corr_of_corrs_table(
+    K_true: np.ndarray,
+    perts_true: list[str],
+    externals: list[tuple[np.ndarray, list[str], str]],
+    min_overlap_abs: int = 5,
+    min_overlap_frac: float = 0.10,
+) -> pd.DataFrame:
+    """
+    Returns a DataFrame:
+      index = perts_true
+      columns = external dataset names
+      values = corr-of-corrs for each perturbation
+    """
+    pos_true = {p: i for i, p in enumerate(perts_true)}
+    out = pd.DataFrame(index=perts_true)
+
+    for (K_ext, perts_ext, ext_name) in externals:
+        pos_ext = {p: i for i, p in enumerate(perts_ext)}
+        vals = []
+
+        for p in perts_true:
+            if p not in pos_ext:
+                vals.append(np.nan)
+                continue
+
+            # common perturbations (exclude p itself)
+            common = [q for q in perts_true if (q in pos_ext and q != p)]
+            if len(common) < min_overlap_abs:
+                vals.append(np.nan)
+                continue
+            if len(common) < int(np.ceil(min_overlap_frac * (len(perts_true) - 1))):
+                vals.append(np.nan)
+                continue
+
+            i = pos_true[p]
+            j = pos_ext[p]
+            idx_true = [pos_true[q] for q in common]
+            idx_ext  = [pos_ext[q]  for q in common]
+
+            a = K_true[i, idx_true].astype(float)
+            b = K_ext[j, idx_ext].astype(float)
+
+            # If either vector is constant-ish, correlation is undefined
+            if (np.std(a) < 1e-12) or (np.std(b) < 1e-12):
+                vals.append(np.nan)
+            else:
+                vals.append(float(np.corrcoef(a, b)[0, 1]))
+
+        out[ext_name] = vals
+
+    return out
+
+
+def compute_external_kernel_pairwise_uncertainty(
+    perts_all: list[str],
+    externals: list[tuple[np.ndarray, list[str], str]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
+    """
+    Align each external kernel to perts_all with NaNs for missing entries,
+    then compute:
+      - mean over externals
+      - std over externals (ddof=1; requires >=2 datasets per pair)
+      - count of contributing datasets per pair
+
+    Returns (K_mean, K_std, K_n, ext_names)
+    where K_* are (P x P).
+    """
+    P = len(perts_all)
+    M = len(externals)
+
+    K_stack = np.full((M, P, P), np.nan, dtype=np.float32)
+    ext_names = []
+
+    pos_all = {p: i for i, p in enumerate(perts_all)}
+
+    for m, (K_ext, perts_ext, ext_name) in enumerate(externals):
+        ext_names.append(ext_name)
+        pos_ext = {p: i for i, p in enumerate(perts_ext)}
+
+        common = [p for p in perts_all if p in pos_ext]
+        if len(common) == 0:
+            continue
+
+        ia = [pos_all[p] for p in common]
+        ie = [pos_ext[p] for p in common]
+
+        K_sub = K_ext[np.ix_(ie, ie)].astype(np.float32, copy=False)
+        K_stack[m][np.ix_(ia, ia)] = K_sub
+
+    K_n = np.sum(np.isfinite(K_stack), axis=0).astype(np.int32)
+    K_mean = np.nanmean(K_stack, axis=0).astype(np.float32)
+
+    # ddof=1 => sample std; only meaningful if >=2 datasets contribute
+    with np.errstate(invalid="ignore", divide="ignore"):
+        K_std = np.nanstd(K_stack, axis=0, ddof=1).astype(np.float32)
+    K_std[K_n < 2] = np.nan
+
+    return K_mean, K_std, K_n, ext_names
+
+
+def _align_kernel_to_perts(K: np.ndarray, perts_K: list[str], perts_all: list[str]) -> np.ndarray:
+    """Return (P x P) matrix aligned to perts_all with NaNs where missing."""
+    P = len(perts_all)
+    out = np.full((P, P), np.nan, dtype=np.float32)
+    pos_all = {p: i for i, p in enumerate(perts_all)}
+    pos_K = {p: i for i, p in enumerate(perts_K)}
+    common = [p for p in perts_all if p in pos_K]
+    if len(common) == 0:
+        return out
+    ia = [pos_all[p] for p in common]
+    ik = [pos_K[p] for p in common]
+    out[np.ix_(ia, ia)] = K[np.ix_(ik, ik)].astype(np.float32, copy=False)
+    return out
+
+
+def write_kernel_uncertainty_report(
+    outdir: str,
+    perts_eval: list[str],
+    eval_metrics: dict | None,
+    perts_all: list[str],
+    K_true_all: np.ndarray,
+    externals: list[tuple[np.ndarray, list[str], str]],
+    K_fused: np.ndarray | None,
+    perts_fused: list[str] | None,
+):
+    """
+    Produces:
+      - kernel_corr_of_corrs.csv
+      - kernel_uncertainty_pairwise.npz
+      - per_pert_kernel_diagnostics.csv
+      - per_pert_kernel_diagnostics_corr_pearson.csv
+      - per_pert_kernel_diagnostics_corr_spearman.csv
+      - pair_uncertainty_vs_abs_kernel_error.txt
+      - pair_uncertainty_vs_abs_kernel_error_top.csv
+    """
+    os.makedirs(outdir, exist_ok=True)
+
+    # --- corr-of-corrs ---
+    df_coc = compute_corr_of_corrs_table(K_true_all, perts_all, externals)
+    df_coc.to_csv(os.path.join(outdir, "kernel_corr_of_corrs.csv"))
+
+    # --- pairwise uncertainty across external datasets ---
+    K_mean, K_std, K_n, ext_names = compute_external_kernel_pairwise_uncertainty(perts_all, externals)
+    np.savez_compressed(
+        os.path.join(outdir, "kernel_uncertainty_pairwise.npz"),
+        perts=np.array(perts_all, dtype=object),
+        ext_names=np.array(ext_names, dtype=object),
+        K_mean=K_mean,
+        K_std=K_std,
+        K_n=K_n,
+    )
+
+    # --- per-pert table (requested columns) ---
+    pos_all = {p: i for i, p in enumerate(perts_all)}
+    rows = []
+
+    # Pull eval metrics
+    PDS_scores = (eval_metrics or {}).get("PDS_scores", {}) or {}
+    bulk_mae = (eval_metrics or {}).get("bulk_mae_per_pert", {}) or {}
+
+    # MAE ranks (1 = best / lowest MAE)
+    mae_vals = {p: bulk_mae.get(p, np.nan) for p in perts_eval}
+    mae_series = pd.Series(mae_vals, dtype=float)
+    # rank ascending; NaNs stay NaN
+    mae_rank = mae_series.rank(method="average", ascending=True)
+
+    for p in perts_eval:
+        i = pos_all.get(p, None)
+
+        # uncertainty summaries: std across datasets for (p, q) over all q != p
+        if i is None:
+            unc_mean = np.nan
+            unc_max = np.nan
+            unc_n_pairs = 0
+        else:
+            row = K_std[i, :].astype(float)
+            row[i] = np.nan
+            m = np.isfinite(row)
+            unc_n_pairs = int(m.sum())
+            unc_mean = float(np.nanmean(row)) if unc_n_pairs > 0 else np.nan
+            unc_max  = float(np.nanmax(row)) if unc_n_pairs > 0 else np.nan
+
+        # corr-of-corrs summaries across external datasets
+        if p in df_coc.index:
+            coc_row = df_coc.loc[p].astype(float)
+            coc_mean = float(coc_row.mean(skipna=True)) if coc_row.notna().any() else np.nan
+            coc_max  = float(coc_row.max(skipna=True))  if coc_row.notna().any() else np.nan
+        else:
+            coc_mean, coc_max = np.nan, np.nan
+
+        rows.append({
+            "perturbation": p,
+            "PDS": float(PDS_scores.get(p, np.nan)),
+            "bulk_mae": float(bulk_mae.get(p, np.nan)),
+            "mae_rank": float(mae_rank.get(p, np.nan)),
+            "kernel_uncertainty_mean": unc_mean,
+            "kernel_uncertainty_max": unc_max,
+            "kernel_uncertainty_n_pairs": unc_n_pairs,
+            "corr_of_corrs_mean": coc_mean,
+            "corr_of_corrs_max": coc_max,
+        })
+
+    df_pert = pd.DataFrame(rows).set_index("perturbation")
+    df_pert.to_csv(os.path.join(outdir, "per_pert_kernel_diagnostics.csv"))
+
+    # --- correlations between columns ---
+    num_cols = [
+        "PDS", "bulk_mae", "mae_rank",
+        "kernel_uncertainty_mean", "kernel_uncertainty_max",
+        "corr_of_corrs_mean", "corr_of_corrs_max",
+    ]
+    df_num = df_pert[num_cols].copy()
+    pear = df_num.corr(method="pearson")
+    spear = df_num.corr(method="spearman")
+    pear.to_csv(os.path.join(outdir, "per_pert_kernel_diagnostics_corr_pearson.csv"))
+    spear.to_csv(os.path.join(outdir, "per_pert_kernel_diagnostics_corr_spearman.csv"))
+
+    print("\n=== Per-pert diagnostics correlations (Pearson) ===")
+    print(pear)
+    print("\n=== Per-pert diagnostics correlations (Spearman) ===")
+    print(spear)
+
+    # --- pairwise uncertainty vs abs error in fused kernel ---
+    txt_path = os.path.join(outdir, "pair_uncertainty_vs_abs_kernel_error.txt")
+    top_csv  = os.path.join(outdir, "pair_uncertainty_vs_abs_kernel_error_top.csv")
+
+    if (K_fused is None) or (perts_fused is None):
+        with open(txt_path, "w") as f:
+            f.write("No fused kernel provided; skipping pairwise uncertainty vs abs-error.\n")
+        return
+
+    Kf = _align_kernel_to_perts(K_fused, perts_fused, perts_all).astype(float)
+    Kt = K_true_all.astype(float)
+    iu = np.triu_indices(len(perts_all), k=1)
+
+    unc = K_std[iu].astype(float)
+    err = np.abs(Kf[iu] - Kt[iu]).astype(float)
+    pred_mag = np.abs(Kf[iu]).astype(float)
+    true_mag = np.abs(Kt[iu]).astype(float)
+
+    mask = np.isfinite(unc) & np.isfinite(err)
+    n = int(mask.sum())
+
+    def _corr(a, b):
+        if len(a) < 3:
+            return np.nan
+        a = a - a.mean()
+        b = b - b.mean()
+        denom = (np.sqrt((a*a).sum()) * np.sqrt((b*b).sum())) + 1e-12
+        return float((a*b).sum() / denom)
+
+    pear_unc_err = _corr(unc[mask], err[mask])
+    pear_unc_predmag = _corr(unc[mask], pred_mag[mask])
+    pear_unc_truemag = _corr(unc[mask], true_mag[mask])
+
+    # spearman via pandas (no scipy dependency)
+    s_unc = pd.Series(unc[mask])
+    s_err = pd.Series(err[mask])
+    s_predmag = pd.Series(pred_mag[mask])
+    s_truemag = pd.Series(true_mag[mask])
+    spear_unc_err = float(s_unc.corr(s_err, method="spearman")) if n >= 3 else np.nan
+    spear_unc_predmag = float(s_unc.corr(s_predmag, method="spearman")) if n >= 3 else np.nan
+    spear_unc_truemag = float(s_unc.corr(s_truemag, method="spearman")) if n >= 3 else np.nan
+
+    with open(txt_path, "w") as f:
+        f.write(f"Pairs analyzed (finite unc & err): {n}\n")
+        f.write(f"Pearson corr(uncertainty, abs_error): {pear_unc_err:.6f}\n")
+        f.write(f"Spearman corr(uncertainty, abs_error): {spear_unc_err:.6f}\n")
+        f.write(f"Pearson corr(uncertainty, |K_pred|): {pear_unc_predmag:.6f}\n")
+        f.write(f"Spearman corr(uncertainty, |K_pred|): {spear_unc_predmag:.6f}\n")
+        f.write(f"Pearson corr(uncertainty, |K_true|): {pear_unc_truemag:.6f}\n")
+        f.write(f"Spearman corr(uncertainty, |K_true|): {spear_unc_truemag:.6f}\n")
+
+    print("\n=== Pairwise uncertainty vs abs(kernel error) summary ===")
+    print(open(txt_path, "r").read())
+
+    # Save a small “top” table for inspection (largest abs errors)
+    if n > 0:
+        # indices into iu arrays
+        idx = np.flatnonzero(mask)
+        # sort by abs error desc
+        order = idx[np.argsort(err[mask])[::-1]]
+        order = order[: min(500, len(order))]
+
+        ii = iu[0][order]
+        jj = iu[1][order]
+        df_top = pd.DataFrame({
+            "pert_i": [perts_all[x] for x in ii],
+            "pert_j": [perts_all[x] for x in jj],
+            "uncertainty_std": unc[order],
+            "abs_error": err[order],
+            "K_pred": Kf[iu][order],
+            "K_true": Kt[iu][order],
+            "n_datasets_for_pair": K_n[iu][order],
+        })
+        df_top.to_csv(top_csv, index=False)
+
+
+def write_predictive_uncertainty_report_with_checks(
+    outdir: str,
+    eval_metrics: dict,
+    pred_delta_var: np.ndarray,
+    pert_names_for_var: list[str],
+    pred_expr: np.ndarray,
+    true_expr: np.ndarray,
+    ctrl_mean: np.ndarray,
+    K_fused: np.ndarray,
+    perts_fused: list[str],
+    perts_train: list[str],
+    prefix: str = "predictive_uncertainty",
+    topk_train_sims: int = 5,
+):
+    """
+    Writes:
+      - {prefix}_per_pert_with_checks.csv
+      - {prefix}_correlations_with_checks_pearson.csv
+      - {prefix}_correlations_with_checks_spearman.csv
+
+    Adds the "A checks":
+      (1) kernel proximity to train: max_sim_to_O, mean_top{topk}_sim_to_O
+      (2) effect magnitude: pred_delta_l2, true_delta_l2 (and mean abs)
+      (3) kernel quality proxy: corr_of_corrs_mean/max (if kernel_corr_of_corrs.csv exists in outdir)
+    """
+    os.makedirs(outdir, exist_ok=True)
+
+    # ---- Basic validation ----
+    if pred_delta_var is None or pred_expr is None or true_expr is None:
+        print(f"[{prefix}] skipped: missing pred_delta_var or pred_expr/true_expr.")
+        return None
+
+    if len(pert_names_for_var) != pred_delta_var.shape[0]:
+        raise ValueError(
+            f"[{prefix}] pred_delta_var rows ({pred_delta_var.shape[0]}) "
+            f"!= len(pert_names_for_var) ({len(pert_names_for_var)})"
+        )
+
+    if pred_expr.shape != true_expr.shape:
+        raise ValueError(f"[{prefix}] pred_expr shape {pred_expr.shape} != true_expr shape {true_expr.shape}")
+
+    if pred_expr.shape[0] != len(pert_names_for_var):
+        raise ValueError(
+            f"[{prefix}] pred_expr rows ({pred_expr.shape[0]}) "
+            f"!= len(pert_names_for_var) ({len(pert_names_for_var)})"
+        )
+
+    # ---- Pull per-pert metrics (PDS / MAE) ----
+    bulk_mae = (eval_metrics or {}).get("bulk_mae_per_pert", {}) or {}
+    pds = (eval_metrics or {}).get("PDS_scores", {}) or {}
+
+    # Restrict to perts we actually have predictive variances for (names_krr_ev)
+    perts = list(pert_names_for_var)
+
+    df = pd.DataFrame({"pert": perts})
+    df["PDS"] = df["pert"].map(pds).astype(float)
+    df["bulk_MAE"] = df["pert"].map(bulk_mae).astype(float)
+    df["bulk_MAE_rank"] = df["bulk_MAE"].rank(ascending=True, method="average")
+
+    # ---- Predictive uncertainty summaries over genes ----
+    var = np.asarray(pred_delta_var, dtype=np.float64)
+    var = np.maximum(var, 0.0)
+    std = np.sqrt(var)
+
+    df["pred_var_mean"] = var.mean(axis=1)
+    df["pred_var_max"] = var.max(axis=1)
+    df["pred_std_mean"] = std.mean(axis=1)
+    df["pred_std_max"] = std.max(axis=1)
+
+    # ---- Effect magnitude summaries ----
+    ctrl = np.asarray(ctrl_mean, dtype=np.float64).reshape(1, -1)
+    pred_delta = np.asarray(pred_expr, dtype=np.float64) - ctrl
+    true_delta = np.asarray(true_expr, dtype=np.float64) - ctrl
+
+    df["pred_delta_l2"] = np.linalg.norm(pred_delta, axis=1)
+    df["true_delta_l2"] = np.linalg.norm(true_delta, axis=1)
+    df["pred_delta_mean_abs"] = np.mean(np.abs(pred_delta), axis=1)
+    df["true_delta_mean_abs"] = np.mean(np.abs(true_delta), axis=1)
+
+    # ---- Kernel proximity to training (geometry) ----
+    df["max_sim_to_O"] = np.nan
+    df[f"mean_top{topk_train_sims}_sim_to_O"] = np.nan
+    df["n_train_sims_used"] = 0
+
+    if K_fused is not None and perts_fused is not None and perts_train is not None:
+        pos = {p: i for i, p in enumerate(perts_fused)}
+        train_idx = [pos[p] for p in perts_train if p in pos]
+        train_idx = np.array(train_idx, dtype=int)
+
+        if train_idx.size > 0:
+            for r, p in enumerate(perts):
+                if p not in pos:
+                    continue
+                i = pos[p]
+                sims = np.asarray(K_fused[i, train_idx], dtype=np.float64)
+
+                # If eval pert is also in training list, drop self similarity
+                if p in pos and p in set(perts_train):
+                    # remove any entries where train pert name equals p
+                    # (train_idx may include p)
+                    mask = np.array([perts_fused[j] != p for j in train_idx], dtype=bool)
+                    sims = sims[mask]
+
+                if sims.size == 0:
+                    continue
+
+                df.at[r, "max_sim_to_O"] = float(np.nanmax(sims))
+                k = min(int(topk_train_sims), sims.size)
+                # mean of top-k similarities (descending)
+                topk = np.sort(sims)[::-1][:k]
+                df.at[r, f"mean_top{topk_train_sims}_sim_to_O"] = float(np.mean(topk))
+                df.at[r, "n_train_sims_used"] = int(sims.size)
+
+    # ---- Kernel quality proxy: corr-of-corrs mean/max (if available) ----
+    coc_path = os.path.join(outdir, "kernel_corr_of_corrs.csv")
+    df["corr_of_corrs_mean"] = np.nan
+    df["corr_of_corrs_max"] = np.nan
+    if os.path.exists(coc_path):
+        coc = pd.read_csv(coc_path, index_col=0)
+        # coc index is perturbations; columns are external dataset names
+        if "pert" in df.columns:
+            common = [p for p in df["pert"].tolist() if p in coc.index]
+            if len(common) > 0:
+                sub = coc.loc[common]
+                coc_mean = sub.mean(axis=1, skipna=True)
+                coc_max = sub.max(axis=1, skipna=True)
+                df.loc[df["pert"].isin(common), "corr_of_corrs_mean"] = df.loc[df["pert"].isin(common), "pert"].map(coc_mean).astype(float)
+                df.loc[df["pert"].isin(common), "corr_of_corrs_max"] = df.loc[df["pert"].isin(common), "pert"].map(coc_max).astype(float)
+
+    # ---- Write table ----
+    out_csv = os.path.join(outdir, f"{prefix}_per_pert_with_checks.csv")
+    df.to_csv(out_csv, index=False)
+    print(f"[{prefix}] wrote: {os.path.basename(out_csv)}")
+
+    # ---- Correlations: Pearson + Spearman ----
+    num_cols = [
+        "PDS", "bulk_MAE", "bulk_MAE_rank",
+        "pred_var_mean", "pred_var_max", "pred_std_mean", "pred_std_max",
+        "pred_delta_l2", "true_delta_l2", "pred_delta_mean_abs", "true_delta_mean_abs",
+        "max_sim_to_O", f"mean_top{topk_train_sims}_sim_to_O",
+        "corr_of_corrs_mean", "corr_of_corrs_max",
+    ]
+    df_num = df[num_cols].copy()
+
+    pear = df_num.corr(method="pearson")
+    spear = df_num.corr(method="spearman")
+
+    pear_path = os.path.join(outdir, f"{prefix}_correlations_with_checks_pearson.csv")
+    spear_path = os.path.join(outdir, f"{prefix}_correlations_with_checks_spearman.csv")
+    pear.to_csv(pear_path)
+    spear.to_csv(spear_path)
+
+    print(f"\n[{prefix}] correlations with checks (Pearson):\n{pear}\n")
+    print(f"\n[{prefix}] correlations with checks (Spearman):\n{spear}\n")
+
+    return df
+
+
+
 def main():
     args = parse_arguments()
     # Both baselines require pseudobulked data, so we enforce it.
@@ -2327,7 +2786,7 @@ def main():
     if args.method != "krr":
         raise ValueError(f"Unknown method: {args.method}")
     # Run KRR ONLY on the intersected views; get predictions for intersected perts
-    pred_krr_ev, _true_krr_ev, names_krr_ev, _ctrl_ignored, pred_delta_var_ev = krr_predict_from_external(
+    pred_krr_ev, true_krr_ev, names_krr_ev, ctrl_mean_krr, pred_delta_var_ev = krr_predict_from_external(
         adata_train=adata_train_core,
         adata_eval=eval_adata_core,
         target_label=args.target_label,
@@ -2420,7 +2879,7 @@ def main():
     )
     # Evaluate using our assembled bundle (fixed control mean)
     eval_adata_for_eval = eval_adata_int if args.intersect_genes else eval_adata
-    evaluate_model(adata=eval_adata_for_eval, args=args, pred_bundle=(pred_ev, true_ev, names_ev, ctrl_mean_global))
+    eval_metrics = evaluate_model(adata=eval_adata_for_eval, args=args, pred_bundle=(pred_ev, true_ev, names_ev, ctrl_mean_global))
 
     # ---------------------------
     # (Optional) Evaluate on the Train Set
@@ -2586,6 +3045,44 @@ def main():
             )
         except Exception as e:
             print(f"[corr-of-corrs] skipped: {e}")
+
+        # ---------------------------
+        # [DIAG] Kernel uncertainty + corr-of-corrs + performance report
+        # ---------------------------
+        try:
+            write_kernel_uncertainty_report(
+                outdir=args.diagnostics_dir,
+                perts_eval=list(names_ev),
+                eval_metrics=eval_metrics,
+                perts_all=list(names_all),
+                K_true_all=K_true_all,
+                externals=labeled_externals,
+                K_fused=K_full,
+                perts_fused=perts_union,
+            )
+        except Exception as e:
+            print(f"[kernel-uncertainty-report] skipped: {e}")
+
+    # ------------------------------------------------------------
+    # Predictive-uncertainty report + "A checks" columns
+    # ------------------------------------------------------------
+    try:
+        write_predictive_uncertainty_report_with_checks(
+            outdir=args.diagnostics_dir,
+            eval_metrics=eval_metrics,
+            pred_delta_var=pred_delta_var_ev,
+            pert_names_for_var=list(names_krr_ev),
+            pred_expr=pred_krr_ev,
+            true_expr=true_krr_ev,
+            ctrl_mean=ctrl_mean_krr,
+            K_fused=K_full,
+            perts_fused=perts_union,
+            perts_train=list(names_tr),
+            prefix="predictive_uncertainty",
+            topk_train_sims=5,
+        )
+    except Exception as e:
+        print(f"[predictive_uncertainty_with_checks] skipped: {e}")
 
         # ---------------------------
         # [DIAG] Manhattan (L1) distance CSVs (ALL perts)
