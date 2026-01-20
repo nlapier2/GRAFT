@@ -2,17 +2,14 @@
 import warnings
 # Suppress annoying FutureWarning from scanpy
 warnings.filterwarnings('ignore', category=FutureWarning)
-import argparse, math, os
-import pickle as pkl
+import argparse
 import numpy as np
 import pandas as pd
 import anndata as ad
 import scanpy as sc
-from scipy import sparse
 from collections import defaultdict
 from sklearn.metrics import pairwise_distances
-
-from sklearn.metrics import pairwise_distances
+from sklearn.decomposition import TruncatedSVD, PCA
 
 from utils import *
 from losses import *
@@ -65,7 +62,7 @@ def parse_arguments():
     # Method + GP hyperparams
     ap.add_argument("--method", type=str, default="gp",
                     choices=["gp"], help="Which transfer method to run.")
-    ap.add_argument("--gp_lambda", type=float, default=1e-2,
+    ap.add_argument("--gp_noise_var", type=float, default=1e-2,
                     help="Ridge regularization λ for GP on perturbation kernel.")
     ap.add_argument("--kernel_metric", type=str, default="corr",
                     choices=["corr", "cosine"],
@@ -248,7 +245,6 @@ def create_kernel_pc_space(
         # corr between rows of T
         K = np.corrcoef(T)
     elif metric == "cosine":
-        from sklearn.metrics import pairwise_distances
         K = 1.0 - pairwise_distances(T, metric="cosine")
     else:
         raise ValueError("metric must be 'corr' or 'cosine'")
@@ -293,7 +289,6 @@ def _build_pca_basis_from_train(
     r_eff = max(1, min(r, Yc.shape[0], Yc.shape[1]))
     # fast truncated SVD (no full covariance). components_: (r, G)
     try:
-        from sklearn.decomposition import TruncatedSVD
         svd = TruncatedSVD(n_components=r_eff, random_state=0)
         T_O = svd.fit_transform(Yc).astype(np.float32)              # (|O|, r)
         W_r = svd.components_.T.astype(np.float32, copy=True)       # (G, r)
@@ -313,7 +308,7 @@ def create_kernel(
     kernel_metric: str = "corr",     # {"corr","cosine"}
     eps: float = 1e-6,               # tiny PSD nudge
     impute_from_main: Optional[ad.AnnData] = None,  # NEW: donor AnnData (first external) or None
-    impute_lambda: float = 0.01,                     # NEW: regularization for GP imputation
+    impute_noise_var: float = 0.01,                     # NEW: regularization for GP imputation
 ) -> tuple[np.ndarray, list[str]]:
     """
     Build a perturbation kernel from ONE external dataset
@@ -382,7 +377,7 @@ def create_kernel(
 
                     # GP in pert space to impute missing rows in CURRENT panel gene space (genes_int)
                     A = np.linalg.solve(
-                        K_OO + float(impute_lambda) * np.eye(K_OO.shape[0], dtype=np.float32),
+                        K_OO + float(impute_noise_var) * np.eye(K_OO.shape[0], dtype=np.float32),
                         Y_O
                     ).astype(np.float32)  # (|O| x G_int)
                     Y_U_hat = (K_UO @ A).astype(np.float32)  # (|U| x G_int)
@@ -464,7 +459,6 @@ def create_embedding_kernel_from_df(
     # optional PCA for stability / denoising
     if pca_dim and pca_dim > 0 and X.shape[1] > pca_dim:
         try:
-            from sklearn.decomposition import PCA
             X = PCA(n_components=pca_dim, random_state=0).fit_transform(X)
         except Exception:
             # keep original X if sklearn not available
@@ -925,7 +919,7 @@ def gp_predict_from_external(
     adata_eval: ad.AnnData,
     target_label: str,
     control_label: str,
-    gp_lambda: float = 1e-2,
+    gp_noise_var: float = 1e-2,
     ctrl_mean_target: np.ndarray | None = None,
     kernel_gamma: float = 1.0,
     topk: int = 0,
@@ -1004,7 +998,7 @@ def gp_predict_from_external(
             pos = {p:i for i,p in enumerate(perts_O_pca)}
             T_O = T_O[np.asarray([pos[p] for p in O], dtype=int), :]
         # Solve once for all components and predict scores for U
-        A_comp = np.linalg.solve(KOO + gp_lambda * np.eye(KOO.shape[0], dtype=KOO.dtype), T_O)  # (|O|, r)
+        A_comp = np.linalg.solve(KOO + gp_noise_var * np.eye(KOO.shape[0], dtype=KOO.dtype), T_O)  # (|O|, r)
         KUO_sharp = sharpen_neighbors(KUO, tau=kernel_gamma, topk=topk)
         Z_U = KUO_sharp @ A_comp                                                                  # (|U|, r)
         # Reconstruct gene-space deltas for U
@@ -1023,7 +1017,7 @@ def gp_predict_from_external(
         sigma2_gene = (resid ** 2).mean(axis=0)                                                    # (G,)
     else:
         # Original full-rank path on genes
-        A = np.linalg.solve(KOO + gp_lambda * np.eye(KOO.shape[0], dtype=KOO.dtype), Y_O)         # (|O|, G)
+        A = np.linalg.solve(KOO + gp_noise_var * np.eye(KOO.shape[0], dtype=KOO.dtype), Y_O)         # (|O|, G)
         KUO_sharp = sharpen_neighbors(KUO, tau=kernel_gamma, topk=topk)
         Y_U_hat_delta = KUO_sharp @ A                                                              # (|U|, G)
         Y_O_hat = KOO @ A                                                                          # (|O|, G)
@@ -1032,7 +1026,7 @@ def gp_predict_from_external(
 
     # --- GP-style scalar uncertainty per eval pert based on kernel geometry
     # s2_raw[u] = k_uu - k_uO @ (KOO+λI)^(-1) @ k_Ou
-    KOO_reg_inv = np.linalg.inv(KOO + gp_lambda * np.eye(KOO.shape[0], dtype=KOO.dtype))
+    KOO_reg_inv = np.linalg.inv(KOO + gp_noise_var * np.eye(KOO.shape[0], dtype=KOO.dtype))
     # precompute for speed: M = KOO_reg_inv @ K_Ou for each u
     # We'll just loop since |U| is usually not huge
     s2_raw_list = []
@@ -1551,7 +1545,7 @@ def main():
                     control_label=args.control_label,
                     kernel_metric=args.kernel_metric,
                     impute_from_main=donor_main,   # (None for the first dataset or if flag off)
-                    impute_lambda=float(args.gp_lambda),
+                    impute_noise_var=float(args.gp_noise_var),
                 )
         if K_i.size and len(perts_i):
             kernels_and_perts.append((K_i, perts_i))
@@ -1690,7 +1684,7 @@ def main():
         adata_eval=eval_adata_core,
         target_label=args.target_label,
         control_label=args.control_label,
-        gp_lambda=args.gp_lambda,
+        gp_noise_var=args.gp_noise_var,
         ctrl_mean_target=ctrl_mean_global,  # fixed control mean
         kernel_gamma=args.kernel_gamma,
         topk=args.topk,
@@ -1751,7 +1745,7 @@ def main():
             adata_eval=adata_train_core,
             target_label=args.target_label,
             control_label=args.control_label,
-            gp_lambda=args.gp_lambda,
+            gp_noise_var=args.gp_noise_var,
             ctrl_mean_target=ctrl_mean_global,
             kernel_gamma=args.kernel_gamma,
             topk=args.topk,
