@@ -52,7 +52,7 @@ def run_simulation_strategy(name, df_sorted, total_genes, batch_size, p_threshol
     Runs the batch simulation for a specific ordering of genes (df_sorted).
     """
     print(f"\nRunning Strategy: {name}")
-    print(f"{'Batch':<8} | {'Revealed':<8} | {'Corr (Obs)':<11} | {'P (Obs)':<11} | {'Corr (Imp)':<11} | {'P (Imp)':<11}")
+    print(f"{'Batch':<8} | {'Revealed':<8} | {'Corr (ObsGenes)':<15} | {'P (ObsGenes)':<15} | {'Corr (ImpGenes)':<15} | {'P (ImpGenes)':<15}")
     print("-" * 75)
 
     # These are the full "Ground Truth" vectors
@@ -206,7 +206,7 @@ def main():
         return
 
     # ---------------------------------------------------------
-    # Strategy 1: Magnitude Sampling (LoF Known)
+    # Strategy 1: GammaMagnitude Sampling (LoF Known)
     # ---------------------------------------------------------
     # Sort by absolute LoF_gamma
     df_mag = df.copy()
@@ -214,10 +214,10 @@ def main():
     df_mag = df_mag.sort_values(by='abs_lof', ascending=False)
     
     mag_obs, mag_imp, mag_hist_obs, mag_hist_imp = run_simulation_strategy(
-        "Magnitude Sorting (LoF Known)", df_mag, total_genes, args.batch_size, args.p_threshold
+        "GammaMagnitude Sorting (LoF Known)", df_mag, total_genes, args.batch_size, args.p_threshold
     )
 
-    # Plot Magnitude results
+    # Plot GammaMagnitude results
     plot_pvalue_history(mag_hist_obs, "GammaMagnitude_ObservedGenes", args.output_dir)
     plot_pvalue_history(mag_hist_imp, "GammaMagnitude_ImputedGenes", args.output_dir)
 
@@ -233,8 +233,8 @@ def main():
     )
 
     # Plot Random results
-    plot_pvalue_history(rnd_hist_obs, "Random_Observed", args.output_dir)
-    plot_pvalue_history(rnd_hist_imp, "Random_Imputed", args.output_dir)
+    plot_pvalue_history(rnd_hist_obs, "Random_ObservedGenes", args.output_dir)
+    plot_pvalue_history(rnd_hist_imp, "Random_ImputedGenes", args.output_dir)
 
     # ---------------------------------------------------------
     # Summary
@@ -242,12 +242,12 @@ def main():
     print("\n" + "="*50)
     print("FINAL SUMMARY: Batches needed for Significance")
     print("="*50)
-    print(f"{'Strategy':<30} | {'Observed (Subset)':<18} | {'Imputed (Full)':<18}")
+    print(f"{'Strategy':<30} | {'ObservedGenes':<18} | {'ImputedGenes':<18}")
     print("-" * 72)
     
     def fmt(val): return str(val) if val else "> Max Batches"
-    
-    print(f"{'Magnitude Sorting':<30} | {fmt(mag_obs):<18} | {fmt(mag_imp):<18}")
+
+    print(f"{'GammaMagnitude Sorting':<30} | {fmt(mag_obs):<18} | {fmt(mag_imp):<18}")
     print(f"{'Random Sampling':<30} | {fmt(rnd_obs):<18} | {fmt(rnd_imp):<18}")
     print("-" * 72)
 
