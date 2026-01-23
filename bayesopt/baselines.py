@@ -76,80 +76,15 @@ def parse_arguments():
         help="Value in target_label that identifies control cells. If blank, uses all cells (default: '')."
     )
 
+    # New Argument for External Perturbation Strategy
+    parser.add_argument(
+        "--external_h5ad",
+        type=str,
+        default=None,
+        help="Path to 'external' pseudobulked H5AD for perturbation effect calculation."
+    )
+
     return parser.parse_args()
-
-
-def compute_control_covariance(h5ad_path, target_gene, obs_label, control_val):
-    """
-    Loads an AnnData file, filters for control cells (case-insensitive), 
-    and calculates the covariance between every gene and the 'target_gene'.
-    Returns a pandas Series mapping gene_name -> absolute_covariance.
-    """
-    if not os.path.exists(h5ad_path):
-        print(f"Warning: Control H5AD not found at {h5ad_path}")
-        return None
-
-    print(f"Loading control data from {h5ad_path}...")
-    try:
-        adata = ad.read_h5ad(h5ad_path)
-    except Exception as e:
-        print(f"Error loading H5AD: {e}")
-        return None
-
-    # 1. Filter for control cells (if label is provided)
-    if control_val is not None and str(control_val).strip() != "":
-        if obs_label in adata.obs.columns:
-            # Case-insensitive comparison
-            c_val_lower = str(control_val).lower()
-            mask = adata.obs[obs_label].astype(str).str.lower() == c_val_lower
-            
-            n_total = adata.n_obs
-            adata = adata[mask].copy()
-            print(f"Filtered control cells: {adata.n_obs} / {n_total} cells (label '{obs_label}' ~= '{control_val}')")
-        else:
-            print(f"Warning: obs column '{obs_label}' not found. Using all {adata.n_obs} cells.")
-    else:
-        # Blank control label -> Trust that all cells are controls
-        print(f"Control label is blank. Using all {adata.n_obs} cells as controls.")
-
-    if adata.n_obs < 5:
-        print("Error: Too few control cells to compute covariance.")
-        return None
-
-    # 2. Check for target gene
-    if target_gene not in adata.var_names:
-        print(f"Error: Target gene '{target_gene}' not found in H5AD var_names.")
-        return None
-
-    # 3. Compute Covariance
-    # Cov(X, Y) = E[(X - E[X])(Y - E[Y])]
-    
-    # Extract Target Vector
-    target_idx = adata.var_names.get_loc(target_gene)
-    X = adata.X
-    
-    # Handle Sparse vs Dense (Convert to dense for simple vectorization)
-    if sp.issparse(X):
-        try:
-            X = X.toarray() 
-        except MemoryError:
-            print("Error: Control matrix too large to densify for covariance calc.")
-            return None
-        
-    # Get target column and center it
-    y_vec = X[:, target_idx]
-    y_centered = y_vec - np.mean(y_vec)
-    
-    # Center all genes
-    X_mean = np.mean(X, axis=0)
-    X_centered = X - X_mean[None, :]
-    
-    # Calculate Covariance: (X_c . y_c) / (N - 1)
-    N = adata.n_obs
-    covariances = np.dot(X_centered.T, y_centered) / (N - 1)
-    
-    # Return as Series
-    return pd.Series(covariances, index=adata.var_names)
 
 
 def run_simulation_strategy(name, df_sorted, total_genes, batch_size, p_threshold, print_every=10):
@@ -288,6 +223,154 @@ def plot_pvalue_history(p_values, method_name, output_dir):
     print(f"Saved plot to {out_path}")
 
 
+def compute_control_covariance(h5ad_path, target_gene, obs_label, control_val):
+    """
+    Loads an AnnData file, filters for control cells (case-insensitive), 
+    and calculates the covariance between every gene and the 'target_gene'.
+    Returns a pandas Series mapping gene_name -> absolute_covariance.
+    """
+    if not os.path.exists(h5ad_path):
+        print(f"Warning: Control H5AD not found at {h5ad_path}")
+        return None
+
+    print(f"Loading control data from {h5ad_path}...")
+    try:
+        adata = ad.read_h5ad(h5ad_path)
+    except Exception as e:
+        print(f"Error loading H5AD: {e}")
+        return None
+
+    # 1. Filter for control cells (if label is provided)
+    if control_val is not None and str(control_val).strip() != "":
+        if obs_label in adata.obs.columns:
+            # Case-insensitive comparison
+            c_val_lower = str(control_val).lower()
+            mask = adata.obs[obs_label].astype(str).str.lower() == c_val_lower
+            
+            n_total = adata.n_obs
+            adata = adata[mask].copy()
+            print(f"Filtered control cells: {adata.n_obs} / {n_total} cells (label '{obs_label}' ~= '{control_val}')")
+        else:
+            print(f"Warning: obs column '{obs_label}' not found. Using all {adata.n_obs} cells.")
+    else:
+        # Blank control label -> Trust that all cells are controls
+        print(f"Control label is blank. Using all {adata.n_obs} cells as controls.")
+
+    if adata.n_obs < 5:
+        print("Error: Too few control cells to compute covariance.")
+        return None
+
+    # 2. Check for target gene
+    if target_gene not in adata.var_names:
+        print(f"Error: Target gene '{target_gene}' not found in H5AD var_names.")
+        return None
+
+    # 3. Compute Covariance
+    # Cov(X, Y) = E[(X - E[X])(Y - E[Y])]
+    
+    # Extract Target Vector
+    target_idx = adata.var_names.get_loc(target_gene)
+    X = adata.X
+    
+    # Handle Sparse vs Dense (Convert to dense for simple vectorization)
+    if sp.issparse(X):
+        try:
+            X = X.toarray() 
+        except MemoryError:
+            print("Error: Control matrix too large to densify for covariance calc.")
+            return None
+        
+    # Get target column and center it
+    y_vec = X[:, target_idx]
+    y_centered = y_vec - np.mean(y_vec)
+    
+    # Center all genes
+    X_mean = np.mean(X, axis=0)
+    X_centered = X - X_mean[None, :]
+    
+    # Calculate Covariance: (X_c . y_c) / (N - 1)
+    N = adata.n_obs
+    covariances = np.dot(X_centered.T, y_centered) / (N - 1)
+    
+    # Return as Series
+    return pd.Series(covariances, index=adata.var_names)
+
+
+def compute_external_perturbation_effect(h5ad_path, target_gene, obs_label, control_val):
+    """
+    Loads an external H5AD (pseudobulk or single-cell), finds the control population,
+    and calculates the absolute difference in `target_gene` expression between 
+    each perturbation and the control.
+    Returns: pd.Series mapping perturbation_name -> absolute_effect_size
+    """
+    if not os.path.exists(h5ad_path):
+        print(f"Warning: External H5AD not found at {h5ad_path}")
+        return None
+
+    print(f"Loading external perturbation data from {h5ad_path}...")
+    try:
+        adata = ad.read_h5ad(h5ad_path)
+    except Exception as e:
+        print(f"Error loading H5AD: {e}")
+        return None
+
+    # 1. Verify Columns
+    if obs_label not in adata.obs.columns:
+        print(f"Error: Target label column '{obs_label}' not found in external H5AD.")
+        return None
+    
+    if target_gene not in adata.var_names:
+        print(f"Error: Target gene '{target_gene}' not found in external H5AD.")
+        return None
+
+    # 2. Extract Data for Target Gene
+    # We only need the column corresponding to HBA1
+    gene_idx = adata.var_names.get_loc(target_gene)
+    X_vec = adata.X[:, gene_idx]
+    
+    # Densify if sparse
+    if sp.issparse(X_vec):
+        X_vec = X_vec.toarray().flatten()
+    else:
+        X_vec = np.asarray(X_vec).flatten()
+
+    # 3. Identify Control Mean
+    # We use case-insensitive matching for robustness, or exact if preferred.
+    # Given the previous instruction, we'll try exact first, then case-insensitive.
+    obs_vals = adata.obs[obs_label].astype(str)
+    
+    is_ctrl = obs_vals == str(control_val)
+    if not is_ctrl.any():
+        # Try case-insensitive
+        is_ctrl = obs_vals.str.lower() == str(control_val).lower()
+    
+    if not is_ctrl.any():
+        print(f"Error: No control cells found with label '{control_val}' in column '{obs_label}'.")
+        return None
+    
+    ctrl_mean = np.mean(X_vec[is_ctrl])
+    print(f"External Dataset: Found {is_ctrl.sum()} control observations. Mean {target_gene}: {ctrl_mean:.4f}")
+
+    # 4. Compute Means per Perturbation
+    # We group by the perturbation label
+    # Create a DataFrame for easy groupby
+    df_temp = pd.DataFrame({
+        'pert': obs_vals,
+        'expr': X_vec
+    })
+    
+    # Filter out controls from the perturbation list (optional, but keeps the series clean)
+    df_pert = df_temp[~is_ctrl]
+    
+    # Group by perturbation and calculate mean
+    pert_means = df_pert.groupby('pert')['expr'].mean()
+    
+    # 5. Calculate Absolute Delta
+    abs_deltas = (pert_means - ctrl_mean).abs()
+    
+    return abs_deltas
+
+
 def main():
     args = parse_arguments()
     
@@ -378,6 +461,35 @@ def main():
             plot_pvalue_history(cov_hist_obs, "ControlCovariance_ObservedGenes", args.output_dir)
             plot_pvalue_history(cov_hist_imp, "ControlCovariance_ImputedGenes", args.output_dir)
 
+
+    # ---------------------------------------------------------
+    # Strategy 4: External Perturbation Effect (Optional)
+    # ---------------------------------------------------------
+    ext_obs, ext_imp = None, None
+
+    if args.external_h5ad:
+        # 1. Compute Deltas in External Dataset
+        ext_series = compute_external_perturbation_effect(
+            args.external_h5ad, "HBA1", args.target_label, args.control_label
+        )
+
+        if ext_series is not None:
+            # 2. Merge into DF
+            df_ext = df.copy()
+            # Map effects. Fill missing with 0 (assumption: unmeasured = no info = low priority)
+            df_ext['ext_effect'] = df_ext['gene_name'].map(ext_series).fillna(0.0)
+
+            # 3. Sort by Absolute Effect (Descending)
+            df_ext = df_ext.sort_values(by='ext_effect', ascending=False)
+
+            ext_obs, ext_imp, ext_hist_obs, ext_hist_imp = run_simulation_strategy(
+                "External Perturbation Sorting", df_ext, total_genes, args.batch_size, args.p_threshold, args.print_every
+            )
+
+            plot_pvalue_history(ext_hist_obs, "ExternalPerturbation_ObservedGenes", args.output_dir)
+            plot_pvalue_history(ext_hist_imp, "ExternalPerturbation_ImputedGenes", args.output_dir)
+
+
     # ---------------------------------------------------------
     # Summary
     # ---------------------------------------------------------
@@ -393,6 +505,8 @@ def main():
     print(f"{'Random Sampling':<30} | {fmt(rnd_obs):<18} | {fmt(rnd_imp):<18}")
     if args.control_h5ad and cov_obs is not None:
         print(f"{'Control Covariance Sorting':<30} | {fmt(cov_obs):<18} | {fmt(cov_imp):<18}")
+    if args.external_h5ad and ext_obs is not None:
+        print(f"{'External Perturbation Sorting':<30} | {fmt(ext_obs):<18} | {fmt(ext_imp):<18}")
     print("-" * 72)
 
 if __name__ == "__main__":
