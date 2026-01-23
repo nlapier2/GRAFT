@@ -84,6 +84,12 @@ def parse_arguments():
         help="Path to 'external' pseudobulked H5AD for perturbation effect calculation."
     )
 
+    parser.add_argument(
+        "--center_data",
+        action="store_true",
+        help="Center LoF_gamma and HBA1_beta at 0 by subtracting their means."
+    )
+
     return parser.parse_args()
 
 
@@ -106,6 +112,7 @@ def run_simulation_strategy(name, df_sorted, total_genes, batch_size, p_threshol
 
     history_obs = []
     history_imp = []
+    history_mse = []
 
     for batch_idx in range(1, total_batches + 1):
         n_revealed = min(batch_idx * batch_size, total_genes)
@@ -167,11 +174,18 @@ def run_simulation_strategy(name, df_sorted, total_genes, batch_size, p_threshol
 
         history_imp.append(p_imp)
 
+        # ==========================================
+        # Metric 3: Mean Squared Error (Full Vector)
+        # ==========================================
+        # MSE between Truth and Hybrid (Imputed) Vector
+        mse = np.mean((all_hba1_true - hba1_full_hybrid) ** 2)
+        history_mse.append(mse)
+
         # Print row (Every N, plus first and last)
         if batch_idx == 1 or batch_idx % print_every == 0 or batch_idx == total_batches:
             print(f"{batch_idx:<8} | {n_revealed:<8} | {corr_obs:+.4f}     | {p_obs:.2e}    | {corr_imp:+.4f}     | {p_imp:.2e}")
 
-    return sig_batch_obs, sig_batch_imp, history_obs, history_imp
+    return sig_batch_obs, sig_batch_imp, history_obs, history_imp, history_mse
 
 
 def plot_pvalue_history(p_values, method_name, output_dir):
@@ -221,6 +235,89 @@ def plot_pvalue_history(p_values, method_name, output_dir):
     plt.savefig(out_path)
     plt.close()
     print(f"Saved plot to {out_path}")
+
+
+def plot_mse_comparison(mse_histories, output_dir):
+    """
+    Plots MSE trajectories. Automatically splits the y-axis (broken axis)
+    if one method's initial error is significantly (>5x) higher than the median max error.
+    """
+    if not mse_histories:
+        return
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    # 1. Analyze Data to decide on Broken Axis
+    # Get the maximum MSE for each strategy
+    max_values = [max(hist) for hist in mse_histories.values() if hist]
+    if not max_values: 
+        return
+        
+    global_max = max(max_values)
+    median_max = np.median(max_values)
+    
+    # Threshold: If the worst method is >5x higher than the median method, break the axis.
+    use_broken_axis = global_max > (5.0 * median_max)
+
+    if use_broken_axis:
+        # --- BROKEN AXIS PLOT ---
+        fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(10, 8))
+        fig.subplots_adjust(hspace=0.1)  # adjust space between axes
+
+        # Plot data on both axes
+        for name, history in mse_histories.items():
+            batches = range(1, len(history) + 1)
+            ax1.plot(batches, history, label=name, linewidth=2, alpha=0.8)
+            ax2.plot(batches, history, label=name, linewidth=2, alpha=0.8)
+
+        # zoom-in / limit the view to different portions of the data
+        # Ax1 (Top): Shows the outliers. Y-lim from (median_max*2) to (global_max * 1.05)
+        ax1.set_ylim(median_max * 1.5, global_max * 1.05)
+        
+        # Ax2 (Bottom): Shows the details. Y-lim from 0 to (median_max * 1.2)
+        ax2.set_ylim(0, median_max * 1.2)
+
+        # Hide the spines between ax and ax2
+        ax1.spines.bottom.set_visible(False)
+        ax2.spines.top.set_visible(False)
+        ax1.xaxis.tick_top()
+        ax1.tick_params(labeltop=False)  # don't put tick labels at the top
+        ax2.xaxis.tick_bottom()
+
+        # Add diagonal lines to indicate the break
+        d = .5  # proportion of vertical to horizontal extent of the slanted line
+        kwargs = dict(marker=[(-1, -d), (1, d)], markersize=12,
+                      linestyle="none", color='k', mec='k', mew=1, clip_on=False)
+        ax1.plot([0, 1], [0, 0], transform=ax1.transAxes, **kwargs)
+        ax2.plot([0, 1], [1, 1], transform=ax2.transAxes, **kwargs)
+
+        ax1.set_title("Imputation Error Trajectory (MSE) - Split Axis")
+        ax2.set_ylabel("Mean Squared Error")
+        ax2.set_xlabel("Batches")
+        
+        # Legend only on top to avoid clutter
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        ax2.grid(True, alpha=0.3)
+        
+    else:
+        # --- STANDARD PLOT ---
+        plt.figure(figsize=(10, 6))
+        for name, history in mse_histories.items():
+            batches = range(1, len(history) + 1)
+            plt.plot(batches, history, label=name, linewidth=2, alpha=0.8)
+        
+        plt.title("Imputation Error Trajectory (MSE)")
+        plt.xlabel("Batches")
+        plt.ylabel("Mean Squared Error")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+    out_path = os.path.join(output_dir, "MSE_Comparison.png")
+    plt.savefig(out_path)
+    plt.close()
+    print(f"Saved MSE comparison plot to {out_path}")
 
 
 def compute_control_covariance(h5ad_path, target_gene, obs_label, control_val):
@@ -385,7 +482,13 @@ def main():
     # We remove rows that don't have ground truth, as we can't simulate checking them.
     df = df.dropna(subset=['LoF_gamma', 'HBA1_beta'])
     total_genes = len(df)
-    
+
+    # Optional Centering
+    if args.center_data:
+        print("Centering LoF_gamma and HBA1_beta at 0...")
+        df['LoF_gamma'] = df['LoF_gamma'] - df['LoF_gamma'].mean()
+        df['HBA1_beta'] = df['HBA1_beta'] - df['HBA1_beta'].mean()
+
     print(f"Valid genes for simulation: {total_genes}")
     print(f"Batch size: {args.batch_size}")
     print(f"Significance Threshold: {args.p_threshold}")
@@ -393,6 +496,9 @@ def main():
     if total_genes < 3:
         print("Not enough genes to run simulation.")
         return
+
+    # Dictionary to store MSE histories for comparison plot
+    all_mse_histories = {}
 
     # ---------------------------------------------------------
     # Strategy 1: GammaMagnitude Sampling (LoF Known)
@@ -402,9 +508,10 @@ def main():
     df_mag['abs_lof'] = df_mag['LoF_gamma'].abs()
     df_mag = df_mag.sort_values(by='abs_lof', ascending=False)
     
-    mag_obs, mag_imp, mag_hist_obs, mag_hist_imp = run_simulation_strategy(
+    mag_obs, mag_imp, mag_hist_obs, mag_hist_imp, mag_mse = run_simulation_strategy(
         "GammaMagnitude Sorting (LoF Known)", df_mag, total_genes, args.batch_size, args.p_threshold, args.print_every
     )
+    all_mse_histories["GammaMagnitude"] = mag_mse
 
     # Plot GammaMagnitude results
     plot_pvalue_history(mag_hist_obs, "GammaMagnitude_ObservedGenes", args.output_dir)
@@ -417,9 +524,10 @@ def main():
     df_rnd = df.copy()
     df_rnd = df_rnd.sample(frac=1, random_state=args.seed).reset_index(drop=True)
     
-    rnd_obs, rnd_imp, rnd_hist_obs, rnd_hist_imp = run_simulation_strategy(
+    rnd_obs, rnd_imp, rnd_hist_obs, rnd_hist_imp, rnd_mse = run_simulation_strategy(
         "Random Sampling (LoF Unknown)", df_rnd, total_genes, args.batch_size, args.p_threshold, args.print_every
     )
+    all_mse_histories["Random"] = rnd_mse
 
     # Plot Random results
     plot_pvalue_history(rnd_hist_obs, "Random_ObservedGenes", args.output_dir)
@@ -454,9 +562,10 @@ def main():
             df_cov['abs_cov'] = df_cov['covariance'].abs()
             df_cov = df_cov.sort_values(by='abs_cov', ascending=False)
 
-            cov_obs, cov_imp, cov_hist_obs, cov_hist_imp = run_simulation_strategy(
+            cov_obs, cov_imp, cov_hist_obs, cov_hist_imp, cov_mse = run_simulation_strategy(
                 "Control Covariance Sorting", df_cov, total_genes, args.batch_size, args.p_threshold, args.print_every
             )
+            all_mse_histories["ControlCovariance"] = cov_mse
 
             plot_pvalue_history(cov_hist_obs, "ControlCovariance_ObservedGenes", args.output_dir)
             plot_pvalue_history(cov_hist_imp, "ControlCovariance_ImputedGenes", args.output_dir)
@@ -482,13 +591,19 @@ def main():
             # 3. Sort by Absolute Effect (Descending)
             df_ext = df_ext.sort_values(by='ext_effect', ascending=False)
 
-            ext_obs, ext_imp, ext_hist_obs, ext_hist_imp = run_simulation_strategy(
+            ext_obs, ext_imp, ext_hist_obs, ext_hist_imp, ext_mse = run_simulation_strategy(
                 "External Perturbation Sorting", df_ext, total_genes, args.batch_size, args.p_threshold, args.print_every
             )
+            all_mse_histories["ExternalPerturbation"] = ext_mse
 
             plot_pvalue_history(ext_hist_obs, "ExternalPerturbation_ObservedGenes", args.output_dir)
             plot_pvalue_history(ext_hist_imp, "ExternalPerturbation_ImputedGenes", args.output_dir)
 
+    # ---------------------------------------------------------
+    # Final Comparative Plots
+    # ---------------------------------------------------------
+    if all_mse_histories:
+        plot_mse_comparison(all_mse_histories, args.output_dir)
 
     # ---------------------------------------------------------
     # Summary
