@@ -8,6 +8,8 @@ import matplotlib.pyplot as plt
 import anndata as ad
 import scipy.sparse as sp
 
+from active_gp import ActiveGPLearner
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Active Learning Baselines: Random vs. Magnitude Sampling")
@@ -90,12 +92,20 @@ def parse_arguments():
         help="Center LoF_gamma and HBA1_beta at 0 by subtracting their means."
     )
 
+    # --- GP Imputation Arguments ---
+    parser.add_argument("--external_list", type=str, default="", help="List of external h5ad files for GP kernel.")
+    parser.add_argument("--embeddings_yaml", type=str, default="", help="Single YAML file defining pathway/embedding sources.")
+    parser.add_argument("--kernel_agg", type=str, default="mean", choices=["mean", "wmean"], help="GP Kernel aggregation method.")
+    parser.add_argument("--gp_noise_var", type=float, default=0.01, help="GP noise variance (lambda).")
+    parser.add_argument("--gp_recompute_freq", type=int, default=5, help="How often to re-weight GP kernels (batches).")
+
     return parser.parse_args()
 
 
-def run_simulation_strategy(name, df_sorted, total_genes, batch_size, p_threshold, print_every=10):
+def run_simulation_strategy(name, df_sorted, total_genes, batch_size, p_threshold, print_every=10, gp_learner=None):
     """
     Runs the batch simulation for a specific ordering of genes (df_sorted).
+    If gp_learner is provided, uses GP prediction for the 'Imputed' metric instead of Mean Imputation.
     """
     print(f"\nRunning Strategy: {name}")
     print(f"{'Batch':<8} | {'Revealed':<8} | {'Corr (ObsGenes)':<15} | {'P (ObsGenes)':<15} | {'Corr (ImpGenes)':<15} | {'P (ImpGenes)':<15}")
@@ -144,24 +154,62 @@ def run_simulation_strategy(name, df_sorted, total_genes, batch_size, p_threshol
         history_obs.append(p_obs)
 
         # ==========================================
-        # Metric 2: Imputed Correlation (Average Known)
+        # Metric 2: Imputed Correlation (Mean OR GP)
         # ==========================================
         # LOF: We use the FULL REAL LoF vector (no imputation, we just use the truth).
         # HBA1: We use the HYBRID vector (Real for knowns, Mean of knowns for unknowns).
         
         n_missing = total_genes - n_revealed
         
-        if n_missing > 0:
-            # Impute HBA1 only
-            if len(hba1_known) > 0:
-                mean_hba1 = np.mean(hba1_known)
-            else:
-                mean_hba1 = 0.0 # Fallback if nothing revealed yet
+        if gp_learner is not None:
+            # --- GP IMPUTATION ---
+            # 1. Update weights periodically
+            if batch_idx % gp_learner.args.gp_recompute_freq == 0:
+                # Create mask for CURRENTLY known genes in the ORIGINAL order
+                # We need to map the sorted df back to the original indices the GP knows
+                # BUT ActiveGPLearner was init with df['gene_name'].values from the MAIN df.
+                # So we just pass the names of currently revealed genes.
+                pass # Optimization: ActiveGP.update takes indices.
                 
-            hba1_imputed_tail = np.full(n_missing, mean_hba1)
-            hba1_full_hybrid = np.concatenate([hba1_known, hba1_imputed_tail])
+            # Create boolean mask for the learner
+            # The learner stores genes in the original order. We need to match.
+            # Get names of revealed genes
+            rev_names = df_sorted['gene_name'].iloc[:n_revealed].values
+            
+            # Create mask aligned to learner.genes
+            # Use np.isin for speed
+            mask = np.isin(gp_learner.genes, rev_names)
+            
+            # Get observed values aligned to that mask
+            # We need to ensure Y is aligned to learner.genes[mask]
+            # Create a lookup series
+            y_series = pd.Series(hba1_known, index=rev_names)
+            y_aligned_obs = y_series.reindex(gp_learner.genes[mask]).values
+            
+            # Update weights (optional frequency check inside update or here)
+            if batch_idx % gp_learner.args.gp_recompute_freq == 0:
+                gp_learner.update(mask, y_aligned_obs)
+                
+            # Predict
+            hba1_full_hybrid = gp_learner.predict(mask, y_aligned_obs)
+            
+            # Note: hba1_full_hybrid is aligned to gp_learner.genes (Original Order)
+            # We need to compare it to all_lof_true (Sorted Order)
+            # So we map it back
+            pred_series = pd.Series(hba1_full_hybrid, index=gp_learner.genes)
+            hba1_full_hybrid = pred_series.reindex(df_sorted['gene_name']).values
+            
         else:
-            hba1_full_hybrid = hba1_known
+            # --- MEAN IMPUTATION (Baseline) ---
+            if n_missing > 0:
+                if len(hba1_known) > 0:
+                    mean_hba1 = np.mean(hba1_known)
+                else:
+                    mean_hba1 = 0.0 
+                hba1_imputed_tail = np.full(n_missing, mean_hba1)
+                hba1_full_hybrid = np.concatenate([hba1_known, hba1_imputed_tail])
+            else:
+                hba1_full_hybrid = hba1_known
             
         # Calculate correlation: Full Real LoF vs Full Hybrid HBA1
         if np.std(all_lof_true) == 0 or np.std(hba1_full_hybrid) == 0:
