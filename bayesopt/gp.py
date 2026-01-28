@@ -600,8 +600,22 @@ def compute_global_kernel_weights(
         return [1.0 / max(1, len(kernels_and_perts))] * len(kernels_and_perts), [0.0] * len(kernels_and_perts)
 
     D_tgt_O = np.stack([np.asarray(deltas_tgt_O[p]).ravel() for p in perts_O], axis=0).astype(np.float32)
-    # Pearson corr similarity on O×O
-    S_tgt = np.corrcoef(D_tgt_O)
+    # Compute S_tgt (Similarity on Target)
+    # If we have only 1 feature (e.g. single-gene Active Learning), corrcoef is undefined (div by 0).
+    # In that case, we use the outer product of z-scored values.
+    if D_tgt_O.shape[1] == 1:
+        # 1D Case: Z-score and outer product
+        # (y - mean) / std
+        y = D_tgt_O.flatten()
+        if y.std() > 1e-9:
+            y_z = (y - y.mean()) / y.std()
+            S_tgt = np.outer(y_z, y_z)
+        else:
+            S_tgt = np.zeros((len(y), len(y)), dtype=np.float32)
+    else:
+        # Standard Multi-Gene Case: Pearson Correlation
+        S_tgt = np.corrcoef(D_tgt_O)
+
     S_tgt = np.nan_to_num(S_tgt, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
     scores = []
@@ -674,7 +688,16 @@ def compute_per_pert_weights_on_O(
         return [{p: 1.0 for p in perts_O}] * len(kernels_and_perts)
 
     D_tgt_O = np.stack([np.asarray(deltas_tgt_O[p]).ravel() for p in perts_O], axis=0).astype(np.float32)
-    S_tgt = np.corrcoef(D_tgt_O)
+    # Handle 1D case
+    if D_tgt_O.shape[1] == 1:
+        y = D_tgt_O.flatten()
+        if y.std() > 1e-9:
+            y_z = (y - y.mean()) / y.std()
+            S_tgt = np.outer(y_z, y_z)
+        else:
+            S_tgt = np.zeros((len(y), len(y)), dtype=np.float32)
+    else:
+        S_tgt = np.corrcoef(D_tgt_O)
     S_tgt = np.nan_to_num(S_tgt, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
     pos = {p: j for j, p in enumerate(perts_O)}
 

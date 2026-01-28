@@ -33,10 +33,11 @@ class ActiveGPLearner:
         # --- ADAPTER: Dummy Target for Intersections ---
         # utils.read_and_intersect expects an AnnData object to define the "target" set of perturbations.
         # We create a lightweight container holding our master gene list in .obs[target_label].
-        obs_perts = pd.DataFrame({args.target_label: self.genes})
-        obs_perts.index = self.genes
+        dummy_labels = list(self.genes) + [self.args.control_label]
+        obs_perts = pd.DataFrame({self.args.target_label: dummy_labels})
+        obs_perts.index = dummy_labels
         self.dummy_target_perts = ad.AnnData(
-            X=sparse.csr_matrix((self.n_genes, 1), dtype=np.float32),
+            X=sparse.csr_matrix((len(dummy_labels), 1), dtype=np.float32),
             obs=obs_perts
         )
 
@@ -125,7 +126,7 @@ class ActiveGPLearner:
                     var_names_target=list(self.genes),
                     perts_O=list(self.genes), # Pass all genes as candidates
                     perts_U=[],               # No split needed here
-                    emb_metric=getattr(self.args, 'emb_metric', 'cosine'),
+                    emb_metric=self.args.emb_metric,
                     emb_pca_dim=getattr(self.args, 'emb_pca_dim', 0),
                     emb_rbf_gamma=getattr(self.args, 'emb_rbf_gamma', 0.0)
                 )
@@ -215,7 +216,7 @@ class ActiveGPLearner:
         obs_labels = list(obs_genes) + [self.args.control_label]
         
         adata_train_dummy = ad.AnnData(
-            X=sparse.csr_matrix(X_train, dtype=np.float32),
+            X=X_train.astype(np.float32), # Use dense array to avoid sparse errors
             obs=pd.DataFrame({self.args.target_label: obs_labels}, index=range(n_obs+1)),
             var=pd.DataFrame(index=["DummyFeature"]) 
         )
@@ -227,7 +228,7 @@ class ActiveGPLearner:
             target_label=self.args.target_label,
             control_label=self.args.control_label,
             perts_O=list(obs_genes),
-            gamma=getattr(self.args, 'kernel_weight_gamma', 1.0)
+            gamma=self.args.kernel_weight_gamma
         )
         
         self.current_weights = new_weights

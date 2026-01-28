@@ -95,6 +95,8 @@ def parse_arguments():
     # --- GP Imputation Arguments ---
     parser.add_argument("--external_list", type=str, default="", help="List of external h5ad files for GP kernel.")
     parser.add_argument("--embeddings_yaml", type=str, default="", help="Single YAML file defining pathway/embedding sources.")
+    parser.add_argument("--emb_metric", type=str, default="cosine", help="Metric for embedding kernels (cosine/rbf).")
+    parser.add_argument("--kernel_weight_gamma", type=float, default=1.0, help="Gamma parameter for kernel alignment weights.")
     parser.add_argument("--kernel_agg", type=str, default="mean", choices=["mean", "wmean"], help="GP Kernel aggregation method.")
     parser.add_argument("--gp_noise_var", type=float, default=0.01, help="GP noise variance (lambda).")
     parser.add_argument("--gp_recompute_freq", type=int, default=5, help="How often to re-weight GP kernels (batches).")
@@ -163,14 +165,6 @@ def run_simulation_strategy(name, df_sorted, total_genes, batch_size, p_threshol
         
         if gp_learner is not None:
             # --- GP IMPUTATION ---
-            # 1. Update weights periodically
-            if batch_idx % gp_learner.args.gp_recompute_freq == 0:
-                # Create mask for CURRENTLY known genes in the ORIGINAL order
-                # We need to map the sorted df back to the original indices the GP knows
-                # BUT ActiveGPLearner was init with df['gene_name'].values from the MAIN df.
-                # So we just pass the names of currently revealed genes.
-                pass # Optimization: ActiveGP.update takes indices.
-                
             # Create boolean mask for the learner
             # The learner stores genes in the original order. We need to match.
             # Get names of revealed genes
@@ -585,6 +579,7 @@ def main():
     # Strategy 3: Control Covariance (Optional)
     # ---------------------------------------------------------
     cov_obs, cov_imp = None, None
+    df_cov = None  # Initialize for wider scope (used by GP strategy)
 
     if args.control_h5ad:
         # 1. Compute Covariance
@@ -648,6 +643,46 @@ def main():
             plot_pvalue_history(ext_hist_imp, "ExternalPerturbation_ImputedGenes", args.output_dir)
 
     # ---------------------------------------------------------
+    # # Strategy 5: GP Imputation (Covariance Sampling + GP Imputation)
+    # ---------------------------------------------------------
+    # This runs the SAME gene order as Control Covariance (if avail) or Random, but uses GP for the "Imputed" metric.
+    gp_obs, gp_imp = None, None
+    gp_strat_name = "GP Imputation"
+    if ActiveGPLearner is not None and (args.external_list or args.external_h5ad or args.embeddings_yaml):
+        print("\nInitializing Active GP Learner...")
+        # Initialize with the FULL list of genes from the input file
+        learner = ActiveGPLearner(df['gene_name'].values, args)
+
+        # Select Gene Order: Prioritize Control Covariance, fallback to Random
+        if df_cov is not None:
+            target_df = df_cov
+            gp_strat_name = "Control Covariance + GP Imputation"
+            plot_name_obs = "CovGP_ObservedGenes"
+            plot_name_imp = "CovGP_ImputedGenes"
+            mse_key = "ControlCovariance_GP"
+        else:
+            print("Warning: Control Covariance not available. Falling back to Random Sampling for GP.")
+            target_df = df_rnd
+            gp_strat_name = "Random Sampling + GP Imputation"
+            plot_name_obs = "RandomGP_ObservedGenes"
+            plot_name_imp = "RandomGP_ImputedGenes"
+            mse_key = "Random_GP"
+
+        gp_obs, gp_imp, gp_hist_obs, gp_hist_imp, gp_mse = run_simulation_strategy(
+            gp_strat_name, 
+            target_df,
+            total_genes, 
+            args.batch_size, 
+            args.p_threshold, 
+            args.print_every,
+            gp_learner=learner
+        )
+        
+        all_mse_histories[mse_key] = gp_mse
+        plot_pvalue_history(gp_hist_obs, plot_name_obs, args.output_dir)
+        plot_pvalue_history(gp_hist_imp, plot_name_imp, args.output_dir)
+
+    # ---------------------------------------------------------
     # Final Comparative Plots
     # ---------------------------------------------------------
     if all_mse_histories:
@@ -659,18 +694,20 @@ def main():
     print("\n" + "="*50)
     print("FINAL SUMMARY: Batches needed for Significance")
     print("="*50)
-    print(f"{'Strategy':<30} | {'ObservedGenes':<18} | {'ImputedGenes':<18}")
-    print("-" * 72)
+    print(f"{'Strategy':<40} | {'ObservedGenes':<18} | {'ImputedGenes':<18}")
+    print("-" * 82)
 
     def fmt(val): return str(val) if val else "> Max Batches"
 
-    print(f"{'GammaMagnitude Sorting':<30} | {fmt(mag_obs):<18} | {fmt(mag_imp):<18}")
-    print(f"{'Random Sampling':<30} | {fmt(rnd_obs):<18} | {fmt(rnd_imp):<18}")
+    print(f"{'GammaMagnitude Sorting':<40} | {fmt(mag_obs):<18} | {fmt(mag_imp):<18}")
+    print(f"{'Random Sampling':<40} | {fmt(rnd_obs):<18} | {fmt(rnd_imp):<18}")
     if args.control_h5ad and cov_obs is not None:
-        print(f"{'Control Covariance Sorting':<30} | {fmt(cov_obs):<18} | {fmt(cov_imp):<18}")
+        print(f"{'Control Covariance Sorting':<40} | {fmt(cov_obs):<18} | {fmt(cov_imp):<18}")
     if args.external_h5ad and ext_obs is not None:
-        print(f"{'External Perturbation Sorting':<30} | {fmt(ext_obs):<18} | {fmt(ext_imp):<18}")
-    print("-" * 72)
+        print(f"{'External Perturbation Sorting':<40} | {fmt(ext_obs):<18} | {fmt(ext_imp):<18}")
+    if gp_obs is not None:
+        print(f"{gp_strat_name:<40} | {fmt(gp_obs):<18} | {fmt(gp_imp):<18}")
+    print("-" * 82)
 
 if __name__ == "__main__":
     main()

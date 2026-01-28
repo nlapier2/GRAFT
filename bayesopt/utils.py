@@ -463,14 +463,20 @@ def compute_deltas(adata, target_label, control_label):
         A dictionary mapping perturbation labels to their delta vectors.
     """
     control_mask = adata.obs[target_label] == control_label
-    control_mean = adata[control_mask].X.mean(axis=0)
-
+    if not control_mask.any():
+        raise ValueError(f"No control cells found with label '{control_label}' in column '{target_label}'.")
+        
+    # Handle sparse inputs via to_numpy helper
+    X_ctrl = to_numpy(adata[control_mask].X)
+    control_mean = np.array(X_ctrl.mean(axis=0)).flatten()
     pert_adata = adata[~control_mask]
     
-    deltas = {
-        pert: pert_adata[pert_adata.obs[target_label] == pert].X.flatten() - control_mean
-        for pert in pert_adata.obs[target_label].unique()
-    }
+    deltas = {}
+    for pert in pert_adata.obs[target_label].unique():
+        mask = pert_adata.obs[target_label] == pert
+        # Use to_numpy to safely handle sparse inputs
+        row_vals = to_numpy(pert_adata[mask].X).flatten()
+        deltas[pert] = row_vals - control_mean
     return deltas, control_mean
 
 def row_standardize(M: np.ndarray) -> np.ndarray:
