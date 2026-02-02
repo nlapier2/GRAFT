@@ -76,6 +76,11 @@ def run_simulation_strategy(strategy, df_master, total_genes, batch_size, p_thre
     history_imp = []
     history_mse = []
     
+    # Diagnostics storage
+    diag_lof = []
+    diag_hba1 = []
+    diag_conn = []
+    
     batch_idx = 0
     
     while n_revealed < total_genes:
@@ -106,6 +111,29 @@ def run_simulation_strategy(strategy, df_master, total_genes, batch_size, p_thre
         # Here we pass the indices and values of the NEW batch if needed, 
         # but typically the strategy might just use the FULL known set next time.
         strategy.update(new_indices, all_hba1_true[new_indices])
+
+        # ==========================================
+        # Diagnostic: Analyze Selected Batch Quality
+        # ==========================================
+        # 1. Magnitude of Effects (Are we picking strong genes?)
+        batch_lof_abs = np.mean(np.abs(all_lof_true[new_indices]))
+        batch_hba1_abs = np.mean(np.abs(all_hba1_true[new_indices]))
+        
+        diag_lof.append(batch_lof_abs)
+        diag_hba1.append(batch_hba1_abs)
+        
+        # 2. Connectivity (Are we picking central hubs or outliers?)
+        # We check if the strategy has a 'learner' with a fused kernel
+        learner = getattr(strategy, 'learner', None)
+        if learner is not None and getattr(learner, 'K_fused', None) is not None:
+            # Get the rows of the kernel for the selected genes
+            # Calculate mean absolute similarity to ALL other genes (Connectivity)
+            # K_fused is (N, N). We take rows [new_indices]. 
+            K_sub = learner.K_fused[new_indices, :]
+            batch_conn = np.mean(np.abs(K_sub)) # Average correlation to the universe
+        else:
+            batch_conn = np.nan
+        diag_conn.append(batch_conn)
 
         # ==========================================
         # Metric 1: Observed Correlation
@@ -155,7 +183,14 @@ def run_simulation_strategy(strategy, df_master, total_genes, batch_size, p_thre
         if batch_idx == 1 or batch_idx % print_every == 0 or n_revealed == total_genes:
             print(f"{batch_idx:<8} | {n_revealed:<8} | {corr_obs:+.4f}     | {p_obs:.2e}    | {corr_imp:+.4f}     | {p_imp:.2e}")
 
-    return sig_batch_obs, sig_batch_imp, history_obs, history_imp, history_mse
+    # Aggregate Diagnostics
+    avg_diag = {
+        'lof': np.mean(diag_lof) if diag_lof else 0.0,
+        'hba1': np.mean(diag_hba1) if diag_hba1 else 0.0,
+        'conn': np.nanmean(diag_conn) if not np.all(np.isnan(diag_conn)) else 0.0
+    }
+
+    return sig_batch_obs, sig_batch_imp, history_obs, history_imp, history_mse, avg_diag
 
 
 def plot_pvalue_history(p_values, method_name, output_dir, true_p_val=None):
@@ -484,6 +519,9 @@ def main():
     # Dictionary to store MSE histories for comparison plot
     all_mse_histories = {}
 
+    # Store diagnostics for final table
+    all_diagnostics = {}
+
     # ---------------------------------------------------------
     # Strategy 1: GammaMagnitude Sampling
     # ---------------------------------------------------------
@@ -492,10 +530,11 @@ def main():
     
     strat_mag = StaticStrategy(total_genes, args, mag_indices, name="GammaMagnitude Sorting")
     
-    mag_obs, mag_imp, mag_hist_obs, mag_hist_imp, mag_mse = run_simulation_strategy(
+    mag_obs, mag_imp, mag_hist_obs, mag_hist_imp, mag_mse, mag_diag = run_simulation_strategy(
         strat_mag, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
     )
     all_mse_histories["GammaMagnitude"] = mag_mse
+    all_diagnostics["GammaMagnitude"] = mag_diag
 
     plot_pvalue_history(mag_hist_obs, "GammaMagnitude_ObservedGenes", args.output_dir, ground_truth_p)
     plot_pvalue_history(mag_hist_imp, "GammaMagnitude_ImputedGenes", args.output_dir, ground_truth_p)
@@ -508,10 +547,11 @@ def main():
     
     strat_rnd = StaticStrategy(total_genes, args, rnd_indices, name="Random Sampling")
     
-    rnd_obs, rnd_imp, rnd_hist_obs, rnd_hist_imp, rnd_mse = run_simulation_strategy(
+    rnd_obs, rnd_imp, rnd_hist_obs, rnd_hist_imp, rnd_mse, rnd_diag = run_simulation_strategy(
         strat_rnd, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
     )
     all_mse_histories["Random"] = rnd_mse
+    all_diagnostics["Random"] = rnd_diag
 
     plot_pvalue_history(rnd_hist_obs, "Random_ObservedGenes", args.output_dir, ground_truth_p)
     plot_pvalue_history(rnd_hist_imp, "Random_ImputedGenes", args.output_dir, ground_truth_p)
@@ -537,10 +577,11 @@ def main():
             
             strat_cov = StaticStrategy(total_genes, args, cov_indices, name="Control Covariance")
 
-            cov_obs, cov_imp, cov_hist_obs, cov_hist_imp, cov_mse = run_simulation_strategy(
+            cov_obs, cov_imp, cov_hist_obs, cov_hist_imp, cov_mse, cov_diag = run_simulation_strategy(
                 strat_cov, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
             )
             all_mse_histories["ControlCovariance"] = cov_mse
+            all_diagnostics["ControlCovariance"] = cov_diag
 
             plot_pvalue_history(cov_hist_obs, "ControlCovariance_ObservedGenes", args.output_dir, ground_truth_p)
             plot_pvalue_history(cov_hist_imp, "ControlCovariance_ImputedGenes", args.output_dir, ground_truth_p)
@@ -559,10 +600,11 @@ def main():
             
             strat_ext = StaticStrategy(total_genes, args, ext_indices, name="External Perturbation")
 
-            ext_obs, ext_imp, ext_hist_obs, ext_hist_imp, ext_mse = run_simulation_strategy(
+            ext_obs, ext_imp, ext_hist_obs, ext_hist_imp, ext_mse, ext_diag = run_simulation_strategy(
                 strat_ext, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
             )
             all_mse_histories["ExternalPerturbation"] = ext_mse
+            all_diagnostics["ExternalPerturbation"] = ext_diag
 
             plot_pvalue_history(ext_hist_obs, "ExternalPerturbation_ObservedGenes", args.output_dir, ground_truth_p)
             plot_pvalue_history(ext_hist_imp, "ExternalPerturbation_ImputedGenes", args.output_dir, ground_truth_p)
@@ -608,11 +650,12 @@ def main():
         shared_learner.reset()
         strat_gp = StaticGPStrategy(total_genes, args, gp_indices, shared_learner, name=gp_strat_name)
 
-        gp_obs, gp_imp, gp_hist_obs, gp_hist_imp, gp_mse = run_simulation_strategy(
+        gp_obs, gp_imp, gp_hist_obs, gp_hist_imp, gp_mse, gp_diag = run_simulation_strategy(
             strat_gp, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
         )
         
         all_mse_histories[mse_key] = gp_mse
+        all_diagnostics[mse_key] = gp_diag
         plot_pvalue_history(gp_hist_obs, plot_name_obs, args.output_dir, ground_truth_p)
         plot_pvalue_history(gp_hist_imp, plot_name_imp, args.output_dir, ground_truth_p)
 
@@ -631,11 +674,12 @@ def main():
             # Pass cov_indices (if they exist) to use as the "Warm Start" for Batch 1
             strat_lev = HighLeverageStrategy(total_genes, args, shared_learner, prior_indices=cov_indices)
             
-            lev_obs, lev_imp, lev_hist_obs, lev_hist_imp, lev_mse = run_simulation_strategy(
+            lev_obs, lev_imp, lev_hist_obs, lev_hist_imp, lev_mse, lev_diag = run_simulation_strategy(
                 strat_lev, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
             )
             
             all_mse_histories["Active_HighLeverage"] = lev_mse
+            all_diagnostics["Active_HighLeverage"] = lev_diag
             plot_pvalue_history(lev_hist_obs, "HighLeverage_ObservedGenes", args.output_dir, ground_truth_p)
             plot_pvalue_history(lev_hist_imp, "HighLeverage_ImputedGenes", args.output_dir, ground_truth_p)
 
@@ -653,12 +697,13 @@ def main():
             # Use Random Start (default) or Covariance Start (if cov_indices passed)
             # Typically Uncertainty sampling starts Randomly to maximize entropy.
             strat_unc = UncertaintyStrategy(total_genes, args, shared_learner, prior_indices=None)
-            
-            unc_obs, unc_imp, unc_hist_obs, unc_hist_imp, unc_mse = run_simulation_strategy(
+
+            unc_obs, unc_imp, unc_hist_obs, unc_hist_imp, unc_mse, unc_diag = run_simulation_strategy(
                 strat_unc, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
             )
             
             all_mse_histories["Active_Uncertainty"] = unc_mse
+            all_diagnostics["Active_Uncertainty"] = unc_diag
             plot_pvalue_history(unc_hist_obs, "Uncertainty_ObservedGenes", args.output_dir, ground_truth_p)
             plot_pvalue_history(unc_hist_imp, "Uncertainty_ImputedGenes", args.output_dir, ground_truth_p)
 
@@ -668,7 +713,7 @@ def main():
     if all_mse_histories:
         plot_mse_comparison(all_mse_histories, args.output_dir)
 
-    # ---------------------------------------------------------
+# ---------------------------------------------------------
     # Summary
     # ---------------------------------------------------------
     print("\n" + "="*50)
@@ -692,6 +737,33 @@ def main():
     if unc_obs is not None:
         print(f"{'Active Uncertainty':<40} | {fmt(unc_obs):<18} | {fmt(unc_imp):<18}")
     print("-" * 82)
+
+    print("\n" + "="*85)
+    print("DIAGNOSTIC REPORT: Average Quality of Selected Genes")
+    print("="*85)
+    print(f"{'Strategy':<40} | {'Avg |LoF|':<12} | {'Avg |HBA1|':<12} | {'Avg Connectivity':<16}")
+    print("-" * 85)
+    
+    # Helper to print row
+    def print_diag(name, key):
+        if key in all_diagnostics:
+            d = all_diagnostics[key]
+            conn_str = f"{d['conn']:.4f}" if d['conn'] > 0 else "N/A"
+            print(f"{name:<40} | {d['lof']:.4f}       | {d['hba1']:.4f}       | {conn_str:<16}")
+
+    print_diag("GammaMagnitude Sorting", "GammaMagnitude")
+    print_diag("Random Sampling", "Random")
+    if args.control_h5ad and cov_obs is not None:
+        print_diag("Control Covariance Sorting", "ControlCovariance")
+    if args.external_h5ad and ext_obs is not None:
+        print_diag("External Perturbation Sorting", "ExternalPerturbation")
+    if gp_obs is not None:
+        print_diag(gp_strat_name, mse_key)
+    if lev_obs is not None:
+        print_diag("Active High Leverage", "Active_HighLeverage")
+    if unc_obs is not None:
+        print_diag("Active Uncertainty", "Active_Uncertainty")
+    print("-" * 85)
 
 if __name__ == "__main__":
     main()
