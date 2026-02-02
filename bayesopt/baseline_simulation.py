@@ -220,9 +220,10 @@ def run_simulation_strategy(strategy, df_master, total_genes, batch_size, p_thre
     return sig_batch_obs, sig_batch_imp, history_obs, history_imp, history_mse
 
 
-def plot_pvalue_history(p_values, method_name, output_dir):
+def plot_pvalue_history(p_values, method_name, output_dir, true_p_val=None):
     """
     Plots the -log10(p-value) over batches for a single approach.
+    If true_p_val is provided, it is plotted as the 'Ground Truth' reference line.
     """
     if not p_values:
         return
@@ -238,12 +239,17 @@ def plot_pvalue_history(p_values, method_name, output_dir):
     capped_p_values = [max(p, min_p) for p in p_values]
     
     # Convert to -log10
-    # Handle case where p might be 0 (though max(p, 1e-20) handles that)
     nlog10_p = [-np.log10(p) for p in capped_p_values]
     
-    # Reference values (also capped/converted)
-    final_p = capped_p_values[-1]
-    final_nlog10 = -np.log10(final_p)
+    # Determine Reference Line (Ground Truth or Final Batch)
+    if true_p_val is not None:
+        ref_p = max(true_p_val, min_p)
+        label_text = "Ground Truth"
+    else:
+        ref_p = capped_p_values[-1]
+        label_text = "Final Batch"
+
+    ref_nlog10 = -np.log10(ref_p)
     
     thresh_p = 0.05
     thresh_nlog10 = -np.log10(thresh_p)
@@ -253,7 +259,7 @@ def plot_pvalue_history(p_values, method_name, output_dir):
     
     # Horizontal lines
     plt.axhline(y=thresh_nlog10, color='r', linestyle='--', alpha=0.7, label=f'Marginal Sig (0.05)')
-    plt.axhline(y=final_nlog10, color='g', linestyle='--', alpha=0.7, label=f'Final P-value')
+    plt.axhline(y=ref_nlog10, color='g', linestyle='--', alpha=0.7, label=f'{label_text} P-value')
     
     plt.title(f"Significance Trajectory: {method_name}")
     plt.xlabel("Batches")
@@ -529,6 +535,14 @@ def main():
         print("Not enough genes to run simulation.")
         return
 
+    # --- Calculate Ground Truth P-Value ---
+    # This is the target p-value if we perfectly measured the entire dataset.
+    if df['LoF_gamma'].std() > 0 and df['HBA1_beta'].std() > 0:
+        _, ground_truth_p = stats.pearsonr(df['LoF_gamma'], df['HBA1_beta'])
+    else:
+        ground_truth_p = 1.0
+    print(f"Ground Truth Correlation P-value (All Genes): {ground_truth_p:.2e}")
+
     # Dictionary to store MSE histories for comparison plot
     all_mse_histories = {}
 
@@ -545,8 +559,8 @@ def main():
     )
     all_mse_histories["GammaMagnitude"] = mag_mse
 
-    plot_pvalue_history(mag_hist_obs, "GammaMagnitude_ObservedGenes", args.output_dir)
-    plot_pvalue_history(mag_hist_imp, "GammaMagnitude_ImputedGenes", args.output_dir)
+    plot_pvalue_history(mag_hist_obs, "GammaMagnitude_ObservedGenes", args.output_dir, ground_truth_p)
+    plot_pvalue_history(mag_hist_imp, "GammaMagnitude_ImputedGenes", args.output_dir, ground_truth_p)
 
     # ---------------------------------------------------------
     # Strategy 2: Random Sampling
@@ -561,8 +575,8 @@ def main():
     )
     all_mse_histories["Random"] = rnd_mse
 
-    plot_pvalue_history(rnd_hist_obs, "Random_ObservedGenes", args.output_dir)
-    plot_pvalue_history(rnd_hist_imp, "Random_ImputedGenes", args.output_dir)
+    plot_pvalue_history(rnd_hist_obs, "Random_ObservedGenes", args.output_dir, ground_truth_p)
+    plot_pvalue_history(rnd_hist_imp, "Random_ImputedGenes", args.output_dir, ground_truth_p)
 
     # ---------------------------------------------------------
     # Strategy 3: Control Covariance (Optional)
@@ -590,8 +604,8 @@ def main():
             )
             all_mse_histories["ControlCovariance"] = cov_mse
 
-            plot_pvalue_history(cov_hist_obs, "ControlCovariance_ObservedGenes", args.output_dir)
-            plot_pvalue_history(cov_hist_imp, "ControlCovariance_ImputedGenes", args.output_dir)
+            plot_pvalue_history(cov_hist_obs, "ControlCovariance_ObservedGenes", args.output_dir, ground_truth_p)
+            plot_pvalue_history(cov_hist_imp, "ControlCovariance_ImputedGenes", args.output_dir, ground_truth_p)
 
     # ---------------------------------------------------------
     # Strategy 4: External Perturbation Effect (Optional)
@@ -612,10 +626,10 @@ def main():
             )
             all_mse_histories["ExternalPerturbation"] = ext_mse
 
-            plot_pvalue_history(ext_hist_obs, "ExternalPerturbation_ObservedGenes", args.output_dir)
-            plot_pvalue_history(ext_hist_imp, "ExternalPerturbation_ImputedGenes", args.output_dir)
+            plot_pvalue_history(ext_hist_obs, "ExternalPerturbation_ObservedGenes", args.output_dir, ground_truth_p)
+            plot_pvalue_history(ext_hist_imp, "ExternalPerturbation_ImputedGenes", args.output_dir, ground_truth_p)
 
-# ---------------------------------------------------------
+    # ---------------------------------------------------------
     # Shared GP Initialization (Run once if any GP strategy is needed)
     # ---------------------------------------------------------
     shared_learner = None
@@ -661,8 +675,8 @@ def main():
         )
         
         all_mse_histories[mse_key] = gp_mse
-        plot_pvalue_history(gp_hist_obs, plot_name_obs, args.output_dir)
-        plot_pvalue_history(gp_hist_imp, plot_name_imp, args.output_dir)
+        plot_pvalue_history(gp_hist_obs, plot_name_obs, args.output_dir, ground_truth_p)
+        plot_pvalue_history(gp_hist_imp, plot_name_imp, args.output_dir, ground_truth_p)
 
     # ---------------------------------------------------------
     # Strategy 6: Active High Leverage (Optional)
@@ -683,8 +697,8 @@ def main():
             )
             
             all_mse_histories["Active_HighLeverage"] = lev_mse
-            plot_pvalue_history(lev_hist_obs, "HighLeverage_ObservedGenes", args.output_dir)
-            plot_pvalue_history(lev_hist_imp, "HighLeverage_ImputedGenes", args.output_dir)
+            plot_pvalue_history(lev_hist_obs, "HighLeverage_ObservedGenes", args.output_dir, ground_truth_p)
+            plot_pvalue_history(lev_hist_imp, "HighLeverage_ImputedGenes", args.output_dir, ground_truth_p)
 
     # ---------------------------------------------------------
     # Final Comparative Plots
