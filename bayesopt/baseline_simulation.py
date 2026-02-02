@@ -9,89 +9,26 @@ import anndata as ad
 import scipy.sparse as sp
 
 from active_gp import ActiveGPLearner
-from active_strategies import StaticStrategy, StaticGPStrategy, HighLeverageStrategy
+from active_strategies import StaticStrategy, StaticGPStrategy, HighLeverageStrategy, UncertaintyStrategy
 
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Active Learning Baselines: Random vs. Magnitude Sampling")
-    
-    parser.add_argument(
-        "--input_file", 
-        type=str, 
-        required=True, 
-        help="Path to the TSV file containing gene_name, LoF_gamma, and HBA1_beta."
-    )
-    
-    parser.add_argument(
-        "--batch_size", 
-        type=int, 
-        default=100, 
-        help="Number of genes to reveal in each batch (default: 100)."
-    )
+    parser.add_argument("--input_file", type=str, required=True, help="Path to the TSV file containing gene_name, LoF_gamma, and HBA1_beta.")
+    parser.add_argument("--batch_size", type=int, default=100, help="Number of genes to reveal in each batch (default: 100).")
+    parser.add_argument("--print_every", type=int, default=10, help="Print progress every N batches (default: 10).")
+    parser.add_argument("--p_threshold", type=float, default=0.05, help="P-value threshold for statistical significance (default: 0.05).")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
+    parser.add_argument("--center_data", action="store_true", help="Center LoF_gamma and HBA1_beta at 0 by subtracting their means.")
+    parser.add_argument("--output_dir", type=str, default="plots", help="Directory to save the correlation plots.")
 
-    parser.add_argument(
-        "--print_every",
-        type=int,
-        default=10,
-        help="Print progress every N batches (default: 10)."
-    )
-    
-    parser.add_argument(
-        "--p_threshold",
-        type=float,
-        default=0.05,
-        help="P-value threshold for statistical significance (default: 0.05)."
-    )
-    
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed for reproducibility."
-    )
+    # Arguments for Control Strategy
+    parser.add_argument("--control_h5ad", type=str, default=None, help="Path to H5AD file containing control cells for covariance calculation.")
+    parser.add_argument("--target_label", type=str, default="target_gene", help="Obs column name identifying perturbation/control status (default: target_gene).")
+    parser.add_argument("--control_label", type=str, default="", help="Value in target_label that identifies control cells. If blank, uses all cells (default: '').")
 
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="plots",
-        help="Directory to save the correlation plots."
-    )
-
-    # New Arguments for Control Strategy
-    parser.add_argument(
-        "--control_h5ad",
-        type=str,
-        default=None,
-        help="Path to H5AD file containing control cells for covariance calculation."
-    )
-    
-    parser.add_argument(
-        "--target_label",
-        type=str,
-        default="target_gene",
-        help="Obs column name identifying perturbation/control status (default: target_gene)."
-    )
-    
-    parser.add_argument(
-        "--control_label",
-        type=str,
-        default="",
-        help="Value in target_label that identifies control cells. If blank, uses all cells (default: '')."
-    )
-
-    # New Argument for External Perturbation Strategy
-    parser.add_argument(
-        "--external_h5ad",
-        type=str,
-        default=None,
-        help="Path to 'external' pseudobulked H5AD for perturbation effect calculation."
-    )
-
-    parser.add_argument(
-        "--center_data",
-        action="store_true",
-        help="Center LoF_gamma and HBA1_beta at 0 by subtracting their means."
-    )
+    # Argument for External Perturbation Strategy
+    parser.add_argument("--external_h5ad", type=str, default=None, help="Path to 'external' pseudobulked H5AD for perturbation effect calculation.")
 
     # --- GP Imputation Arguments ---
     parser.add_argument("--external_list", type=str, default="", help="List of external h5ad files for GP kernel.")
@@ -104,6 +41,7 @@ def parse_arguments():
     
     # --- Active Learning Arguments ---
     parser.add_argument("--run_active_leverage", action="store_true", help="Run the Active High Leverage strategy.")
+    parser.add_argument("--run_active_uncertainty", action="store_true", help="Run the Active Uncertainty strategy.")
     parser.add_argument("--acq_beta", type=float, default=1.0, help="Beta parameter for acquisition (mean vs std trade-off).")
     parser.add_argument("--max_batches", type=int, default=None, help="Maximum number of batches to run (optional limit).")
 
@@ -702,6 +640,29 @@ def main():
             plot_pvalue_history(lev_hist_imp, "HighLeverage_ImputedGenes", args.output_dir, ground_truth_p)
 
     # ---------------------------------------------------------
+    # Strategy 7: Active Uncertainty (Optional)
+    # ---------------------------------------------------------
+    unc_obs, unc_imp = None, None
+    if args.run_active_uncertainty:
+        if shared_learner is None:
+            print("\nError: Active Uncertainty requires ActiveGPLearner and external data.")
+        else:
+            print("\nRunning Active Uncertainty Strategy...")
+            shared_learner.reset()
+            
+            # Use Random Start (default) or Covariance Start (if cov_indices passed)
+            # Typically Uncertainty sampling starts Randomly to maximize entropy.
+            strat_unc = UncertaintyStrategy(total_genes, args, shared_learner, prior_indices=None)
+            
+            unc_obs, unc_imp, unc_hist_obs, unc_hist_imp, unc_mse = run_simulation_strategy(
+                strat_unc, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
+            )
+            
+            all_mse_histories["Active_Uncertainty"] = unc_mse
+            plot_pvalue_history(unc_hist_obs, "Uncertainty_ObservedGenes", args.output_dir, ground_truth_p)
+            plot_pvalue_history(unc_hist_imp, "Uncertainty_ImputedGenes", args.output_dir, ground_truth_p)
+
+    # ---------------------------------------------------------
     # Final Comparative Plots
     # ---------------------------------------------------------
     if all_mse_histories:
@@ -728,6 +689,8 @@ def main():
         print(f"{gp_strat_name:<40} | {fmt(gp_obs):<18} | {fmt(gp_imp):<18}")
     if lev_obs is not None:
         print(f"{'Active High Leverage':<40} | {fmt(lev_obs):<18} | {fmt(lev_imp):<18}")
+    if unc_obs is not None:
+        print(f"{'Active Uncertainty':<40} | {fmt(unc_obs):<18} | {fmt(unc_imp):<18}")
     print("-" * 82)
 
 if __name__ == "__main__":

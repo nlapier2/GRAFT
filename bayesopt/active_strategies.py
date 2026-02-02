@@ -173,16 +173,28 @@ class UncertaintyStrategy(ActiveGPStrategy):
     Selects genes where the GP is most unsure (highest Variance).
     Goal: Explore the unknown space.
     """
-    def __init__(self, total_genes, args, gp_learner):
+    def __init__(self, total_genes, args, gp_learner, prior_indices=None):
         super().__init__(total_genes, args, gp_learner)
-        self.name = "Active_Uncertainty"
+        self.name = "Active Uncertainty"
+        self.prior_indices = prior_indices
 
     def select_next_batch(self, n_to_select, currently_known_mask, y_obs_vector=None):
-        # 1. Get predictions
+        # 0. Cold Start
+        n_known = np.sum(currently_known_mask)
+        if n_known == 0:
+            if self.prior_indices is not None:
+                return self.prior_indices[:n_to_select]
+            
+            rng = np.random.default_rng(getattr(self.args, 'seed', 42))
+            all_indices = np.arange(self.n_genes)
+            return rng.choice(all_indices, size=n_to_select, replace=False)
+
+        # 1. Get predictions (Variance only needed)
         _, vars = self._get_scored_candidates(currently_known_mask, y_obs_vector)
         
         # 2. Score = Variance
         scores = vars.copy()
+        # Mask known genes
         scores[currently_known_mask] = -np.inf
         
         # 3. Pick top N
