@@ -615,17 +615,27 @@ def main():
             plot_pvalue_history(ext_hist_obs, "ExternalPerturbation_ObservedGenes", args.output_dir)
             plot_pvalue_history(ext_hist_imp, "ExternalPerturbation_ImputedGenes", args.output_dir)
 
+# ---------------------------------------------------------
+    # Shared GP Initialization (Run once if any GP strategy is needed)
+    # ---------------------------------------------------------
+    shared_learner = None
+    has_external_data = (args.external_list or args.external_h5ad or args.embeddings_yaml)
+    
+    # We initialize the learner if we have external data AND (we run the default GP strategy OR the optional active one)
+    # Note: Strategy 5 runs automatically if data is present. Strategy 6 is optional.
+    if ActiveGPLearner is not None and has_external_data:
+        print("\nInitializing Shared Active GP Learner...")
+        # Learner uses gene names matching df index order.
+        # This loads the heavy kernels ONCE.
+        shared_learner = ActiveGPLearner(df['gene_name'].values, args)
+
     # ---------------------------------------------------------
     # Strategy 5: GP Imputation (Covariance/Random + GP Prediction)
     # ---------------------------------------------------------
     gp_obs, gp_imp = None, None
     gp_strat_name = "GP Imputation"
     
-    if ActiveGPLearner is not None and (args.external_list or args.external_h5ad or args.embeddings_yaml):
-        print("\nInitializing Active GP Learner...")
-        # Learner uses gene names matching df index order
-        learner = ActiveGPLearner(df['gene_name'].values, args)
-
+    if shared_learner is not None:
         # Select Order: Prioritize Control Covariance, fallback to Random
         if cov_indices is not None:
             gp_indices = cov_indices
@@ -642,7 +652,9 @@ def main():
             mse_key = "Random_GP"
             
         # Use StaticGPStrategy to wrap the static list + learner
-        strat_gp = StaticGPStrategy(total_genes, args, gp_indices, learner, name=gp_strat_name)
+        # Ensure learner starts clean
+        shared_learner.reset()
+        strat_gp = StaticGPStrategy(total_genes, args, gp_indices, shared_learner, name=gp_strat_name)
 
         gp_obs, gp_imp, gp_hist_obs, gp_hist_imp, gp_mse = run_simulation_strategy(
             strat_gp, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
@@ -653,18 +665,18 @@ def main():
         plot_pvalue_history(gp_hist_imp, plot_name_imp, args.output_dir)
 
     # ---------------------------------------------------------
-    # Strategy 6: Active High Leverage
+    # Strategy 6: Active High Leverage (Optional)
     # ---------------------------------------------------------
     lev_obs, lev_imp = None, None
     if args.run_active_leverage:
-        if ActiveGPLearner is None or not (args.external_list or args.external_h5ad or args.embeddings_yaml):
+        if shared_learner is None:
             print("\nError: Active High Leverage requires ActiveGPLearner and external data/embeddings.")
         else:
-            print("\nInitializing Active GP Learner for High Leverage Strategy...")
-            # Instantiate a FRESH learner to avoid state contamination from previous strategies
-            active_learner = ActiveGPLearner(df['gene_name'].values, args)
+            print("\nRunning Active High Leverage Strategy...")
+            # Reset the learner to clear weights learned during Strategy 5
+            shared_learner.reset()
             
-            strat_lev = HighLeverageStrategy(total_genes, args, active_learner)
+            strat_lev = HighLeverageStrategy(total_genes, args, shared_learner)
             
             lev_obs, lev_imp, lev_hist_obs, lev_hist_imp, lev_mse = run_simulation_strategy(
                 strat_lev, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
