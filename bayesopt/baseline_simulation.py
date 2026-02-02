@@ -9,7 +9,7 @@ import anndata as ad
 import scipy.sparse as sp
 
 from active_gp import ActiveGPLearner
-from active_strategies import StaticStrategy, StaticGPStrategy
+from active_strategies import StaticStrategy, StaticGPStrategy, HighLeverageStrategy
 
 
 def parse_arguments():
@@ -101,11 +101,16 @@ def parse_arguments():
     parser.add_argument("--kernel_agg", type=str, default="mean", choices=["mean", "wmean"], help="GP Kernel aggregation method.")
     parser.add_argument("--gp_noise_var", type=float, default=0.01, help="GP noise variance (lambda).")
     parser.add_argument("--gp_recompute_freq", type=int, default=5, help="How often to re-weight GP kernels (batches).")
+    
+    # --- Active Learning Arguments ---
+    parser.add_argument("--run_active_leverage", action="store_true", help="Run the Active High Leverage strategy.")
+    parser.add_argument("--acq_beta", type=float, default=1.0, help="Beta parameter for acquisition (mean vs std trade-off).")
+    parser.add_argument("--max_batches", type=int, default=None, help="Maximum number of batches to run (optional limit).")
 
     return parser.parse_args()
 
 
-def run_simulation_strategy(strategy, df_master, total_genes, batch_size, p_threshold, print_every=10):
+def run_simulation_strategy(strategy, df_master, total_genes, batch_size, p_threshold, max_batches=None, print_every=10):
     """
     Runs the simulation using a Strategy object.
     
@@ -136,6 +141,11 @@ def run_simulation_strategy(strategy, df_master, total_genes, batch_size, p_thre
     batch_idx = 0
     
     while n_revealed < total_genes:
+        # Check max batches
+        if max_batches is not None and batch_idx >= max_batches:
+            print(f"Reached max_batches ({max_batches}). Stopping.")
+            break
+
         batch_idx += 1
         
         # 1. Ask Strategy for next batch indices
@@ -522,7 +532,7 @@ def main():
     # Dictionary to store MSE histories for comparison plot
     all_mse_histories = {}
 
-# ---------------------------------------------------------
+    # ---------------------------------------------------------
     # Strategy 1: GammaMagnitude Sampling
     # ---------------------------------------------------------
     # Sort indices by absolute LoF_gamma (descending)
@@ -531,7 +541,7 @@ def main():
     strat_mag = StaticStrategy(total_genes, args, mag_indices, name="GammaMagnitude Sorting")
     
     mag_obs, mag_imp, mag_hist_obs, mag_hist_imp, mag_mse = run_simulation_strategy(
-        strat_mag, df, total_genes, args.batch_size, args.p_threshold, args.print_every
+        strat_mag, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
     )
     all_mse_histories["GammaMagnitude"] = mag_mse
 
@@ -547,7 +557,7 @@ def main():
     strat_rnd = StaticStrategy(total_genes, args, rnd_indices, name="Random Sampling")
     
     rnd_obs, rnd_imp, rnd_hist_obs, rnd_hist_imp, rnd_mse = run_simulation_strategy(
-        strat_rnd, df, total_genes, args.batch_size, args.p_threshold, args.print_every
+        strat_rnd, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
     )
     all_mse_histories["Random"] = rnd_mse
 
@@ -576,7 +586,7 @@ def main():
             strat_cov = StaticStrategy(total_genes, args, cov_indices, name="Control Covariance")
 
             cov_obs, cov_imp, cov_hist_obs, cov_hist_imp, cov_mse = run_simulation_strategy(
-                strat_cov, df, total_genes, args.batch_size, args.p_threshold, args.print_every
+                strat_cov, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
             )
             all_mse_histories["ControlCovariance"] = cov_mse
 
@@ -598,7 +608,7 @@ def main():
             strat_ext = StaticStrategy(total_genes, args, ext_indices, name="External Perturbation")
 
             ext_obs, ext_imp, ext_hist_obs, ext_hist_imp, ext_mse = run_simulation_strategy(
-                strat_ext, df, total_genes, args.batch_size, args.p_threshold, args.print_every
+                strat_ext, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
             )
             all_mse_histories["ExternalPerturbation"] = ext_mse
 
@@ -635,12 +645,34 @@ def main():
         strat_gp = StaticGPStrategy(total_genes, args, gp_indices, learner, name=gp_strat_name)
 
         gp_obs, gp_imp, gp_hist_obs, gp_hist_imp, gp_mse = run_simulation_strategy(
-            strat_gp, df, total_genes, args.batch_size, args.p_threshold, args.print_every
+            strat_gp, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
         )
         
         all_mse_histories[mse_key] = gp_mse
         plot_pvalue_history(gp_hist_obs, plot_name_obs, args.output_dir)
         plot_pvalue_history(gp_hist_imp, plot_name_imp, args.output_dir)
+
+    # ---------------------------------------------------------
+    # Strategy 6: Active High Leverage
+    # ---------------------------------------------------------
+    lev_obs, lev_imp = None, None
+    if args.run_active_leverage:
+        if ActiveGPLearner is None or not (args.external_list or args.external_h5ad or args.embeddings_yaml):
+            print("\nError: Active High Leverage requires ActiveGPLearner and external data/embeddings.")
+        else:
+            print("\nInitializing Active GP Learner for High Leverage Strategy...")
+            # Instantiate a FRESH learner to avoid state contamination from previous strategies
+            active_learner = ActiveGPLearner(df['gene_name'].values, args)
+            
+            strat_lev = HighLeverageStrategy(total_genes, args, active_learner)
+            
+            lev_obs, lev_imp, lev_hist_obs, lev_hist_imp, lev_mse = run_simulation_strategy(
+                strat_lev, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
+            )
+            
+            all_mse_histories["Active_HighLeverage"] = lev_mse
+            plot_pvalue_history(lev_hist_obs, "HighLeverage_ObservedGenes", args.output_dir)
+            plot_pvalue_history(lev_hist_imp, "HighLeverage_ImputedGenes", args.output_dir)
 
     # ---------------------------------------------------------
     # Final Comparative Plots
@@ -667,6 +699,8 @@ def main():
         print(f"{'External Perturbation Sorting':<40} | {fmt(ext_obs):<18} | {fmt(ext_imp):<18}")
     if gp_obs is not None:
         print(f"{gp_strat_name:<40} | {fmt(gp_obs):<18} | {fmt(gp_imp):<18}")
+    if lev_obs is not None:
+        print(f"{'Active High Leverage':<40} | {fmt(lev_obs):<18} | {fmt(lev_imp):<18}")
     print("-" * 82)
 
 if __name__ == "__main__":

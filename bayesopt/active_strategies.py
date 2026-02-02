@@ -114,15 +114,8 @@ class ActiveGPStrategy(BaseStrategy):
             self.learner.update(currently_known_mask, y_obs_vector)
         self.step_counter += 1
 
-        # 2. Get Predictions (Mean)
-        # Note: We will need to update ActiveGPLearner to return variance/uncertainty too.
-        # For now, assuming learner.predict returns full N-length vector.
-        preds_mean = self.learner.predict(currently_known_mask, y_obs_vector)
-        
-        # 3. Get Uncertainty (Variance)
-        # Placeholder: We need to add a method to ActiveGPLearner for this.
-        # preds_var = self.learner.get_last_variance() 
-        preds_var = np.ones_like(preds_mean) 
+        # 2. Get Predictions (Mean AND Variance)
+        preds_mean, preds_var = self.learner.predict_with_variance(currently_known_mask, y_obs_vector)
 
         return preds_mean, preds_var
 
@@ -136,23 +129,25 @@ class HighLeverageStrategy(ActiveGPStrategy):
     """
     def __init__(self, total_genes, args, gp_learner):
         super().__init__(total_genes, args, gp_learner)
-        self.name = "Active_HighLeverage"
-        self.beta = 1.0 # Exploration parameter
+        self.name = "Active HighLeverage"
+        self.beta = getattr(args, 'acq_beta', 1.0) # Allow CLI override, default 1.0
 
     def select_next_batch(self, n_to_select, currently_known_mask, y_obs_vector=None):
-        # 1. Get predictions
+        # 1. Get predictions for all genes
         means, vars = self._get_scored_candidates(currently_known_mask, y_obs_vector)
         stds = np.sqrt(vars)
 
-        # 2. Calculate Acquisition Score (for unknown genes only)
+        # 2. Calculate Acquisition Score
         # Score = |Mean| + Beta * Std
+        # Prioritize high magnitude predictions (Anchors) with some exploration (Std)
         scores = np.abs(means) + (self.beta * stds)
         
-        # Mask out known genes (set score to -infinity)
+        # 3. Mask out known genes
+        # Set their score to -infinity so they are pushed to the bottom
         scores[currently_known_mask] = -np.inf
         
-        # 3. Pick top N
-        # (Using argpartition is faster than full sort)
+        # 4. Pick top N
+        # argpartition moves the top N elements to the end of the array
         top_indices = np.argpartition(scores, -n_to_select)[-n_to_select:]
         
         return top_indices

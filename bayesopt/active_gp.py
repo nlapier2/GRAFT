@@ -234,38 +234,123 @@ class ActiveGPLearner:
         self.current_weights = new_weights
         self._fuse_kernels(initial=False)
 
+    def reset(self):
+            """
+            Resets the learner to its initial state (uniform weights).
+            Call this before using the learner in a new independent strategy
+            to avoid 'leaking' learned weights from a previous run.
+            """
+            print("[\u2699 ActiveGP] Resetting kernel weights to uniform...")
+            self._fuse_kernels(initial=True)
+
     def predict(self, obs_bool_mask, y_obs_vector):
+            """
+            Predicts y for UNobserved genes given Observed genes.
+            """
+            obs_idx = np.where(obs_bool_mask)[0]
+            
+            # Handle Cold Start (No observations yet)
+            if len(obs_idx) == 0:
+                return np.zeros(self.n_genes, dtype=np.float32)
+
+            unobs_idx = np.where(~obs_bool_mask)[0]
+            
+            # Center observed y
+            y_mean = np.mean(y_obs_vector)
+            y_centered = y_obs_vector - y_mean
+            
+            # Slice Fused Kernel
+            K_OO = self.K_fused[np.ix_(obs_idx, obs_idx)]
+            K_UO = self.K_fused[np.ix_(unobs_idx, obs_idx)]
+            
+            # Solve (Ridge)
+            lambda_i = getattr(self.args, 'gp_noise_var', 0.01)
+            K_reg = K_OO + lambda_i * np.eye(len(obs_idx), dtype=np.float32)
+            
+            try:
+                # (N_obs, 1)
+                alpha = np.linalg.solve(K_reg, y_centered)
+            except np.linalg.LinAlgError:
+                alpha = np.linalg.lstsq(K_reg, y_centered, rcond=None)[0]
+                
+            # Predict
+            y_pred_centered = K_UO @ alpha
+            y_pred = y_pred_centered + y_mean
+            
+            # Reconstruct full vector
+            y_full = np.zeros(self.n_genes)
+            y_full[obs_idx] = y_obs_vector
+            y_full[unobs_idx] = y_pred
+            
+            return y_full
+
+
+    def predict_with_variance(self, obs_bool_mask, y_obs_vector):
         """
-        Predicts y for UNobserved genes given Observed genes.
+        Predicts Mean AND Variance for unobserved genes.
+        Returns: (y_full_mean, y_full_var)
         """
         obs_idx = np.where(obs_bool_mask)[0]
         unobs_idx = np.where(~obs_bool_mask)[0]
         
-        # Center observed y
+        # 1. Handle Cold Start
+        if len(obs_idx) == 0:
+            return np.zeros(self.n_genes), np.ones(self.n_genes)
+
+        # 2. Compute Mean (Standard Predict Logic)
         y_mean = np.mean(y_obs_vector)
         y_centered = y_obs_vector - y_mean
         
-        # Slice Fused Kernel
         K_OO = self.K_fused[np.ix_(obs_idx, obs_idx)]
         K_UO = self.K_fused[np.ix_(unobs_idx, obs_idx)]
         
-        # Solve (Ridge)
         lambda_i = getattr(self.args, 'gp_noise_var', 0.01)
         K_reg = K_OO + lambda_i * np.eye(len(obs_idx), dtype=np.float32)
         
+        # Solve for Alpha (Mean) and Inverse (Variance)
+        # Using cholesky or solve. 
+        # For variance: var(u) = K(u,u) - K_uO * K_reg^-1 * K_Ou
         try:
-            # (N_obs, 1)
+            # A = K_reg^-1 * K_Ou  -> Solve K_reg * A = K_UO.T
+            # A shape: (N_obs, N_unobs)
+            A = np.linalg.solve(K_reg, K_UO.T)
             alpha = np.linalg.solve(K_reg, y_centered)
         except np.linalg.LinAlgError:
+            # Fallback
+            A = np.linalg.lstsq(K_reg, K_UO.T, rcond=None)[0]
             alpha = np.linalg.lstsq(K_reg, y_centered, rcond=None)[0]
-            
-        # Predict
-        y_pred_centered = K_UO @ alpha
-        y_pred = y_pred_centered + y_mean
+
+        # 3. Compute Mean
+        y_pred = (K_UO @ alpha) + y_mean
         
-        # Reconstruct full vector
-        y_full = np.zeros(self.n_genes)
-        y_full[obs_idx] = y_obs_vector
-        y_full[unobs_idx] = y_pred
+        # 4. Compute Variance
+        # We only need the diagonal of the posterior covariance
+        # var = diag(K_UU) - diag(K_UO @ A)
+        # Since K_UU diagonal is 1.0 (normalized kernel), we simplify:
+        # K_UU_diag = self.K_fused[unobs_idx, unobs_idx] # Should be ~1.0
+        # Actually, let's look it up to be safe regarding epsilons
+        K_UU_diag = np.diag(self.K_fused[np.ix_(unobs_idx, unobs_idx)])
         
-        return y_full
+        # Reduction term: sum(K_UO * A.T, axis=1) -> elementwise multiplication
+        # K_UO is (N_un, N_obs), A is (N_obs, N_un)
+        # diag(K_UO @ A) = sum(K_UO * A.T, axis=1)
+        var_reduction = np.sum(K_UO * A.T, axis=1)
+        
+        y_var_pred = K_UU_diag - var_reduction
+        
+        # Clip negative noise
+        y_var_pred = np.maximum(y_var_pred, 0.0)
+
+        # 5. Reconstruct Full Vectors
+        y_full_mean = np.zeros(self.n_genes)
+        y_full_var = np.zeros(self.n_genes)
+        
+        # Fill Observed
+        y_full_mean[obs_idx] = y_obs_vector
+        y_full_var[obs_idx] = 0.0 # No uncertainty for observed
+        
+        # Fill Unobserved
+        y_full_mean[unobs_idx] = y_pred
+        y_full_var[unobs_idx] = y_var_pred
+        
+        return y_full_mean, y_full_var
