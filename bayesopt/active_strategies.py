@@ -127,12 +127,26 @@ class HighLeverageStrategy(ActiveGPStrategy):
     Goal: Find the strong regulators to anchor the correlation estimate.
     Score = |Mean| + Beta * StdDev
     """
-    def __init__(self, total_genes, args, gp_learner):
+    def __init__(self, total_genes, args, gp_learner, prior_indices=None):
         super().__init__(total_genes, args, gp_learner)
         self.name = "Active HighLeverage"
         self.beta = getattr(args, 'acq_beta', 1.0) # Allow CLI override, default 1.0
+        self.prior_indices = prior_indices # Indices to use for the first batch (e.g. Covariance)
 
     def select_next_batch(self, n_to_select, currently_known_mask, y_obs_vector=None):
+        # 0. Cold Start: If we know nothing...
+        n_known = np.sum(currently_known_mask)
+        if n_known == 0:
+            # OPTION A: Use Prior (e.g. Control Covariance) if available
+            if self.prior_indices is not None:
+                # Return the top N genes from the prior list
+                return self.prior_indices[:n_to_select]
+            
+            # OPTION B: Fallback to Random to span the space
+            rng = np.random.default_rng(getattr(self.args, 'seed', 42))
+            all_indices = np.arange(self.n_genes)
+            return rng.choice(all_indices, size=n_to_select, replace=False)
+
         # 1. Get predictions for all genes
         means, vars = self._get_scored_candidates(currently_known_mask, y_obs_vector)
         stds = np.sqrt(vars)

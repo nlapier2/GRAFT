@@ -690,7 +690,8 @@ def main():
             # Reset the learner to clear weights learned during Strategy 5
             shared_learner.reset()
             
-            strat_lev = HighLeverageStrategy(total_genes, args, shared_learner)
+            # Pass cov_indices (if they exist) to use as the "Warm Start" for Batch 1
+            strat_lev = HighLeverageStrategy(total_genes, args, shared_learner, prior_indices=cov_indices)
             
             lev_obs, lev_imp, lev_hist_obs, lev_hist_imp, lev_mse = run_simulation_strategy(
                 strat_lev, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
