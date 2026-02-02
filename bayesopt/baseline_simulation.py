@@ -9,6 +9,7 @@ import anndata as ad
 import scipy.sparse as sp
 
 from active_gp import ActiveGPLearner
+from active_strategies import StaticStrategy, StaticGPStrategy
 
 
 def parse_arguments():
@@ -104,20 +105,26 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def run_simulation_strategy(name, df_sorted, total_genes, batch_size, p_threshold, print_every=10, gp_learner=None):
+def run_simulation_strategy(strategy, df_master, total_genes, batch_size, p_threshold, print_every=10):
     """
-    Runs the batch simulation for a specific ordering of genes (df_sorted).
-    If gp_learner is provided, uses GP prediction for the 'Imputed' metric instead of Mean Imputation.
+    Runs the simulation using a Strategy object.
+    
+    Args:
+        strategy: An instance of BaseStrategy (e.g., StaticStrategy).
+        df_master: The canonical DataFrame (unsorted, index 0..N-1) containing Truth.
+        total_genes: N.
     """
-    print(f"\nRunning Strategy: {name}")
+    print(f"\nRunning Strategy: {strategy.name}")
     print(f"{'Batch':<8} | {'Revealed':<8} | {'Corr (ObsGenes)':<15} | {'P (ObsGenes)':<15} | {'Corr (ImpGenes)':<15} | {'P (ImpGenes)':<15}")
     print("-" * 75)
 
-    # These are the full "Ground Truth" vectors
-    all_lof_true = df_sorted['LoF_gamma'].values
-    all_hba1_true = df_sorted['HBA1_beta'].values
+    # Truth Vectors (aligned to 0..N indices)
+    all_lof_true = df_master['LoF_gamma'].values
+    all_hba1_true = df_master['HBA1_beta'].values
     
-    total_batches = math.ceil(total_genes / batch_size)
+    # State
+    revealed_mask = np.zeros(total_genes, dtype=bool)
+    n_revealed = 0
     
     sig_batch_obs = None
     sig_batch_imp = None
@@ -125,106 +132,79 @@ def run_simulation_strategy(name, df_sorted, total_genes, batch_size, p_threshol
     history_obs = []
     history_imp = []
     history_mse = []
+    
+    batch_idx = 0
+    
+    while n_revealed < total_genes:
+        batch_idx += 1
+        
+        # 1. Ask Strategy for next batch indices
+        # Pass the current mask and the KNOWN HBA1 values aligned to that mask
+        new_indices = strategy.select_next_batch(batch_size, revealed_mask, all_hba1_true[revealed_mask])
+        
+        if len(new_indices) == 0:
+            break # No more genes to select
+            
+        # 2. Reveal Data
+        revealed_mask[new_indices] = True
+        n_revealed = np.sum(revealed_mask)
+        
+        # Get Observed Data Subsets
+        lof_known = all_lof_true[revealed_mask]
+        hba1_known = all_hba1_true[revealed_mask]
+        
+        # 3. Notify Strategy (for Active Learning updates)
+        # Passing just the NEW data logic or FULL known data logic depends on implementation.
+        # Here we pass the indices and values of the NEW batch if needed, 
+        # but typically the strategy might just use the FULL known set next time.
+        strategy.update(new_indices, all_hba1_true[new_indices])
 
-    for batch_idx in range(1, total_batches + 1):
-        n_revealed = min(batch_idx * batch_size, total_genes)
-        
-        # --- Slice Data (Simulate "Revealing" the batch) ---
-        # The genes 0..n_revealed are "Known".
-        # The genes n_revealed..end are "Unknown".
-        
-        lof_known = all_lof_true[:n_revealed]
-        hba1_known = all_hba1_true[:n_revealed]
-        
         # ==========================================
         # Metric 1: Observed Correlation
         # ==========================================
-        # Correlation computed ONLY on the subset we have sampled.
-        # We use the real LoF values here just for the calculation.
-        if n_revealed >= 2:
-            # Handle constant input case to avoid warnings
-            if np.std(lof_known) == 0 or np.std(hba1_known) == 0:
-                corr_obs, p_obs = 0.0, 1.0
-            else:
-                corr_obs, p_obs = stats.pearsonr(lof_known, hba1_known)
+        if n_revealed >= 2 and np.std(lof_known) > 0 and np.std(hba1_known) > 0:
+            corr_obs, p_obs = stats.pearsonr(lof_known, hba1_known)
         else:
             corr_obs, p_obs = 0.0, 1.0
             
         if sig_batch_obs is None and p_obs < p_threshold:
             sig_batch_obs = batch_idx
-
         history_obs.append(p_obs)
 
         # ==========================================
-        # Metric 2: Imputed Correlation (Mean OR GP)
+        # Metric 2: Imputed Correlation
         # ==========================================
-        # LOF: We use the FULL REAL LoF vector (no imputation, we just use the truth).
-        # HBA1: We use the HYBRID vector (Real for knowns, Mean of knowns for unknowns).
+        # Check if Strategy offers a prediction (Active GP), otherwise use Mean Imputation
+        prediction = strategy.predict(revealed_mask, hba1_known)
         
-        n_missing = total_genes - n_revealed
-        
-        if gp_learner is not None:
-            # --- GP IMPUTATION ---
-            # Create boolean mask for the learner
-            # The learner stores genes in the original order. We need to match.
-            # Get names of revealed genes
-            rev_names = df_sorted['gene_name'].iloc[:n_revealed].values
-            
-            # Create mask aligned to learner.genes
-            # Use np.isin for speed
-            mask = np.isin(gp_learner.genes, rev_names)
-            
-            # Get observed values aligned to that mask
-            # We need to ensure Y is aligned to learner.genes[mask]
-            # Create a lookup series
-            y_series = pd.Series(hba1_known, index=rev_names)
-            y_aligned_obs = y_series.reindex(gp_learner.genes[mask]).values
-            
-            # Update weights (optional frequency check inside update or here)
-            if batch_idx % gp_learner.args.gp_recompute_freq == 0:
-                gp_learner.update(mask, y_aligned_obs)
-                
-            # Predict
-            hba1_full_hybrid = gp_learner.predict(mask, y_aligned_obs)
-            
-            # Note: hba1_full_hybrid is aligned to gp_learner.genes (Original Order)
-            # We need to compare it to all_lof_true (Sorted Order)
-            # So we map it back
-            pred_series = pd.Series(hba1_full_hybrid, index=gp_learner.genes)
-            hba1_full_hybrid = pred_series.reindex(df_sorted['gene_name']).values
-            
+        if prediction is not None:
+            # Strategy provided full imputed vector
+            hba1_full_hybrid = prediction
         else:
-            # --- MEAN IMPUTATION (Baseline) ---
-            if n_missing > 0:
-                if len(hba1_known) > 0:
-                    mean_hba1 = np.mean(hba1_known)
-                else:
-                    mean_hba1 = 0.0 
-                hba1_imputed_tail = np.full(n_missing, mean_hba1)
-                hba1_full_hybrid = np.concatenate([hba1_known, hba1_imputed_tail])
+            # Fallback: Mean Imputation
+            if len(hba1_known) > 0:
+                mean_val = np.mean(hba1_known)
             else:
-                hba1_full_hybrid = hba1_known
+                mean_val = 0.0
             
-        # Calculate correlation: Full Real LoF vs Full Hybrid HBA1
-        if np.std(all_lof_true) == 0 or np.std(hba1_full_hybrid) == 0:
-             corr_imp, p_imp = 0.0, 1.0
-        else:
+            hba1_full_hybrid = np.copy(all_hba1_true) # Start with truth...
+            hba1_full_hybrid[~revealed_mask] = mean_val # ...overwrite unknown with mean
+            
+        if np.std(all_lof_true) > 0 and np.std(hba1_full_hybrid) > 0:
             corr_imp, p_imp = stats.pearsonr(all_lof_true, hba1_full_hybrid)
+        else:
+            corr_imp, p_imp = 0.0, 1.0
 
         if sig_batch_imp is None and p_imp < p_threshold:
             sig_batch_imp = batch_idx
-
         history_imp.append(p_imp)
 
-        # ==========================================
-        # Metric 3: Mean Squared Error (Full Vector)
-        # ==========================================
-        # MSE between Truth and Hybrid (Imputed) Vector
+        # Metric 3: MSE
         mse = np.mean((all_hba1_true - hba1_full_hybrid) ** 2)
         history_mse.append(mse)
 
-        # Print row (Every N, plus first and last)
-        if batch_idx == 1 or batch_idx % print_every == 0 or batch_idx == total_batches:
+        # Print
+        if batch_idx == 1 or batch_idx % print_every == 0 or n_revealed == total_genes:
             print(f"{batch_idx:<8} | {n_revealed:<8} | {corr_obs:+.4f}     | {p_obs:.2e}    | {corr_imp:+.4f}     | {p_imp:.2e}")
 
     return sig_batch_obs, sig_batch_imp, history_obs, history_imp, history_mse
@@ -522,7 +502,7 @@ def main():
     
     # Preprocessing: Drop NAs
     # We remove rows that don't have ground truth, as we can't simulate checking them.
-    df = df.dropna(subset=['LoF_gamma', 'HBA1_beta'])
+    df = df.dropna(subset=['LoF_gamma', 'HBA1_beta']).reset_index(drop=True)
     total_genes = len(df)
 
     # Optional Centering
@@ -542,100 +522,83 @@ def main():
     # Dictionary to store MSE histories for comparison plot
     all_mse_histories = {}
 
+# ---------------------------------------------------------
+    # Strategy 1: GammaMagnitude Sampling
     # ---------------------------------------------------------
-    # Strategy 1: GammaMagnitude Sampling (LoF Known)
-    # ---------------------------------------------------------
-    # Sort by absolute LoF_gamma
-    df_mag = df.copy()
-    df_mag['abs_lof'] = df_mag['LoF_gamma'].abs()
-    df_mag = df_mag.sort_values(by='abs_lof', ascending=False)
+    # Sort indices by absolute LoF_gamma (descending)
+    mag_indices = df['LoF_gamma'].abs().sort_values(ascending=False).index.values
+    
+    strat_mag = StaticStrategy(total_genes, args, mag_indices, name="GammaMagnitude Sorting")
     
     mag_obs, mag_imp, mag_hist_obs, mag_hist_imp, mag_mse = run_simulation_strategy(
-        "GammaMagnitude Sorting (LoF Known)", df_mag, total_genes, args.batch_size, args.p_threshold, args.print_every
+        strat_mag, df, total_genes, args.batch_size, args.p_threshold, args.print_every
     )
     all_mse_histories["GammaMagnitude"] = mag_mse
 
-    # Plot GammaMagnitude results
     plot_pvalue_history(mag_hist_obs, "GammaMagnitude_ObservedGenes", args.output_dir)
     plot_pvalue_history(mag_hist_imp, "GammaMagnitude_ImputedGenes", args.output_dir)
 
     # ---------------------------------------------------------
-    # Strategy 2: Random Sampling (LoF Unknown)
+    # Strategy 2: Random Sampling
     # ---------------------------------------------------------
-    # Shuffle randomly
-    df_rnd = df.copy()
-    df_rnd = df_rnd.sample(frac=1, random_state=args.seed).reset_index(drop=True)
+    # Random indices
+    rnd_indices = df.sample(frac=1, random_state=args.seed).index.values
+    
+    strat_rnd = StaticStrategy(total_genes, args, rnd_indices, name="Random Sampling")
     
     rnd_obs, rnd_imp, rnd_hist_obs, rnd_hist_imp, rnd_mse = run_simulation_strategy(
-        "Random Sampling (LoF Unknown)", df_rnd, total_genes, args.batch_size, args.p_threshold, args.print_every
+        strat_rnd, df, total_genes, args.batch_size, args.p_threshold, args.print_every
     )
     all_mse_histories["Random"] = rnd_mse
 
-    # Plot Random results
     plot_pvalue_history(rnd_hist_obs, "Random_ObservedGenes", args.output_dir)
     plot_pvalue_history(rnd_hist_imp, "Random_ImputedGenes", args.output_dir)
 
     # ---------------------------------------------------------
     # Strategy 3: Control Covariance (Optional)
     # ---------------------------------------------------------
-    cov_obs, cov_imp = None, None
-    df_cov = None  # Initialize for wider scope (used by GP strategy)
-
+    # We will store the indices for use in Strategy 5 if available
+    cov_indices = None 
+    
     if args.control_h5ad:
-        # 1. Compute Covariance
-        # We assume the target gene name is "HBA1" based on the TSV context (HBA1_beta)
         cov_series = compute_control_covariance(
             args.control_h5ad, "HBA1", args.target_label, args.control_label
         )
 
         if cov_series is not None:
-            # 2. Merge Covariance into DF
-            df_cov = df.copy()
-            # Map covariance values to genes. Fill missing with 0.
-            df_cov['covariance'] = df_cov['gene_name'].map(cov_series).fillna(0.0)
-
-        if cov_series is not None:
-            # 2. Merge Covariance into DF
-            df_cov = df.copy()
-            # Map covariance values to genes. Fill missing with 0.
-            df_cov['covariance'] = df_cov['gene_name'].map(cov_series).fillna(0.0)
-
-            # 3. Sort by Absolute Covariance (Descending)
-            # Active learning assumption: genes strongly correlated (pos or neg) are most informative.
-            df_cov['abs_cov'] = df_cov['covariance'].abs()
-            df_cov = df_cov.sort_values(by='abs_cov', ascending=False)
+            # Map to DF to get aligned values
+            # Fill missing with 0.0
+            cov_aligned = df['gene_name'].map(cov_series).fillna(0.0)
+            
+            # Sort indices by absolute covariance
+            cov_indices = cov_aligned.abs().sort_values(ascending=False).index.values
+            
+            strat_cov = StaticStrategy(total_genes, args, cov_indices, name="Control Covariance")
 
             cov_obs, cov_imp, cov_hist_obs, cov_hist_imp, cov_mse = run_simulation_strategy(
-                "Control Covariance Sorting", df_cov, total_genes, args.batch_size, args.p_threshold, args.print_every
+                strat_cov, df, total_genes, args.batch_size, args.p_threshold, args.print_every
             )
             all_mse_histories["ControlCovariance"] = cov_mse
 
             plot_pvalue_history(cov_hist_obs, "ControlCovariance_ObservedGenes", args.output_dir)
             plot_pvalue_history(cov_hist_imp, "ControlCovariance_ImputedGenes", args.output_dir)
 
-
     # ---------------------------------------------------------
     # Strategy 4: External Perturbation Effect (Optional)
     # ---------------------------------------------------------
-    ext_obs, ext_imp = None, None
-
     if args.external_h5ad:
-        # 1. Compute Deltas in External Dataset
         ext_series = compute_external_perturbation_effect(
             args.external_h5ad, "HBA1", args.target_label, args.control_label
         )
 
         if ext_series is not None:
-            # 2. Merge into DF
-            df_ext = df.copy()
-            # Map effects. Fill missing with 0 (assumption: unmeasured = no info = low priority)
-            df_ext['ext_effect'] = df_ext['gene_name'].map(ext_series).fillna(0.0)
-
-            # 3. Sort by Absolute Effect (Descending)
-            df_ext = df_ext.sort_values(by='ext_effect', ascending=False)
+            ext_aligned = df['gene_name'].map(ext_series).fillna(0.0)
+            ext_indices = ext_aligned.abs().sort_values(ascending=False).index.values
+            
+            strat_ext = StaticStrategy(total_genes, args, ext_indices, name="External Perturbation")
 
             ext_obs, ext_imp, ext_hist_obs, ext_hist_imp, ext_mse = run_simulation_strategy(
-                "External Perturbation Sorting", df_ext, total_genes, args.batch_size, args.p_threshold, args.print_every
+                strat_ext, df, total_genes, args.batch_size, args.p_threshold, args.print_every
             )
             all_mse_histories["ExternalPerturbation"] = ext_mse
 
@@ -643,39 +606,36 @@ def main():
             plot_pvalue_history(ext_hist_imp, "ExternalPerturbation_ImputedGenes", args.output_dir)
 
     # ---------------------------------------------------------
-    # # Strategy 5: GP Imputation (Covariance Sampling + GP Imputation)
+    # Strategy 5: GP Imputation (Covariance/Random + GP Prediction)
     # ---------------------------------------------------------
-    # This runs the SAME gene order as Control Covariance (if avail) or Random, but uses GP for the "Imputed" metric.
     gp_obs, gp_imp = None, None
     gp_strat_name = "GP Imputation"
+    
     if ActiveGPLearner is not None and (args.external_list or args.external_h5ad or args.embeddings_yaml):
         print("\nInitializing Active GP Learner...")
-        # Initialize with the FULL list of genes from the input file
+        # Learner uses gene names matching df index order
         learner = ActiveGPLearner(df['gene_name'].values, args)
 
-        # Select Gene Order: Prioritize Control Covariance, fallback to Random
-        if df_cov is not None:
-            target_df = df_cov
+        # Select Order: Prioritize Control Covariance, fallback to Random
+        if cov_indices is not None:
+            gp_indices = cov_indices
             gp_strat_name = "Control Covariance + GP Imputation"
             plot_name_obs = "CovGP_ObservedGenes"
             plot_name_imp = "CovGP_ImputedGenes"
             mse_key = "ControlCovariance_GP"
         else:
             print("Warning: Control Covariance not available. Falling back to Random Sampling for GP.")
-            target_df = df_rnd
+            gp_indices = rnd_indices
             gp_strat_name = "Random Sampling + GP Imputation"
             plot_name_obs = "RandomGP_ObservedGenes"
             plot_name_imp = "RandomGP_ImputedGenes"
             mse_key = "Random_GP"
+            
+        # Use StaticGPStrategy to wrap the static list + learner
+        strat_gp = StaticGPStrategy(total_genes, args, gp_indices, learner, name=gp_strat_name)
 
         gp_obs, gp_imp, gp_hist_obs, gp_hist_imp, gp_mse = run_simulation_strategy(
-            gp_strat_name, 
-            target_df,
-            total_genes, 
-            args.batch_size, 
-            args.p_threshold, 
-            args.print_every,
-            gp_learner=learner
+            strat_gp, df, total_genes, args.batch_size, args.p_threshold, args.print_every
         )
         
         all_mse_histories[mse_key] = gp_mse

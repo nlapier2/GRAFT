@@ -1,157 +1,198 @@
 import numpy as np
-import pandas as pd
 
 class BaseStrategy:
     """
     Abstract base class for all gene selection strategies.
+    The simulation loop calls 'select_next_batch', reveals the data, 
+    and then calls 'update' to let the strategy learn.
     """
     def __init__(self, total_genes, args):
         self.n_genes = total_genes
         self.args = args
         self.name = "BaseStrategy"
 
-    def select_batch(self, n_to_select, currently_known_mask, y_obs_vector=None):
+    def select_next_batch(self, n_to_select, currently_known_mask, y_obs_vector=None):
         """
-        Selects the next batch of gene indices to reveal.
-        
-        Args:
-            n_to_select (int): Number of genes to pick.
-            currently_known_mask (np.array): Boolean mask of genes already revealed.
-            y_obs_vector (np.array): (Optional) The observed values for the known genes.
-                                     Used by active strategies to update their models.
-        
-        Returns:
-            np.array: Indices of the selected genes (in the original 0..N order).
+        Decides which genes to reveal next.
+        Returns: np.array of indices (integers 0..N).
         """
         raise NotImplementedError
 
     def update(self, new_indices, new_values):
         """
-        Optional hook to update internal models (e.g. GP) with newly revealed data.
+        Hook for the strategy to digest new data after it has been revealed.
         """
         pass
+    
+    def predict(self, currently_known_mask, y_obs_vector):
+        """
+        Optional: Returns the imputed vector for ALL genes (known + unknown).
+        If not implemented, the simulation runner defaults to Mean Imputation.
+        """
+        return None
 
 
 class StaticStrategy(BaseStrategy):
     """
-    Wrapper for passive/static ordering (Random, Magnitude, Covariance).
-    The order is determined at initialization and never changes.
+    Wrapper for passive strategies (Random, Magnitude, Covariance).
+    The order is determined EXTERNALLY (in the simulation script) and passed here.
     """
-    def __init__(self, sorted_df_indices, name="Static"):
-        """
-        Args:
-            sorted_df_indices (np.array): Array of integer indices representing the 
-                                          fixed order of genes to reveal.
-            name (str): Display name for the strategy.
-        """
-        # We don't need total_genes or args for the simple static case
-        self.queue = sorted_df_indices
+    def __init__(self, total_genes, args, sorted_indices, name="Static"):
+        super().__init__(total_genes, args)
         self.name = name
+        self.queue = np.array(sorted_indices, dtype=int)
         self.pointer = 0
 
-    def select_batch(self, n_to_select, currently_known_mask, y_obs_vector=None):
-        # Simply slice the next N items from the pre-calculated queue
+    def select_next_batch(self, n_to_select, currently_known_mask, y_obs_vector=None):
+        # Simply take the next N indices from the pre-calculated queue
         start = self.pointer
-        end = start + n_to_select
-        batch_indices = self.queue[start:end]
+        end = min(self.pointer + n_to_select, len(self.queue))
         
+        if start >= len(self.queue):
+            return np.array([], dtype=int)
+            
+        batch_indices = self.queue[start:end]
         self.pointer = end
+        
         return batch_indices
+
+
+class StaticGPStrategy(StaticStrategy):
+    """
+    Same as StaticStrategy (fixed order), but uses a GP for prediction
+    instead of Mean Imputation. Use this for the 'Random + GP' baseline.
+    """
+    def __init__(self, total_genes, args, sorted_indices, gp_learner, name="Static GP"):
+        super().__init__(total_genes, args, sorted_indices, name)
+        self.learner = gp_learner
+        self._batch_count = 0
+
+    def update(self, new_indices, new_values):
+        # Static strategies do not change their queue based on data,
+        # so we do not need to process updates here.
+        pass
+
+    def predict(self, currently_known_mask, y_obs_vector):
+        """
+        Uses the ActiveGPLearner to impute values.
+        Retrains (updates weights) every 'gp_recompute_freq' batches.
+        """
+        self._batch_count += 1
+        
+        # Trigger GP re-weighting/training
+        if self._batch_count % self.args.gp_recompute_freq == 0:
+             self.learner.update(currently_known_mask, y_obs_vector)
+
+        # Return full genome prediction
+        return self.learner.predict(currently_known_mask, y_obs_vector)
 
 
 class ActiveGPStrategy(BaseStrategy):
     """
-    Base class for strategies that use the ActiveGPLearner.
-    Handles the model updates and prediction calls common to all GP strategies.
+    Base class for Active Learning.
+    Holds the 'ActiveGPLearner' (from active_gp.py) to generate predictions.
     """
     def __init__(self, total_genes, args, gp_learner):
         super().__init__(total_genes, args)
         self.learner = gp_learner
-        # We start with no genes known
         self.step_counter = 0
 
     def update(self, new_indices, new_values):
         """
-        Updates the internal GP model with the new batch of data.
+        Triggers the GP Kernel update/re-weighting.
         """
-        # Create full mask of what we know NOW (after this batch)
-        # In the simulation runner, we typically pass the *current* mask.
-        # This update hook allows the strategy to trigger the learner's update().
-        
-        # NOTE: The simulation runner handles the global mask. 
-        # Here we just pass the indices and values to the learner if needed.
-        # But ActiveGPLearner.update() takes a full mask. 
-        # So we might rely on the 'select_batch' to trigger updates or 
-        # construct the mask here.
+        # We can implement the re-weighting frequency logic here
         pass
 
-    def _get_predictions(self, known_mask, y_obs):
+    def _get_scored_candidates(self, currently_known_mask, y_obs_vector):
         """
-        Helper to get Mean and Variance for all unknown genes.
+        Helper: Uses the learner to predict Mean and Variance for all UNKNOWN genes.
+        Strategies will use these (Mean, Var) to calculate their own scores (Acquisition Functions).
         """
-        # Trigger learner update logic (e.g. re-weighting every N batches)
+        # 1. Update Learner (if needed based on frequency)
         if self.step_counter % self.args.gp_recompute_freq == 0:
-            self.learner.update(known_mask, y_obs)
-            
+            self.learner.update(currently_known_mask, y_obs_vector)
         self.step_counter += 1
+
+        # 2. Get Predictions (Mean)
+        # Note: We will need to update ActiveGPLearner to return variance/uncertainty too.
+        # For now, assuming learner.predict returns full N-length vector.
+        preds_mean = self.learner.predict(currently_known_mask, y_obs_vector)
         
-        # Get full predictions vector (imputed)
-        y_pred_full = self.learner.predict(known_mask, y_obs)
-        
-        # Get posterior variance (if implemented in learner, otherwise placeholder)
-        # Note: We will need to update ActiveGPLearner to return variance too.
-        y_var_full = getattr(self.learner, "last_prediction_variance", np.ones_like(y_pred_full))
-        
-        return y_pred_full, y_var_full
+        # 3. Get Uncertainty (Variance)
+        # Placeholder: We need to add a method to ActiveGPLearner for this.
+        # preds_var = self.learner.get_last_variance() 
+        preds_var = np.ones_like(preds_mean) 
+
+        return preds_mean, preds_var
 
 
 class HighLeverageStrategy(ActiveGPStrategy):
     """
-    Active Learning: Selects genes likely to have high absolute effect (Anchors).
-    Score = |Mean| + Beta * Std
+    Strategy: "Anchor Sampling"
+    Selects unknown genes with highest predicted MAGNITUDE (positive or negative).
+    Goal: Find the strong regulators to anchor the correlation estimate.
+    Score = |Mean| + Beta * StdDev
     """
     def __init__(self, total_genes, args, gp_learner):
         super().__init__(total_genes, args, gp_learner)
         self.name = "Active_HighLeverage"
-        self.beta = getattr(args, 'acq_beta', 1.0) # Trade-off parameter
+        self.beta = 1.0 # Exploration parameter
 
-    def select_batch(self, n_to_select, currently_known_mask, y_obs_vector=None):
-        # Implementation:
-        # 1. Get predictions (Mean, Var) for unknown genes
-        # 2. Compute Score = Abs(Mean) + Beta * Sqrt(Var)
-        # 3. Argpartition to get top N indices
-        # 4. Return indices
-        pass
+    def select_next_batch(self, n_to_select, currently_known_mask, y_obs_vector=None):
+        # 1. Get predictions
+        means, vars = self._get_scored_candidates(currently_known_mask, y_obs_vector)
+        stds = np.sqrt(vars)
+
+        # 2. Calculate Acquisition Score (for unknown genes only)
+        # Score = |Mean| + Beta * Std
+        scores = np.abs(means) + (self.beta * stds)
+        
+        # Mask out known genes (set score to -infinity)
+        scores[currently_known_mask] = -np.inf
+        
+        # 3. Pick top N
+        # (Using argpartition is faster than full sort)
+        top_indices = np.argpartition(scores, -n_to_select)[-n_to_select:]
+        
+        return top_indices
 
 
 class UncertaintyStrategy(ActiveGPStrategy):
     """
-    Active Learning: Selects genes with highest posterior uncertainty.
-    Score = Variance
+    Strategy: "Uncertainty Sampling"
+    Selects genes where the GP is most unsure (highest Variance).
+    Goal: Explore the unknown space.
     """
     def __init__(self, total_genes, args, gp_learner):
         super().__init__(total_genes, args, gp_learner)
         self.name = "Active_Uncertainty"
 
-    def select_batch(self, n_to_select, currently_known_mask, y_obs_vector=None):
-        # Implementation:
-        # 1. Get predictions (Var only needed)
-        # 2. Score = Var
-        # 3. Return top N indices
-        pass
+    def select_next_batch(self, n_to_select, currently_known_mask, y_obs_vector=None):
+        # 1. Get predictions
+        _, vars = self._get_scored_candidates(currently_known_mask, y_obs_vector)
+        
+        # 2. Score = Variance
+        scores = vars.copy()
+        scores[currently_known_mask] = -np.inf
+        
+        # 3. Pick top N
+        top_indices = np.argpartition(scores, -n_to_select)[-n_to_select:]
+        
+        return top_indices
 
 
 class DiversityStrategy(ActiveGPStrategy):
     """
-    Active Learning: Selects genes least similar to the current set (Kernel Distance).
+    Strategy: "Kernel Diversity"
+    Selects genes that are least similar (in Kernel space) to the current known set.
+    Goal: Span the biological space (e.g. don't pick 100 ribosomal genes).
     """
     def __init__(self, total_genes, args, gp_learner):
         super().__init__(total_genes, args, gp_learner)
         self.name = "Active_Diversity"
 
-    def select_batch(self, n_to_select, currently_known_mask, y_obs_vector=None):
-        # Implementation:
-        # 1. Look at Kernel K_UU (Unknown vs Unknown) and K_UO (Unknown vs Known)
-        # 2. Greedy selection (farthest point) or Kernel K-Means center selection
-        # 3. Return N indices
+    def select_next_batch(self, n_to_select, currently_known_mask, y_obs_vector=None):
+        # This will require access to the Kernel Matrix from the learner.
+        # Logic: Greedy selection of point with max min-distance to known set.
         pass
