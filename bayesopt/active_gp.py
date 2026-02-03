@@ -354,3 +354,51 @@ class ActiveGPLearner:
         y_full_var[unobs_idx] = y_var_pred
         
         return y_full_mean, y_full_var
+
+    def predict_with_covariance(self, obs_bool_mask, y_obs_vector):
+        """
+        Predicts Mean vector AND full Covariance Matrix for unobserved genes.
+        Returns: (y_unobs_mean, Cov_unobs)
+        """
+        obs_idx = np.where(obs_bool_mask)[0]
+        unobs_idx = np.where(~obs_bool_mask)[0]
+        
+        # 1. Handle Cold Start
+        if len(obs_idx) == 0:
+            # Prior covariance is just K_UU (the kernel itself)
+            # Warning: This is huge (N x N)
+            return np.zeros(len(unobs_idx)), self.K_fused[np.ix_(unobs_idx, unobs_idx)]
+
+        # 2. Setup
+        y_mean = np.mean(y_obs_vector)
+        y_centered = y_obs_vector - y_mean
+        
+        K_OO = self.K_fused[np.ix_(obs_idx, obs_idx)]
+        K_UO = self.K_fused[np.ix_(unobs_idx, obs_idx)] # Shape (N_un, N_obs)
+        K_UU = self.K_fused[np.ix_(unobs_idx, unobs_idx)] # Shape (N_un, N_un)
+        
+        lambda_i = getattr(self.args, 'gp_noise_var', 0.01)
+        K_reg = K_OO + lambda_i * np.eye(len(obs_idx), dtype=np.float32)
+        
+        # 3. Solve (Reuse logic from predict)
+        # We need A = K_reg^-1 * K_OU  =>  A = K_reg^-1 * K_UO.T
+        try:
+            # A shape: (N_obs, N_un)
+            A = np.linalg.solve(K_reg, K_UO.T)
+            alpha = np.linalg.solve(K_reg, y_centered)
+        except np.linalg.LinAlgError:
+            A = np.linalg.lstsq(K_reg, K_UO.T, rcond=None)[0]
+            alpha = np.linalg.lstsq(K_reg, y_centered, rcond=None)[0]
+
+        # 4. Compute Posterior Mean
+        y_pred = (K_UO @ alpha) + y_mean
+        
+        # 5. Compute Posterior Covariance
+        # Sigma = K_UU - K_UO @ (K_reg^-1 @ K_OU)
+        # Sigma = K_UU - K_UO @ A
+        
+        # This is the heavy matrix multiplication (N_un x N_obs) @ (N_obs x N_un) -> (N_un x N_un)
+        Cov_reduction = K_UO @ A
+        Cov_post = K_UU - Cov_reduction
+        
+        return y_pred, Cov_post

@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.sparse.linalg import eigsh
 
 class BaseStrategy:
     """
@@ -275,3 +276,78 @@ class DiversityStrategy(ActiveGPStrategy):
             current_max_sim[next_idx] = np.inf
             
         return np.array(selected_indices, dtype=int)
+
+class PCUncertaintyStrategy(ActiveGPStrategy):
+    """
+    Strategy: "Principal Component Uncertainty" (Eigengene Sampling)
+    1. Computes Posterior Covariance.
+    2. Decomposes into Top K Eigenvectors (Principal Components of Uncertainty).
+    3. Scores genes by their weighted loading on these components.
+    
+    Goal: Target "Modules" of uncertainty rather than "Orphans".
+    """
+    def __init__(self, total_genes, args, gp_learner, prior_indices=None):
+        super().__init__(total_genes, args, gp_learner)
+        self.name = "Active PC-Uncertainty"
+        self.prior_indices = prior_indices
+        self.recompute_freq = getattr(args, 'pca_recompute_freq', 1)
+        self.top_k = getattr(args, 'pca_top_k', 50)
+        
+        # Cache
+        self.cached_scores = None
+        self.batches_since_compute = 9999
+
+    def select_next_batch(self, n_to_select, currently_known_mask, y_obs_vector=None):
+        # 0. Cold Start
+        n_known = np.sum(currently_known_mask)
+        if n_known == 0:
+            if self.prior_indices is not None:
+                return self.prior_indices[:n_to_select]
+            
+            rng = np.random.default_rng(getattr(self.args, 'seed', 42))
+            all_indices = np.arange(self.n_genes)
+            return rng.choice(all_indices, size=n_to_select, replace=False)
+            
+        # 1. Check if we need to recompute the PCA
+        if self.batches_since_compute >= self.recompute_freq:
+            print(f"   [PC-Uncertainty] Recomputing Covariance & SVD (Top {self.top_k})...")
+            
+            # Update learner weights if needed
+            self.learner.update(currently_known_mask, y_obs_vector)
+            
+            # Get Full Posterior Covariance (N_un x N_un)
+            # Note: predict_with_covariance returns (mean, cov)
+            _, cov_matrix = self.learner.predict_with_covariance(currently_known_mask, y_obs_vector)
+            
+            # Decompose (Truncated SVD / Eigsh)
+            # cov_matrix is symmetric positive definite (or semi-definite)
+            # Use 'LM' (Largest Magnitude)
+            k = min(self.top_k, cov_matrix.shape[0] - 1)
+            vals, vecs = eigsh(cov_matrix, k=k, which='LM')
+            
+            # vals: (k,) eigenvalues
+            # vecs: (N_un, k) eigenvectors
+            
+            # Calculate Scores: Sum of squared loadings weighted by eigenvalue
+            # Score_i = Sum_k ( lambda_k * (v_ik)^2 )
+            # We take abs(vals) just in case of slight numerical noise (though Cov is PSD)
+            weighted_sq_loadings = (vecs ** 2) @ np.abs(vals)
+            
+            # Map back to full genome size
+            unobs_indices = np.where(~currently_known_mask)[0]
+            full_scores = np.zeros(self.n_genes)
+            full_scores[unobs_indices] = weighted_sq_loadings
+            full_scores[currently_known_mask] = -np.inf
+            
+            self.cached_scores = full_scores
+            self.batches_since_compute = 0
+            
+        else:
+            # Use cached scores, but mask out newly revealed genes
+            self.cached_scores[currently_known_mask] = -np.inf
+            self.batches_since_compute += 1
+            
+        # 2. Select Top N
+        top_indices = np.argpartition(self.cached_scores, -n_to_select)[-n_to_select:]
+        
+        return top_indices
