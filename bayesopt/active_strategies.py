@@ -205,15 +205,73 @@ class UncertaintyStrategy(ActiveGPStrategy):
 
 class DiversityStrategy(ActiveGPStrategy):
     """
-    Strategy: "Kernel Diversity"
+    Strategy: "Kernel Diversity" (Greedy Farthest Point Sampling)
     Selects genes that are least similar (in Kernel space) to the current known set.
-    Goal: Span the biological space (e.g. don't pick 100 ribosomal genes).
+    Goal: Span the biological space efficiently.
     """
-    def __init__(self, total_genes, args, gp_learner):
+    def __init__(self, total_genes, args, gp_learner, prior_indices=None):
         super().__init__(total_genes, args, gp_learner)
-        self.name = "Active_Diversity"
+        self.name = "Active Diversity"
+        self.prior_indices = prior_indices
 
     def select_next_batch(self, n_to_select, currently_known_mask, y_obs_vector=None):
-        # This will require access to the Kernel Matrix from the learner.
-        # Logic: Greedy selection of point with max min-distance to known set.
-        pass
+        # 1. Access the Kernel Matrix (N, N)
+        if self.learner.K_fused is None:
+            # Fallback if kernel not ready
+            rng = np.random.default_rng(getattr(self.args, 'seed', 42))
+            unobs_indices = np.where(~currently_known_mask)[0]
+            return rng.choice(unobs_indices, size=n_to_select, replace=False)
+            
+        K = self.learner.K_fused
+        N = self.n_genes
+        
+        # 2. Initialize "Max Similarity" vector
+        # max_sim[i] = similarity of gene i to its closest known neighbor
+        # We want to pick i that MINIMIZES this max_sim (farthest from known set)
+        
+        known_indices = np.where(currently_known_mask)[0]
+        
+        # Cold Start Handling
+        if len(known_indices) == 0:
+            # Pick first point
+            if self.prior_indices is not None:
+                first_idx = self.prior_indices[0]
+            else:
+                rng = np.random.default_rng(getattr(self.args, 'seed', 42))
+                first_idx = rng.integers(0, N)
+            
+            selected_indices = [first_idx]
+            # Initialize max_sim with this first point's similarities
+            current_max_sim = K[first_idx, :].copy() 
+            # Mark first point as effectively "already picked" (max sim = infinity or 1.0)
+            current_max_sim[first_idx] = 1.0
+        else:
+            selected_indices = []
+            # Calculate initial max_sim against all currently known
+            # shape (N,)
+            current_max_sim = np.max(K[:, known_indices], axis=1)
+
+        # 3. Greedy Selection Loop
+        # We need to pick (n_to_select - len(selected_indices)) more points
+        n_needed = n_to_select - len(selected_indices)
+        
+        # Mask out known genes from selection by setting their sim to 1.0 (max possible)
+        # So argmin will never pick them (assuming unselected genes have sim < 1.0)
+        # To be safe, we set them to infinity
+        current_max_sim[currently_known_mask] = np.inf
+        for idx in selected_indices:
+             current_max_sim[idx] = np.inf
+        
+        for _ in range(n_needed):
+            # Pick the "loneliest" gene
+            next_idx = np.argmin(current_max_sim)
+            selected_indices.append(next_idx)
+            
+            # Update max_sim: newly picked gene might be the new closest neighbor for some points
+            new_sims = K[next_idx, :]
+            current_max_sim = np.maximum(current_max_sim, new_sims)
+            
+            # Ensure we don't pick it again
+            current_max_sim[next_idx] = np.inf
+            
+        return np.array(selected_indices, dtype=int)

@@ -9,7 +9,7 @@ import anndata as ad
 import scipy.sparse as sp
 
 from active_gp import ActiveGPLearner
-from active_strategies import StaticStrategy, StaticGPStrategy, HighLeverageStrategy, UncertaintyStrategy
+from active_strategies import StaticStrategy, StaticGPStrategy, HighLeverageStrategy, UncertaintyStrategy, DiversityStrategy
 
 
 def parse_arguments():
@@ -42,6 +42,7 @@ def parse_arguments():
     # --- Active Learning Arguments ---
     parser.add_argument("--run_active_leverage", action="store_true", help="Run the Active High Leverage strategy.")
     parser.add_argument("--run_active_uncertainty", action="store_true", help="Run the Active Uncertainty strategy.")
+    parser.add_argument("--run_active_diversity", action="store_true", help="Run the Active Diversity strategy.")
     parser.add_argument("--acq_beta", type=float, default=1.0, help="Beta parameter for acquisition (mean vs std trade-off).")
     parser.add_argument("--max_batches", type=int, default=None, help="Maximum number of batches to run (optional limit).")
 
@@ -708,12 +709,35 @@ def main():
             plot_pvalue_history(unc_hist_imp, "Uncertainty_ImputedGenes", args.output_dir, ground_truth_p)
 
     # ---------------------------------------------------------
+    # Strategy 8: Active Diversity (Optional)
+    # ---------------------------------------------------------
+    div_obs, div_imp = None, None
+    if args.run_active_diversity:
+        if shared_learner is None:
+            print("\nError: Active Diversity requires ActiveGPLearner and external data.")
+        else:
+            print("\nRunning Active Diversity Strategy...")
+            shared_learner.reset()
+            
+            # Pass cov_indices if available for Warm Start
+            strat_div = DiversityStrategy(total_genes, args, shared_learner, prior_indices=cov_indices)
+            
+            div_obs, div_imp, div_hist_obs, div_hist_imp, div_mse, div_diag = run_simulation_strategy(
+                strat_div, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
+            )
+            
+            all_mse_histories["Active_Diversity"] = div_mse
+            all_diagnostics["Active_Diversity"] = div_diag
+            plot_pvalue_history(div_hist_obs, "Diversity_ObservedGenes", args.output_dir, ground_truth_p)
+            plot_pvalue_history(div_hist_imp, "Diversity_ImputedGenes", args.output_dir, ground_truth_p)
+
+    # ---------------------------------------------------------
     # Final Comparative Plots
     # ---------------------------------------------------------
     if all_mse_histories:
         plot_mse_comparison(all_mse_histories, args.output_dir)
 
-# ---------------------------------------------------------
+    # ---------------------------------------------------------
     # Summary
     # ---------------------------------------------------------
     print("\n" + "="*50)
@@ -726,16 +750,20 @@ def main():
 
     print(f"{'GammaMagnitude Sorting':<40} | {fmt(mag_obs):<18} | {fmt(mag_imp):<18}")
     print(f"{'Random Sampling':<40} | {fmt(rnd_obs):<18} | {fmt(rnd_imp):<18}")
-    if args.control_h5ad and cov_obs is not None:
+    
+    # For optional strategies, we check if they ran (exist in history) rather than if they succeeded (is not None)
+    if "ControlCovariance" in all_mse_histories:
         print(f"{'Control Covariance Sorting':<40} | {fmt(cov_obs):<18} | {fmt(cov_imp):<18}")
-    if args.external_h5ad and ext_obs is not None:
+    if "ExternalPerturbation" in all_mse_histories:
         print(f"{'External Perturbation Sorting':<40} | {fmt(ext_obs):<18} | {fmt(ext_imp):<18}")
-    if gp_obs is not None:
+    if mse_key in all_mse_histories: # GP Strategy
         print(f"{gp_strat_name:<40} | {fmt(gp_obs):<18} | {fmt(gp_imp):<18}")
-    if lev_obs is not None:
+    if "Active_HighLeverage" in all_mse_histories:
         print(f"{'Active High Leverage':<40} | {fmt(lev_obs):<18} | {fmt(lev_imp):<18}")
-    if unc_obs is not None:
+    if "Active_Uncertainty" in all_mse_histories:
         print(f"{'Active Uncertainty':<40} | {fmt(unc_obs):<18} | {fmt(unc_imp):<18}")
+    if "Active_Diversity" in all_mse_histories:
+        print(f"{'Active Diversity':<40} | {fmt(div_obs):<18} | {fmt(div_imp):<18}")
     print("-" * 82)
 
     print("\n" + "="*85)
@@ -753,16 +781,12 @@ def main():
 
     print_diag("GammaMagnitude Sorting", "GammaMagnitude")
     print_diag("Random Sampling", "Random")
-    if args.control_h5ad and cov_obs is not None:
-        print_diag("Control Covariance Sorting", "ControlCovariance")
-    if args.external_h5ad and ext_obs is not None:
-        print_diag("External Perturbation Sorting", "ExternalPerturbation")
-    if gp_obs is not None:
-        print_diag(gp_strat_name, mse_key)
-    if lev_obs is not None:
-        print_diag("Active High Leverage", "Active_HighLeverage")
-    if unc_obs is not None:
-        print_diag("Active Uncertainty", "Active_Uncertainty")
+    print_diag("Control Covariance Sorting", "ControlCovariance")
+    print_diag("External Perturbation Sorting", "ExternalPerturbation")
+    print_diag(gp_strat_name, mse_key)
+    print_diag("Active High Leverage", "Active_HighLeverage")
+    print_diag("Active Uncertainty", "Active_Uncertainty")
+    print_diag("Active Diversity", "Active_Diversity")
     print("-" * 85)
 
 if __name__ == "__main__":
