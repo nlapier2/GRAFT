@@ -351,3 +351,100 @@ class PCUncertaintyStrategy(ActiveGPStrategy):
         top_indices = np.argpartition(self.cached_scores, -n_to_select)[-n_to_select:]
         
         return top_indices
+
+
+class VarianceReductionStrategy(ActiveGPStrategy):
+    """
+    Strategy: "Stepwise Variance Reduction" (Kriging Believer / A-Optimality).
+    
+    Logic:
+    1. Compute Full Posterior Covariance Matrix.
+    2. Stepwise greedy selection (Batch Size times):
+       a. Score(k) = ||Cov(:, k)||^2 / Var(k)  (Reduction in total trace)
+       b. Pick Best Gene k.
+       c. Update Covariance Matrix assuming k is known (Schur Complement).
+       d. Repeat.
+    
+    Goal: Minimizes total system uncertainty while handling redundancy perfectly.
+    """
+    def __init__(self, total_genes, args, gp_learner, prior_indices=None):
+        super().__init__(total_genes, args, gp_learner)
+        self.name = "Active Var-Reduction (Stepwise)"
+        self.prior_indices = prior_indices
+        self.subset_size = getattr(args, 'stepwise_subset_size', 400)
+
+    def select_next_batch(self, n_to_select, currently_known_mask, y_obs_vector=None):
+        # 0. Cold Start
+        n_known = np.sum(currently_known_mask)
+        if n_known == 0:
+            if self.prior_indices is not None:
+                return self.prior_indices[:n_to_select]
+            
+            rng = np.random.default_rng(getattr(self.args, 'seed', 42))
+            all_indices = np.arange(self.n_genes)
+            return rng.choice(all_indices, size=n_to_select, replace=False)
+            
+        # 1. Initial Covariance Calculation
+        self.learner.update(currently_known_mask, y_obs_vector)
+        _, cov_matrix = self.learner.predict_with_covariance(currently_known_mask, y_obs_vector)
+        
+        unobs_indices = np.where(~currently_known_mask)[0]
+        n_unobs = len(unobs_indices)
+        
+        # --- SPEED OPTIMIZATION: Candidate Subset Selection ---
+        # Instead of updating the full 9400x9400 matrix, we identify the top M candidates
+        # based on their *initial* reduction score, and then run the greedy loop only on them.
+        
+        # A. Calculate Initial Scores (Global)
+        diags = np.diag(cov_matrix)
+        diags = np.maximum(diags, 1e-9)
+        col_norms_sq = np.sum(cov_matrix**2, axis=0)
+        initial_scores = col_norms_sq / diags
+        
+        # B. Select Working Set (Top M)
+        # We need at least n_to_select candidates
+        M = max(self.subset_size, n_to_select)
+        M = min(M, n_unobs) # Don't exceed available genes
+        
+        # Get indices of top M scores
+        # argpartition puts top M at the end
+        top_M_local_indices = np.argpartition(initial_scores, -M)[-M:]
+        
+        # Slice the covariance matrix to just these M candidates
+        # current_cov is now (M, M)
+        current_cov = cov_matrix[np.ix_(top_M_local_indices, top_M_local_indices)]
+        
+        # Local mask for the Working Set (size M)
+        available_mask_subset = np.ones(M, dtype=bool)
+        selected_indices_in_subset = []
+        
+        # 2. Greedy Stepwise Loop (on Subset)
+        for _ in range(n_to_select):
+            # Calculate Scores on the (shrinking) covariance of the subset
+            diags_sub = np.diag(current_cov)
+            diags_sub = np.maximum(diags_sub, 1e-9)
+            col_norms_sq_sub = np.sum(current_cov**2, axis=0)
+            
+            scores_sub = col_norms_sq_sub / diags_sub
+            scores_sub[~available_mask_subset] = -np.inf
+            
+            # Pick Winner (Index relative to the subset M)
+            best_idx_in_subset = np.argmax(scores_sub)
+            selected_indices_in_subset.append(best_idx_in_subset)
+            available_mask_subset[best_idx_in_subset] = False
+            
+            # Update Covariance (M x M update)
+            v = current_cov[:, best_idx_in_subset]
+            var = current_cov[best_idx_in_subset, best_idx_in_subset]
+            
+            update_term = np.outer(v, v) / (var + 1e-9)
+            current_cov = current_cov - update_term
+
+        # 3. Map back to Global Indices
+        # top_M_local_indices maps Subset(0..M) -> Unobserved(0..N_un)
+        # selected_indices_in_subset is indices into top_M_local_indices
+        
+        chosen_local_indices = top_M_local_indices[selected_indices_in_subset]
+        selected_global_indices = unobs_indices[chosen_local_indices]
+        
+        return selected_global_indices

@@ -9,7 +9,7 @@ import anndata as ad
 import scipy.sparse as sp
 
 from active_gp import ActiveGPLearner
-from active_strategies import StaticStrategy, StaticGPStrategy, HighLeverageStrategy, UncertaintyStrategy, DiversityStrategy, PCUncertaintyStrategy
+from active_strategies import StaticStrategy, StaticGPStrategy, HighLeverageStrategy, UncertaintyStrategy, DiversityStrategy, PCUncertaintyStrategy, VarianceReductionStrategy
 
 
 def parse_arguments():
@@ -44,11 +44,13 @@ def parse_arguments():
     parser.add_argument("--run_active_uncertainty", action="store_true", help="Run the Active Uncertainty strategy.")
     parser.add_argument("--run_active_diversity", action="store_true", help="Run the Active Diversity strategy.")
     parser.add_argument("--run_active_pca", action="store_true", help="Run the Active PC-Uncertainty strategy.")
+    parser.add_argument("--run_active_var_reduction", action="store_true", help="Run the Active Stepwise Variance Reduction (Kriging Believer) strategy.")
 
     parser.add_argument("--acq_beta", type=float, default=1.0, help="Beta parameter for acquisition (mean vs std trade-off).")
     parser.add_argument("--max_batches", type=int, default=None, help="Maximum number of batches to run (optional limit).")
     parser.add_argument("--pca_recompute_freq", type=int, default=1, help="Batch frequency to recompute PCA for PC-Uncertainty.")
     parser.add_argument("--pca_top_k", type=int, default=50, help="Number of Principal Components to use for uncertainty.")
+    parser.add_argument("--stepwise_subset_size", type=int, default=400, help="Size of the 'Working Set' for stepwise variance reduction (speed optimization).")
 
     return parser.parse_args()
 
@@ -758,6 +760,28 @@ def main():
             plot_pvalue_history(pca_hist_imp, "PCUncertainty_ImputedGenes", args.output_dir, ground_truth_p)
 
     # ---------------------------------------------------------
+    # Strategy 10: Active Variance Reduction (Kriging Believer)
+    # ---------------------------------------------------------
+    svr_obs, svr_imp = None, None
+    if args.run_active_var_reduction:
+        if shared_learner is None:
+            print("\nError: Active Variance Reduction requires ActiveGPLearner and external data.")
+        else:
+            print("\nRunning Active Stepwise Variance Reduction (Kriging Believer)...")
+            shared_learner.reset()
+            
+            strat_svr = VarianceReductionStrategy(total_genes, args, shared_learner, prior_indices=cov_indices)
+            
+            svr_obs, svr_imp, svr_hist_obs, svr_hist_imp, svr_mse, svr_diag = run_simulation_strategy(
+                strat_svr, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
+            )
+            
+            all_mse_histories["Active_VarReduction"] = svr_mse
+            all_diagnostics["Active_VarReduction"] = svr_diag
+            plot_pvalue_history(svr_hist_obs, "VarReduction_ObservedGenes", args.output_dir, ground_truth_p)
+            plot_pvalue_history(svr_hist_imp, "VarReduction_ImputedGenes", args.output_dir, ground_truth_p)
+
+    # ---------------------------------------------------------
     # Final Comparative Plots
     # ---------------------------------------------------------
     if all_mse_histories:
@@ -792,6 +816,8 @@ def main():
         print(f"{'Active Diversity':<40} | {fmt(div_obs):<18} | {fmt(div_imp):<18}")
     if "Active_PCUncertainty" in all_mse_histories:
         print(f"{'Active PC-Uncertainty':<40} | {fmt(pca_obs):<18} | {fmt(pca_imp):<18}")
+    if "Active_VarReduction" in all_mse_histories:
+        print(f"{'Active Var-Reduction':<40} | {fmt(svr_obs):<18} | {fmt(svr_imp):<18}")
     print("-" * 82)
 
     print("\n" + "="*85)
@@ -816,6 +842,7 @@ def main():
     print_diag("Active Uncertainty", "Active_Uncertainty")
     print_diag("Active Diversity", "Active_Diversity")
     print_diag("Active PC-Uncertainty", "Active_PCUncertainty")
+    print_diag("Active Var-Reduction", "Active_VarReduction")
     print("-" * 85)
 
 if __name__ == "__main__":
