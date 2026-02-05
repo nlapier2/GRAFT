@@ -37,25 +37,48 @@ class StaticStrategy(BaseStrategy):
     """
     Wrapper for passive strategies (Random, Magnitude, Covariance).
     The order is determined EXTERNALLY (in the simulation script) and passed here.
+    Supports 'random_samp_pct' to mix top-ranked picks with random exploration.
     """
     def __init__(self, total_genes, args, sorted_indices, name="Static"):
         super().__init__(total_genes, args)
         self.name = name
+        # Ensure indices are integers
         self.queue = np.array(sorted_indices, dtype=int)
         self.pointer = 0
+        self.rng = np.random.default_rng(getattr(args, 'seed', 42))
 
     def select_next_batch(self, n_to_select, currently_known_mask, y_obs_vector=None):
-        # Simply take the next N indices from the pre-calculated queue
-        start = self.pointer
-        end = min(self.pointer + n_to_select, len(self.queue))
+        # 1. Determine Split (Static vs Random)
+        pct = getattr(self.args, 'random_samp_pct', 0.0)
+        n_rnd = int(n_to_select * pct)
+        n_det = n_to_select - n_rnd
         
-        if start >= len(self.queue):
-            return np.array([], dtype=int)
+        selected_indices = []
+
+        # 2. Deterministic Selection (Top of the Queue)
+        # We must scan forward to find 'n_det' genes that haven't been revealed yet
+        # (They might have been picked randomly in a previous batch)
+        while len(selected_indices) < n_det and self.pointer < len(self.queue):
+            candidate = self.queue[self.pointer]
+            self.pointer += 1
+            if not currently_known_mask[candidate]:
+                selected_indices.append(candidate)
+        
+        # 3. Random Selection (Background/Exploration)
+        if n_rnd > 0:
+            # Candidates are: ~Known AND ~Selected_Just_Now
+            candidates_mask = ~currently_known_mask
+            if len(selected_indices) > 0:
+                candidates_mask[selected_indices] = False
             
-        batch_indices = self.queue[start:end]
-        self.pointer = end
+            valid_candidates = np.where(candidates_mask)[0]
+            
+            if len(valid_candidates) > 0:
+                to_pick = min(n_rnd, len(valid_candidates))
+                picked = self.rng.choice(valid_candidates, size=to_pick, replace=False)
+                selected_indices.extend(picked)
         
-        return batch_indices
+        return np.array(selected_indices, dtype=int)
 
 
 class StaticGPStrategy(StaticStrategy):

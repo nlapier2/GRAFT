@@ -52,6 +52,12 @@ def parse_arguments():
     parser.add_argument("--pca_top_k", type=int, default=50, help="Number of Principal Components to use for uncertainty.")
     parser.add_argument("--stepwise_subset_size", type=int, default=400, help="Size of the 'Working Set' for stepwise variance reduction (speed optimization).")
 
+    # --- Static Strategy Options ---
+    parser.add_argument("--imputation_method", type=str, default="mean", choices=["mean", "zero"], help="Imputation method for static strategies: 'mean' (AverageKnown) or 'zero'.")
+    parser.add_argument("--sampling_strategy", type=str, default="strongest", choices=["strongest", "uniform"], help="Order to pick genes for static strategies: 'strongest' (Magnitude Descending) or 'uniform' (Stratified across range).")
+    parser.add_argument("--random_samp_pct", type=float, default=0.0, help="Percentage of batch (0.0-1.0) to select randomly for static strategies.")
+    parser.add_argument("--static_only", action="store_true", help="Skip all active learning strategies (GP/Active).")
+
     return parser.parse_args()
 
 
@@ -164,14 +170,21 @@ def run_simulation_strategy(strategy, df_master, total_genes, batch_size, p_thre
             # Strategy provided full imputed vector
             hba1_full_hybrid = prediction
         else:
-            # Fallback: Mean Imputation
-            if len(hba1_known) > 0:
-                mean_val = np.mean(hba1_known)
-            else:
+            # Fallback: Static Imputation (Mean or Zero)
+            # Check strategy args first, then default to 'mean' if not present
+            imp_method = getattr(strategy.args, 'imputation_method', 'mean')
+            
+            if imp_method == 'zero':
                 mean_val = 0.0
+            else:
+                # 'mean' (AverageKnown)
+                if len(hba1_known) > 0:
+                    mean_val = np.mean(hba1_known)
+                else:
+                    mean_val = 0.0
             
             hba1_full_hybrid = np.copy(all_hba1_true) # Start with truth...
-            hba1_full_hybrid[~revealed_mask] = mean_val # ...overwrite unknown with mean
+            hba1_full_hybrid[~revealed_mask] = mean_val # ...overwrite unknown with imputation value
             
         if np.std(all_lof_true) > 0 and np.std(hba1_full_hybrid) > 0:
             corr_imp, p_imp = stats.pearsonr(all_lof_true, hba1_full_hybrid)
@@ -486,6 +499,71 @@ def compute_external_perturbation_effect(h5ad_path, target_gene, obs_label, cont
     return abs_deltas
 
 
+def get_stratified_indices(scores, n_bins=10, seed=42):
+    """
+    Returns indices sorted such that traversing them samples uniformly 
+    across the POPULATION PERCENTILES of 'scores'.
+    
+    1. Bins scores into equal-frequency intervals (pd.qcut).
+       - Top Bin = Top 10% of genes (not just top 10% of value range).
+    2. Shuffles indices within each bin.
+    3. Interleaves the bins (Round Robin) to create the final queue.
+    """
+    try:
+        # Use qcut for Quantile binning (Equal Frequency)
+        # duplicates='drop' merges bins if many genes have identical scores (e.g. 0.0)
+        bins = pd.qcut(scores, q=n_bins, labels=False, duplicates='drop')
+    except ValueError:
+        # Fallback to cut (Equal Width) if qcut fails (e.g. all scores identical)
+        try:
+            bins = pd.cut(scores, bins=n_bins, labels=False, duplicates='drop')
+        except ValueError:
+            return scores.index.values
+    
+    # Determine number of actual bins created (might be < n_bins due to duplicates)
+    if hasattr(bins, 'categories'):
+        n_actual = len(bins.categories)
+    else:
+        # If labels=False, bins are integers. max() + 1 gives count.
+        n_actual = int(bins.max()) + 1
+    
+    # Group indices by bin
+    bin_indices = [[] for _ in range(n_actual)]
+    rng = np.random.default_rng(seed)
+    
+    # This iteration might be slow for huge DFs, but fast for 20k.
+    # A vectorized way:
+    df_temp = pd.DataFrame({'score': scores, 'bin': bins})
+    
+    # Group and shuffle
+    # We explicitly iterate 0..n_actual-1 to ensure order (lowest bin to highest bin)
+    # Note: qcut assigns 0 to the lowest scores and N to highest.
+    # If we want to sample uniformly, order doesn't matter much, 
+    # but usually we want to cycle Low -> Med -> High -> Low...
+    
+    rng = np.random.default_rng(seed)
+    queues = []
+    max_len = 0
+    
+    for b in range(n_actual):
+        # Extract indices belonging to this bin
+        indices = df_temp[df_temp['bin'] == b].index.values
+        if len(indices) > 0:
+            rng.shuffle(indices)
+            queues.append(list(indices))
+            if len(indices) > max_len:
+                max_len = len(indices)
+    
+    # Interleave (Round Robin)
+    stratified_order = []
+    for i in range(max_len):
+        for q in queues:
+            if i < len(q):
+                stratified_order.append(q[i])
+                
+    return np.array(stratified_order, dtype=int)
+
+
 def main():
     args = parse_arguments()
     
@@ -529,13 +607,19 @@ def main():
     # Store diagnostics for final table
     all_diagnostics = {}
 
-    # ---------------------------------------------------------
+# ---------------------------------------------------------
     # Strategy 1: GammaMagnitude Sampling
     # ---------------------------------------------------------
-    # Sort indices by absolute LoF_gamma (descending)
-    mag_indices = df['LoF_gamma'].abs().sort_values(ascending=False).index.values
+    mag_scores = df['LoF_gamma'].abs()
     
-    strat_mag = StaticStrategy(total_genes, args, mag_indices, name="GammaMagnitude Sorting")
+    if args.sampling_strategy == "uniform":
+        mag_indices = get_stratified_indices(mag_scores, n_bins=10, seed=args.seed)
+        strat_name_mag = "GammaMagnitude (Uniform)"
+    else:
+        mag_indices = mag_scores.sort_values(ascending=False).index.values
+        strat_name_mag = "GammaMagnitude (Strongest)"
+    
+    strat_mag = StaticStrategy(total_genes, args, mag_indices, name=strat_name_mag)
     
     mag_obs, mag_imp, mag_hist_obs, mag_hist_imp, mag_mse, mag_diag = run_simulation_strategy(
         strat_mag, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
@@ -579,10 +663,17 @@ def main():
             # Fill missing with 0.0
             cov_aligned = df['gene_name'].map(cov_series).fillna(0.0)
             
-            # Sort indices by absolute covariance
-            cov_indices = cov_aligned.abs().sort_values(ascending=False).index.values
+            # Sort indices based on strategy
+            cov_scores = cov_aligned.abs()
             
-            strat_cov = StaticStrategy(total_genes, args, cov_indices, name="Control Covariance")
+            if args.sampling_strategy == "uniform":
+                cov_indices = get_stratified_indices(cov_scores, n_bins=10, seed=args.seed)
+                strat_name_cov = "Control Covariance (Uniform)"
+            else:
+                cov_indices = cov_scores.sort_values(ascending=False).index.values
+                strat_name_cov = "Control Covariance (Strongest)"
+            
+            strat_cov = StaticStrategy(total_genes, args, cov_indices, name=strat_name_cov)
 
             cov_obs, cov_imp, cov_hist_obs, cov_hist_imp, cov_mse, cov_diag = run_simulation_strategy(
                 strat_cov, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
@@ -603,9 +694,16 @@ def main():
 
         if ext_series is not None:
             ext_aligned = df['gene_name'].map(ext_series).fillna(0.0)
-            ext_indices = ext_aligned.abs().sort_values(ascending=False).index.values
+            ext_scores = ext_aligned.abs()
             
-            strat_ext = StaticStrategy(total_genes, args, ext_indices, name="External Perturbation")
+            if args.sampling_strategy == "uniform":
+                ext_indices = get_stratified_indices(ext_scores, n_bins=10, seed=args.seed)
+                strat_name_ext = "External Perturbation (Uniform)"
+            else:
+                ext_indices = ext_scores.sort_values(ascending=False).index.values
+                strat_name_ext = "External Perturbation (Strongest)"
+            
+            strat_ext = StaticStrategy(total_genes, args, ext_indices, name=strat_name_ext)
 
             ext_obs, ext_imp, ext_hist_obs, ext_hist_imp, ext_mse, ext_diag = run_simulation_strategy(
                 strat_ext, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
@@ -622,21 +720,24 @@ def main():
     shared_learner = None
     has_external_data = (args.external_list or args.external_h5ad or args.embeddings_yaml)
     
-    # We initialize the learner if we have external data AND (we run the default GP strategy OR the optional active one)
-    # Note: Strategy 5 runs automatically if data is present. Strategy 6 is optional.
-    if ActiveGPLearner is not None and has_external_data:
-        print("\nInitializing Shared Active GP Learner...")
-        # Learner uses gene names matching df index order.
-        # This loads the heavy kernels ONCE.
-        shared_learner = ActiveGPLearner(df['gene_name'].values, args)
+    # Only initialize GP if we are NOT in static_only mode
+    if not args.static_only:
+        # We initialize the learner if we have external data AND (we run the default GP strategy OR the optional active one)
+        # Note: Strategy 5 runs automatically if data is present. Strategy 6 is optional.
+        if ActiveGPLearner is not None and has_external_data:
+            print("\nInitializing Shared Active GP Learner...")
+            # Learner uses gene names matching df index order.
+            # This loads the heavy kernels ONCE.
+            shared_learner = ActiveGPLearner(df['gene_name'].values, args)
 
     # ---------------------------------------------------------
     # Strategy 5: GP Imputation (Covariance/Random + GP Prediction)
     # ---------------------------------------------------------
     gp_obs, gp_imp = None, None
     gp_strat_name = "GP Imputation"
+    mse_key = None
     
-    if shared_learner is not None:
+    if shared_learner is not None and not args.static_only:
         # Select Order: Prioritize Control Covariance, fallback to Random
         if cov_indices is not None:
             gp_indices = cov_indices
@@ -670,7 +771,7 @@ def main():
     # Strategy 6: Active High Leverage (Optional)
     # ---------------------------------------------------------
     lev_obs, lev_imp = None, None
-    if args.run_active_leverage:
+    if args.run_active_leverage and not args.static_only:
         if shared_learner is None:
             print("\nError: Active High Leverage requires ActiveGPLearner and external data/embeddings.")
         else:
@@ -694,7 +795,7 @@ def main():
     # Strategy 7: Active Uncertainty (Optional)
     # ---------------------------------------------------------
     unc_obs, unc_imp = None, None
-    if args.run_active_uncertainty:
+    if args.run_active_uncertainty and not args.static_only:
         if shared_learner is None:
             print("\nError: Active Uncertainty requires ActiveGPLearner and external data.")
         else:
@@ -718,7 +819,7 @@ def main():
     # Strategy 8: Active Diversity (Optional)
     # ---------------------------------------------------------
     div_obs, div_imp = None, None
-    if args.run_active_diversity:
+    if args.run_active_diversity and not args.static_only:
         if shared_learner is None:
             print("\nError: Active Diversity requires ActiveGPLearner and external data.")
         else:
@@ -741,7 +842,7 @@ def main():
     # Strategy 9: Active PC-Uncertainty (Optional)
     # ---------------------------------------------------------
     pca_obs, pca_imp = None, None
-    if args.run_active_pca:
+    if args.run_active_pca and not args.static_only:
         if shared_learner is None:
             print("\nError: Active PCA requires ActiveGPLearner and external data.")
         else:
@@ -763,7 +864,7 @@ def main():
     # Strategy 10: Active Variance Reduction (Kriging Believer)
     # ---------------------------------------------------------
     svr_obs, svr_imp = None, None
-    if args.run_active_var_reduction:
+    if args.run_active_var_reduction and not args.static_only:
         if shared_learner is None:
             print("\nError: Active Variance Reduction requires ActiveGPLearner and external data.")
         else:
@@ -798,14 +899,14 @@ def main():
 
     def fmt(val): return str(val) if val else "> Max Batches"
 
-    print(f"{'GammaMagnitude Sorting':<40} | {fmt(mag_obs):<18} | {fmt(mag_imp):<18}")
+    print(f"{strat_name_mag:<40} | {fmt(mag_obs):<18} | {fmt(mag_imp):<18}")
     print(f"{'Random Sampling':<40} | {fmt(rnd_obs):<18} | {fmt(rnd_imp):<18}")
     
     # For optional strategies, we check if they ran (exist in history) rather than if they succeeded (is not None)
     if "ControlCovariance" in all_mse_histories:
-        print(f"{'Control Covariance Sorting':<40} | {fmt(cov_obs):<18} | {fmt(cov_imp):<18}")
+        print(f"{strat_name_cov:<40} | {fmt(cov_obs):<18} | {fmt(cov_imp):<18}")
     if "ExternalPerturbation" in all_mse_histories:
-        print(f"{'External Perturbation Sorting':<40} | {fmt(ext_obs):<18} | {fmt(ext_imp):<18}")
+        print(f"{strat_name_ext:<40} | {fmt(ext_obs):<18} | {fmt(ext_imp):<18}")
     if mse_key in all_mse_histories: # GP Strategy
         print(f"{gp_strat_name:<40} | {fmt(gp_obs):<18} | {fmt(gp_imp):<18}")
     if "Active_HighLeverage" in all_mse_histories:
@@ -833,10 +934,12 @@ def main():
             conn_str = f"{d['conn']:.4f}" if d['conn'] > 0 else "N/A"
             print(f"{name:<40} | {d['lof']:.4f}       | {d['hba1']:.4f}       | {conn_str:<16}")
 
-    print_diag("GammaMagnitude Sorting", "GammaMagnitude")
+    print_diag(strat_name_mag, "GammaMagnitude")
     print_diag("Random Sampling", "Random")
-    print_diag("Control Covariance Sorting", "ControlCovariance")
-    print_diag("External Perturbation Sorting", "ExternalPerturbation")
+    if "ControlCovariance" in all_diagnostics:
+        print_diag(strat_name_cov, "ControlCovariance")
+    if "ExternalPerturbation" in all_diagnostics:
+        print_diag(strat_name_ext, "ExternalPerturbation")
     print_diag(gp_strat_name, mse_key)
     print_diag("Active High Leverage", "Active_HighLeverage")
     print_diag("Active Uncertainty", "Active_Uncertainty")
