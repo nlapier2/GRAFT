@@ -21,6 +21,7 @@ def parse_arguments():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     parser.add_argument("--center_data", action="store_true", help="Center LoF_gamma and HBA1_beta at 0 by subtracting their means.")
     parser.add_argument("--output_dir", type=str, default="plots", help="Directory to save the correlation plots.")
+    parser.add_argument("--plot_target", type=str, default="HBA1", help="The specific target gene to generate plots and detailed logs for.")
 
     # Arguments for Control Strategy
     parser.add_argument("--control_h5ad", type=str, default=None, help="Path to H5AD file containing control cells for covariance calculation.")
@@ -61,29 +62,112 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def run_simulation_strategy(strategy, df_master, total_genes, batch_size, p_threshold, max_batches=None, print_every=10):
+def load_adata_once(h5ad_path, obs_label=None, control_val=None):
     """
-    Runs the simulation using a Strategy object.
-    
-    Args:
-        strategy: An instance of BaseStrategy (e.g., StaticStrategy).
-        df_master: The canonical DataFrame (unsorted, index 0..N-1) containing Truth.
-        total_genes: N.
+    Loads an H5AD file once and optionally filters it for control cells.
+    Returns the AnnData object or None if loading fails.
     """
-    print(f"\nRunning Strategy: {strategy.name}")
-    print(f"{'Batch':<8} | {'Revealed':<8} | {'Corr (ObsGenes)':<15} | {'P (ObsGenes)':<15} | {'Corr (ImpGenes)':<15} | {'P (ImpGenes)':<15}")
-    print("-" * 75)
+    if not h5ad_path or not os.path.exists(h5ad_path):
+        return None
 
-    # Truth Vectors (aligned to 0..N indices)
+    print(f"Loading H5AD: {h5ad_path} ...")
+    try:
+        adata = ad.read_h5ad(h5ad_path)
+    except Exception as e:
+        print(f"Error loading H5AD: {e}")
+        return None
+
+    # Filter only if specific control criteria are provided (e.g. for Control Covariance)
+    # For External data, we usually keep everything (controls + perturbations) so we skip this block if control_val is None
+    if obs_label and control_val is not None and str(control_val).strip() != "":
+        if obs_label in adata.obs.columns:
+            c_val_lower = str(control_val).lower()
+            mask = adata.obs[obs_label].astype(str).str.lower() == c_val_lower
+            adata = adata[mask].copy()
+            print(f"  -> Filtered to {adata.n_obs} cells (label '{obs_label}' ~= '{control_val}').")
+        else:
+            print(f"  -> Warning: '{obs_label}' not found. Using all cells.")
+
+    return adata
+
+
+def print_final_summary(results_list):
+    """
+    Prints the final summary tables for Correlated vs Uncorrelated genes.
+    Expects a list of dictionaries containing keys:
+    ['strategy', 'true_p', 'success_obs', 'error_nlog10_obs', 'final_mse', ...]
+    """
+    if not results_list:
+        print("\nNo results to summarize.")
+        return
+
+    df_res = pd.DataFrame(results_list)
+
+    # Split into Correlated (True P < 0.05) vs Null (True P >= 0.05)
+    df_corr = df_res[df_res['true_p'] < 0.05]
+    df_null = df_res[df_res['true_p'] >= 0.05]
+
+    def _print_group(name, sub_df):
+        print(f"\n\n>>> SUMMARY: {name} Genes (Count: {len(sub_df['gene'].unique())})")
+        if sub_df.empty:
+            print("No genes in this category.")
+            return
+
+        # Group by Strategy
+        grp = sub_df.groupby('strategy')
+        
+        # Headers (Added MSE column at the end)
+        header = (f"{'Strategy':<35} | {'Succ% (Obs)':<11} | {'Bias (Obs)':<10} | "
+                  f"{'MAE (Obs)':<10} | {'Succ% (Imp)':<11} | {'MSE (Mean +/- SE)':<20}")
+        print(header)
+        print("-" * len(header))
+        
+        for strat, g in grp:
+            # Stats: Success Rate, Bias (Mean Error), MAE (Mean Absolute Error)
+            succ_obs = (g['success_obs'].sum() / len(g)) * 100
+            bias_obs = g['error_nlog10_obs'].mean()
+            mae_obs = g['abs_error_nlog10_obs'].mean()
+            
+            succ_imp = (g['success_imp'].sum() / len(g)) * 100
+            
+            # MSE Stats (Mean and Standard Error)
+            mse_mean = g['final_mse'].mean()
+            mse_se = g['final_mse'].sem()
+            
+            # Format string
+            row = (f"{strat:<35} | {succ_obs:9.1f}%  | {bias_obs:9.2f}  | "
+                   f"{mae_obs:9.2f}  | {succ_imp:9.1f}%  | "
+                   f"{mse_mean:.2e} +/- {mse_se:.2e}")
+            print(row)
+
+    _print_group("TRUE CORRELATED", df_corr)
+    _print_group("UNCORRELATED (NULL)", df_null)
+    print("\n" + "="*60)
+
+
+def run_simulation_strategy(strategy, df_master, total_genes, batch_size, p_threshold, 
+                          target_gene_name, y_true_values, ground_truth_p,
+                          max_batches=None, print_every=10, silent=False):
+    """
+    Runs the simulation for a specific Strategy on a specific Target Gene.
+    Returns: A dictionary of summary statistics.
+    """
+    if not silent:
+        print(f"\nRunning Strategy: {strategy.name}")
+        print(f"{'Batch':<8} | {'Revealed':<8} | {'Corr (Obs)':<12} | {'P (Obs)':<10} | {'Corr (Imp)':<12} | {'P (Imp)':<10}")
+        print("-" * 75)
+
     all_lof_true = df_master['LoF_gamma'].values
-    all_hba1_true = df_master['HBA1_beta'].values
+    # y_true_values is passed explicitly (the beta column for this target)
     
-    # State
     revealed_mask = np.zeros(total_genes, dtype=bool)
     n_revealed = 0
     
     sig_batch_obs = None
     sig_batch_imp = None
+    
+    final_p_obs = 1.0
+    final_p_imp = 1.0
 
     history_obs = []
     history_imp = []
@@ -104,33 +188,27 @@ def run_simulation_strategy(strategy, df_master, total_genes, batch_size, p_thre
 
         batch_idx += 1
         
-        # 1. Ask Strategy for next batch indices
-        # Pass the current mask and the KNOWN HBA1 values aligned to that mask
-        new_indices = strategy.select_next_batch(batch_size, revealed_mask, all_hba1_true[revealed_mask])
-        
+        # 1. Select
+        new_indices = strategy.select_next_batch(batch_size, revealed_mask, y_true_values[revealed_mask])
         if len(new_indices) == 0:
-            break # No more genes to select
+            break
             
-        # 2. Reveal Data
+        # 2. Reveal
         revealed_mask[new_indices] = True
         n_revealed = np.sum(revealed_mask)
         
-        # Get Observed Data Subsets
         lof_known = all_lof_true[revealed_mask]
-        hba1_known = all_hba1_true[revealed_mask]
+        y_known = y_true_values[revealed_mask]
         
-        # 3. Notify Strategy (for Active Learning updates)
-        # Passing just the NEW data logic or FULL known data logic depends on implementation.
-        # Here we pass the indices and values of the NEW batch if needed, 
-        # but typically the strategy might just use the FULL known set next time.
-        strategy.update(new_indices, all_hba1_true[new_indices])
+        # 3. Update
+        strategy.update(new_indices, y_true_values[new_indices])
 
         # ==========================================
         # Diagnostic: Analyze Selected Batch Quality
         # ==========================================
-        # 1. Magnitude of Effects (Are we picking strong genes?)
+        # 1. Magnitude of Effects
         batch_lof_abs = np.mean(np.abs(all_lof_true[new_indices]))
-        batch_hba1_abs = np.mean(np.abs(all_hba1_true[new_indices]))
+        batch_hba1_abs = np.mean(np.abs(y_true_values[new_indices]))
         
         diag_lof.append(batch_lof_abs)
         diag_hba1.append(batch_hba1_abs)
@@ -148,72 +226,92 @@ def run_simulation_strategy(strategy, df_master, total_genes, batch_size, p_thre
             batch_conn = np.nan
         diag_conn.append(batch_conn)
 
-        # ==========================================
-        # Metric 1: Observed Correlation
-        # ==========================================
-        if n_revealed >= 2 and np.std(lof_known) > 0 and np.std(hba1_known) > 0:
-            corr_obs, p_obs = stats.pearsonr(lof_known, hba1_known)
+        # Metric 1: Observed
+        if n_revealed >= 2 and np.std(lof_known) > 0 and np.std(y_known) > 0:
+            corr_obs, p_obs = stats.pearsonr(lof_known, y_known)
         else:
             corr_obs, p_obs = 0.0, 1.0
             
         if sig_batch_obs is None and p_obs < p_threshold:
             sig_batch_obs = batch_idx
+        
+        final_p_obs = p_obs
         history_obs.append(p_obs)
 
-        # ==========================================
-        # Metric 2: Imputed Correlation
-        # ==========================================
-        # Check if Strategy offers a prediction (Active GP), otherwise use Mean Imputation
-        prediction = strategy.predict(revealed_mask, hba1_known)
+        # Metric 2: Imputed
+        prediction = strategy.predict(revealed_mask, y_known)
         
         if prediction is not None:
-            # Strategy provided full imputed vector
-            hba1_full_hybrid = prediction
+            y_full_hybrid = prediction
         else:
-            # Fallback: Static Imputation (Mean or Zero)
-            # Check strategy args first, then default to 'mean' if not present
+            # Fallback
             imp_method = getattr(strategy.args, 'imputation_method', 'mean')
-            
             if imp_method == 'zero':
                 mean_val = 0.0
             else:
-                # 'mean' (AverageKnown)
-                if len(hba1_known) > 0:
-                    mean_val = np.mean(hba1_known)
-                else:
-                    mean_val = 0.0
+                mean_val = np.mean(y_known) if len(y_known) > 0 else 0.0
             
-            hba1_full_hybrid = np.copy(all_hba1_true) # Start with truth...
-            hba1_full_hybrid[~revealed_mask] = mean_val # ...overwrite unknown with imputation value
+            y_full_hybrid = np.copy(y_true_values)
+            y_full_hybrid[~revealed_mask] = mean_val
             
-        if np.std(all_lof_true) > 0 and np.std(hba1_full_hybrid) > 0:
-            corr_imp, p_imp = stats.pearsonr(all_lof_true, hba1_full_hybrid)
+        if np.std(all_lof_true) > 0 and np.std(y_full_hybrid) > 0:
+            corr_imp, p_imp = stats.pearsonr(all_lof_true, y_full_hybrid)
         else:
             corr_imp, p_imp = 0.0, 1.0
 
         if sig_batch_imp is None and p_imp < p_threshold:
             sig_batch_imp = batch_idx
+            
+        final_p_imp = p_imp
         history_imp.append(p_imp)
 
         # Metric 3: MSE
-        mse = np.mean((all_hba1_true - hba1_full_hybrid) ** 2)
+        mse = np.mean((y_true_values - y_full_hybrid) ** 2)
         history_mse.append(mse)
 
-        # Print
-        if batch_idx == 1 or batch_idx % print_every == 0 or n_revealed == total_genes:
-            print(f"{batch_idx:<8} | {n_revealed:<8} | {corr_obs:+.4f}     | {p_obs:.2e}    | {corr_imp:+.4f}     | {p_imp:.2e}")
+        if not silent:
+            if batch_idx == 1 or batch_idx % print_every == 0 or n_revealed == total_genes:
+                print(f"{batch_idx:<8} | {n_revealed:<8} | {corr_obs:+.4f}     | {p_obs:.2e}  | {corr_imp:+.4f}     | {p_imp:.2e}")
 
-    # Aggregate Diagnostics
+# Aggregate Diagnostics
     avg_diag = {
         'lof': np.mean(diag_lof) if diag_lof else 0.0,
         'hba1': np.mean(diag_hba1) if diag_hba1 else 0.0,
         'conn': np.nanmean(diag_conn) if not np.all(np.isnan(diag_conn)) else 0.0
     }
 
-    return sig_batch_obs, sig_batch_imp, history_obs, history_imp, history_mse, avg_diag
+    # --- Compile Stats ---
+    # Log10 P-value stats
+    nlog10_true = -np.log10(ground_truth_p) if ground_truth_p > 1e-300 else 300
+    nlog10_pred_obs = -np.log10(final_p_obs) if final_p_obs > 1e-300 else 300
+    nlog10_pred_imp = -np.log10(final_p_imp) if final_p_imp > 1e-300 else 300
+    
+    # Determine the limit for reporting failure (if max_batches is None, use actual batches run)
+    limit = max_batches if max_batches is not None else batch_idx
+
+    return {
+        "gene": target_gene_name,
+        "strategy": strategy.name,
+        "true_p": ground_truth_p,
+        "final_p_obs": final_p_obs,
+        "final_p_imp": final_p_imp,
+        "final_mse": history_mse[-1] if history_mse else 0.0,
+        "batches_obs": sig_batch_obs if sig_batch_obs else (limit + 1),
+        "batches_imp": sig_batch_imp if sig_batch_imp else (limit + 1),
+        "success_obs": (sig_batch_obs is not None),
+        "success_imp": (sig_batch_imp is not None),
+        "error_nlog10_obs": (nlog10_pred_obs - nlog10_true), # Bias
+        "error_nlog10_imp": (nlog10_pred_imp - nlog10_true),
+        "abs_error_nlog10_obs": abs(nlog10_pred_obs - nlog10_true),
+        "abs_error_nlog10_imp": abs(nlog10_pred_imp - nlog10_true),
+        "history_obs": history_obs,
+        "history_imp": history_imp,
+        "history_mse": history_mse,
+        "avg_diag": avg_diag
+    }
 
 
-def plot_pvalue_history(p_values, method_name, output_dir, true_p_val=None):
+def plot_pvalue_history(p_values, method_name, output_dir, target_name, true_p_val=None):
     """
     Plots the -log10(p-value) over batches for a single approach.
     If true_p_val is provided, it is plotted as the 'Ground Truth' reference line.
@@ -254,15 +352,17 @@ def plot_pvalue_history(p_values, method_name, output_dir, true_p_val=None):
     plt.axhline(y=thresh_nlog10, color='r', linestyle='--', alpha=0.7, label=f'Marginal Sig (0.05)')
     plt.axhline(y=ref_nlog10, color='g', linestyle='--', alpha=0.7, label=f'{label_text} P-value')
     
-    plt.title(f"Significance Trajectory: {method_name}")
+    # Update Title to include Target Name
+    plt.title(f"{target_name}: Significance Trajectory - {method_name}")
     plt.xlabel("Batches")
     plt.ylabel("-log10(p-value)")
     plt.legend()
     plt.grid(True, alpha=0.3)
     
-    # Save
+    # Save with Target Name in filename to avoid overwrites
     safe_name = method_name.replace(" ", "_").replace("(", "").replace(")", "")
-    out_path = os.path.join(output_dir, f"{safe_name}.png")
+    safe_target = target_name.replace("/", "_")
+    out_path = os.path.join(output_dir, f"{safe_target}_{safe_name}.png")
     plt.savefig(out_path)
     plt.close()
     print(f"Saved plot to {out_path}")
@@ -351,41 +451,16 @@ def plot_mse_comparison(mse_histories, output_dir):
     print(f"Saved MSE comparison plot to {out_path}")
 
 
-def compute_control_covariance(h5ad_path, target_gene, obs_label, control_val):
+def compute_control_covariance(adata, target_gene):
     """
-    Loads an AnnData file, filters for control cells (case-insensitive), 
-    and calculates the covariance between every gene and the 'target_gene'.
+    Calculates the covariance between every gene and the 'target_gene'
+    using the provided control AnnData object.
     Returns a pandas Series mapping gene_name -> absolute_covariance.
     """
-    if not os.path.exists(h5ad_path):
-        print(f"Warning: Control H5AD not found at {h5ad_path}")
+    if adata is None:
         return None
-
-    print(f"Loading control data from {h5ad_path}...")
-    try:
-        adata = ad.read_h5ad(h5ad_path)
-    except Exception as e:
-        print(f"Error loading H5AD: {e}")
-        return None
-
-    # 1. Filter for control cells (if label is provided)
-    if control_val is not None and str(control_val).strip() != "":
-        if obs_label in adata.obs.columns:
-            # Case-insensitive comparison
-            c_val_lower = str(control_val).lower()
-            mask = adata.obs[obs_label].astype(str).str.lower() == c_val_lower
-            
-            n_total = adata.n_obs
-            adata = adata[mask].copy()
-            print(f"Filtered control cells: {adata.n_obs} / {n_total} cells (label '{obs_label}' ~= '{control_val}')")
-        else:
-            print(f"Warning: obs column '{obs_label}' not found. Using all {adata.n_obs} cells.")
-    else:
-        # Blank control label -> Trust that all cells are controls
-        print(f"Control label is blank. Using all {adata.n_obs} cells as controls.")
-
+        
     if adata.n_obs < 5:
-        print("Error: Too few control cells to compute covariance.")
         return None
 
     # 2. Check for target gene
@@ -424,22 +499,13 @@ def compute_control_covariance(h5ad_path, target_gene, obs_label, control_val):
     return pd.Series(covariances, index=adata.var_names)
 
 
-def compute_external_perturbation_effect(h5ad_path, target_gene, obs_label, control_val):
+def compute_external_perturbation_effect(adata, target_gene, obs_label, control_val):
     """
-    Loads an external H5AD (pseudobulk or single-cell), finds the control population,
-    and calculates the absolute difference in `target_gene` expression between 
-    each perturbation and the control.
+    Calculates the absolute difference in `target_gene` expression between 
+    each perturbation and the control using the provided AnnData.
     Returns: pd.Series mapping perturbation_name -> absolute_effect_size
     """
-    if not os.path.exists(h5ad_path):
-        print(f"Warning: External H5AD not found at {h5ad_path}")
-        return None
-
-    print(f"Loading external perturbation data from {h5ad_path}...")
-    try:
-        adata = ad.read_h5ad(h5ad_path)
-    except Exception as e:
-        print(f"Error loading H5AD: {e}")
+    if adata is None:
         return None
 
     # 1. Verify Columns
@@ -571,382 +637,211 @@ def main():
         print(f"Error: File not found at {args.input_file}")
         return
         
-    print(f"Loading data from {args.input_file}...")
+    print(f"Loading Master TSV from {args.input_file}...")
     df = pd.read_csv(args.input_file, sep='\t')
     
-    # Preprocessing: Drop NAs
-    # We remove rows that don't have ground truth, as we can't simulate checking them.
-    df = df.dropna(subset=['LoF_gamma', 'HBA1_beta']).reset_index(drop=True)
-    total_genes = len(df)
-
-    # Optional Centering
-    if args.center_data:
-        print("Centering LoF_gamma and HBA1_beta at 0...")
-        df['LoF_gamma'] = df['LoF_gamma'] - df['LoF_gamma'].mean()
-        df['HBA1_beta'] = df['HBA1_beta'] - df['HBA1_beta'].mean()
-
-    print(f"Valid genes for simulation: {total_genes}")
-    print(f"Batch size: {args.batch_size}")
-    print(f"Significance Threshold: {args.p_threshold}")
-    
-    if total_genes < 3:
-        print("Not enough genes to run simulation.")
+    # Identify Beta Columns
+    beta_cols = [c for c in df.columns if c.endswith("_beta")]
+    if not beta_cols:
+        print("Error: No columns ending in '_beta' found in input file.")
         return
-
-    # --- Calculate Ground Truth P-Value ---
-    # This is the target p-value if we perfectly measured the entire dataset.
-    if df['LoF_gamma'].std() > 0 and df['HBA1_beta'].std() > 0:
-        _, ground_truth_p = stats.pearsonr(df['LoF_gamma'], df['HBA1_beta'])
-    else:
-        ground_truth_p = 1.0
-    print(f"Ground Truth Correlation P-value (All Genes): {ground_truth_p:.2e}")
-
-    # Dictionary to store MSE histories for comparison plot
-    all_mse_histories = {}
-
-    # Store diagnostics for final table
-    all_diagnostics = {}
-
-# ---------------------------------------------------------
-    # Strategy 1: GammaMagnitude Sampling
-    # ---------------------------------------------------------
-    mag_scores = df['LoF_gamma'].abs()
     
-    if args.sampling_strategy == "uniform":
-        mag_indices = get_stratified_indices(mag_scores, n_bins=10, seed=args.seed)
-        strat_name_mag = "GammaMagnitude (Uniform)"
-    else:
-        mag_indices = mag_scores.sort_values(ascending=False).index.values
-        strat_name_mag = "GammaMagnitude (Strongest)"
+    print(f"Found {len(beta_cols)} target genes: {[c.replace('_beta','') for c in beta_cols]}")
     
-    strat_mag = StaticStrategy(total_genes, args, mag_indices, name=strat_name_mag)
+    # Load Ancillary Data Once
+    adata_ctrl = load_adata_once(args.control_h5ad, args.target_label, args.control_label)
+    # Don't filter external data! We need perturbations + controls.
+    adata_ext = load_adata_once(args.external_h5ad, None, None)
     
-    mag_obs, mag_imp, mag_hist_obs, mag_hist_imp, mag_mse, mag_diag = run_simulation_strategy(
-        strat_mag, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
-    )
-    all_mse_histories["GammaMagnitude"] = mag_mse
-    all_diagnostics["GammaMagnitude"] = mag_diag
-
-    plot_pvalue_history(mag_hist_obs, "GammaMagnitude_ObservedGenes", args.output_dir, ground_truth_p)
-    plot_pvalue_history(mag_hist_imp, "GammaMagnitude_ImputedGenes", args.output_dir, ground_truth_p)
-
-    # ---------------------------------------------------------
-    # Strategy 2: Random Sampling
-    # ---------------------------------------------------------
-    # Random indices
-    rnd_indices = df.sample(frac=1, random_state=args.seed).index.values
-    
-    strat_rnd = StaticStrategy(total_genes, args, rnd_indices, name="Random Sampling")
-    
-    rnd_obs, rnd_imp, rnd_hist_obs, rnd_hist_imp, rnd_mse, rnd_diag = run_simulation_strategy(
-        strat_rnd, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
-    )
-    all_mse_histories["Random"] = rnd_mse
-    all_diagnostics["Random"] = rnd_diag
-
-    plot_pvalue_history(rnd_hist_obs, "Random_ObservedGenes", args.output_dir, ground_truth_p)
-    plot_pvalue_history(rnd_hist_imp, "Random_ImputedGenes", args.output_dir, ground_truth_p)
-
-    # ---------------------------------------------------------
-    # Strategy 3: Control Covariance (Optional)
-    # ---------------------------------------------------------
-    # We will store the indices for use in Strategy 5 if available
-    cov_indices = None 
-    
-    if args.control_h5ad:
-        cov_series = compute_control_covariance(
-            args.control_h5ad, "HBA1", args.target_label, args.control_label
-        )
-
-        if cov_series is not None:
-            # Map to DF to get aligned values
-            # Fill missing with 0.0
-            cov_aligned = df['gene_name'].map(cov_series).fillna(0.0)
-            
-            # Sort indices based on strategy
-            cov_scores = cov_aligned.abs()
-            
-            if args.sampling_strategy == "uniform":
-                cov_indices = get_stratified_indices(cov_scores, n_bins=10, seed=args.seed)
-                strat_name_cov = "Control Covariance (Uniform)"
-            else:
-                cov_indices = cov_scores.sort_values(ascending=False).index.values
-                strat_name_cov = "Control Covariance (Strongest)"
-            
-            strat_cov = StaticStrategy(total_genes, args, cov_indices, name=strat_name_cov)
-
-            cov_obs, cov_imp, cov_hist_obs, cov_hist_imp, cov_mse, cov_diag = run_simulation_strategy(
-                strat_cov, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
-            )
-            all_mse_histories["ControlCovariance"] = cov_mse
-            all_diagnostics["ControlCovariance"] = cov_diag
-
-            plot_pvalue_history(cov_hist_obs, "ControlCovariance_ObservedGenes", args.output_dir, ground_truth_p)
-            plot_pvalue_history(cov_hist_imp, "ControlCovariance_ImputedGenes", args.output_dir, ground_truth_p)
-
-    # ---------------------------------------------------------
-    # Strategy 4: External Perturbation Effect (Optional)
-    # ---------------------------------------------------------
-    if args.external_h5ad:
-        ext_series = compute_external_perturbation_effect(
-            args.external_h5ad, "HBA1", args.target_label, args.control_label
-        )
-
-        if ext_series is not None:
-            ext_aligned = df['gene_name'].map(ext_series).fillna(0.0)
-            ext_scores = ext_aligned.abs()
-            
-            if args.sampling_strategy == "uniform":
-                ext_indices = get_stratified_indices(ext_scores, n_bins=10, seed=args.seed)
-                strat_name_ext = "External Perturbation (Uniform)"
-            else:
-                ext_indices = ext_scores.sort_values(ascending=False).index.values
-                strat_name_ext = "External Perturbation (Strongest)"
-            
-            strat_ext = StaticStrategy(total_genes, args, ext_indices, name=strat_name_ext)
-
-            ext_obs, ext_imp, ext_hist_obs, ext_hist_imp, ext_mse, ext_diag = run_simulation_strategy(
-                strat_ext, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
-            )
-            all_mse_histories["ExternalPerturbation"] = ext_mse
-            all_diagnostics["ExternalPerturbation"] = ext_diag
-
-            plot_pvalue_history(ext_hist_obs, "ExternalPerturbation_ObservedGenes", args.output_dir, ground_truth_p)
-            plot_pvalue_history(ext_hist_imp, "ExternalPerturbation_ImputedGenes", args.output_dir, ground_truth_p)
-
-    # ---------------------------------------------------------
-    # Shared GP Initialization (Run once if any GP strategy is needed)
-    # ---------------------------------------------------------
+    # Initialize Shared GP Learner Once
     shared_learner = None
     has_external_data = (args.external_list or args.external_h5ad or args.embeddings_yaml)
     
-    # Only initialize GP if we are NOT in static_only mode
-    if not args.static_only:
-        # We initialize the learner if we have external data AND (we run the default GP strategy OR the optional active one)
-        # Note: Strategy 5 runs automatically if data is present. Strategy 6 is optional.
-        if ActiveGPLearner is not None and has_external_data:
-            print("\nInitializing Shared Active GP Learner...")
-            # Learner uses gene names matching df index order.
-            # This loads the heavy kernels ONCE.
-            shared_learner = ActiveGPLearner(df['gene_name'].values, args)
-
-    # ---------------------------------------------------------
-    # Strategy 5: GP Imputation (Covariance/Random + GP Prediction)
-    # ---------------------------------------------------------
-    gp_obs, gp_imp = None, None
-    gp_strat_name = "GP Imputation"
-    mse_key = None
+    # Clean DF for Learner (Must have valid LoF for alignment)
+    df = df.dropna(subset=['LoF_gamma']).reset_index(drop=True)
+    total_genes = len(df)
     
-    if shared_learner is not None and not args.static_only:
-        # Select Order: Prioritize Control Covariance, fallback to Random
-        if cov_indices is not None:
-            gp_indices = cov_indices
-            gp_strat_name = "Control Covariance + GP Imputation"
-            plot_name_obs = "CovGP_ObservedGenes"
-            plot_name_imp = "CovGP_ImputedGenes"
-            mse_key = "ControlCovariance_GP"
-        else:
-            print("Warning: Control Covariance not available. Falling back to Random Sampling for GP.")
-            gp_indices = rnd_indices
-            gp_strat_name = "Random Sampling + GP Imputation"
-            plot_name_obs = "RandomGP_ObservedGenes"
-            plot_name_imp = "RandomGP_ImputedGenes"
-            mse_key = "Random_GP"
-            
-        # Use StaticGPStrategy to wrap the static list + learner
-        # Ensure learner starts clean
-        shared_learner.reset()
-        strat_gp = StaticGPStrategy(total_genes, args, gp_indices, shared_learner, name=gp_strat_name)
+    if not args.static_only and ActiveGPLearner is not None and has_external_data:
+        print("\nInitializing Shared Active GP Learner (Kernel Computation)...")
+        shared_learner = ActiveGPLearner(df['gene_name'].values, args)
 
-        gp_obs, gp_imp, gp_hist_obs, gp_hist_imp, gp_mse, gp_diag = run_simulation_strategy(
-            strat_gp, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
-        )
+    results_list = []
+    
+    # ==========================================
+    # LOOP OVER TARGET GENES
+    # ==========================================
+    for target_col in beta_cols:
+        target_name = target_col.replace("_beta", "")
         
-        all_mse_histories[mse_key] = gp_mse
-        all_diagnostics[mse_key] = gp_diag
-        plot_pvalue_history(gp_hist_obs, plot_name_obs, args.output_dir, ground_truth_p)
-        plot_pvalue_history(gp_hist_imp, plot_name_imp, args.output_dir, ground_truth_p)
-
-    # ---------------------------------------------------------
-    # Strategy 6: Active High Leverage (Optional)
-    # ---------------------------------------------------------
-    lev_obs, lev_imp = None, None
-    if args.run_active_leverage and not args.static_only:
-        if shared_learner is None:
-            print("\nError: Active High Leverage requires ActiveGPLearner and external data/embeddings.")
+        # Check if this is the "Plot Target"
+        is_plot_target = (target_name == args.plot_target)
+        silent = not is_plot_target
+        
+        if not silent:
+            print(f"\n{'='*60}")
+            print(f"PROCESSING TARGET: {target_name}")
+            print(f"{'='*60}")
         else:
-            print("\nRunning Active High Leverage Strategy...")
-            # Reset the learner to clear weights learned during Strategy 5
-            shared_learner.reset()
-            
-            # Pass cov_indices (if they exist) to use as the "Warm Start" for Batch 1
-            strat_lev = HighLeverageStrategy(total_genes, args, shared_learner, prior_indices=cov_indices)
-            
-            lev_obs, lev_imp, lev_hist_obs, lev_hist_imp, lev_mse, lev_diag = run_simulation_strategy(
-                strat_lev, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
-            )
-            
-            all_mse_histories["Active_HighLeverage"] = lev_mse
-            all_diagnostics["Active_HighLeverage"] = lev_diag
-            plot_pvalue_history(lev_hist_obs, "HighLeverage_ObservedGenes", args.output_dir, ground_truth_p)
-            plot_pvalue_history(lev_hist_imp, "HighLeverage_ImputedGenes", args.output_dir, ground_truth_p)
+            print(f"... Processing {target_name} ...")
 
-    # ---------------------------------------------------------
-    # Strategy 7: Active Uncertainty (Optional)
-    # ---------------------------------------------------------
-    unc_obs, unc_imp = None, None
-    if args.run_active_uncertainty and not args.static_only:
-        if shared_learner is None:
-            print("\nError: Active Uncertainty requires ActiveGPLearner and external data.")
+        # Extract vectors (Handle Missing Data by Filling 0 or Skipping?)
+        # Simulation requires full vector. We assume clean input or fill 0.
+        y_true = df[target_col].fillna(0.0).values
+        
+        # Optional Centering (Per Target)
+        if args.center_data:
+            y_true = y_true - np.mean(y_true)
+        
+        # Ground Truth
+        lof_vals = df['LoF_gamma'].values
+        if args.center_data: lof_vals = lof_vals - np.mean(lof_vals)
+            
+        if np.std(lof_vals) > 0 and np.std(y_true) > 0:
+            _, ground_truth_p = stats.pearsonr(lof_vals, y_true)
         else:
-            print("\nRunning Active Uncertainty Strategy...")
-            shared_learner.reset()
+            ground_truth_p = 1.0
             
-            # Use Random Start (default) or Covariance Start (if cov_indices passed)
-            # Typically Uncertainty sampling starts Randomly to maximize entropy.
-            strat_unc = UncertaintyStrategy(total_genes, args, shared_learner, prior_indices=None)
+        if not silent:
+            print(f"Ground Truth P-value: {ground_truth_p:.2e}")
 
-            unc_obs, unc_imp, unc_hist_obs, unc_hist_imp, unc_mse, unc_diag = run_simulation_strategy(
-                strat_unc, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
-            )
-            
-            all_mse_histories["Active_Uncertainty"] = unc_mse
-            all_diagnostics["Active_Uncertainty"] = unc_diag
-            plot_pvalue_history(unc_hist_obs, "Uncertainty_ObservedGenes", args.output_dir, ground_truth_p)
-            plot_pvalue_history(unc_hist_imp, "Uncertainty_ImputedGenes", args.output_dir, ground_truth_p)
-
-    # ---------------------------------------------------------
-    # Strategy 8: Active Diversity (Optional)
-    # ---------------------------------------------------------
-    div_obs, div_imp = None, None
-    if args.run_active_diversity and not args.static_only:
-        if shared_learner is None:
-            print("\nError: Active Diversity requires ActiveGPLearner and external data.")
+        # --- PREPARE STRATEGIES ---
+        strategies = []
+        
+        # 1. GammaMagnitude
+        # (Re-instantiate to be safe, though indices are static)
+        mag_scores = df['LoF_gamma'].abs()
+        if args.sampling_strategy == "uniform":
+            mag_idxs = get_stratified_indices(mag_scores, n_bins=10, seed=args.seed)
+            mag_name = "GammaMagnitude (Uniform)"
         else:
-            print("\nRunning Active Diversity Strategy...")
+            mag_idxs = mag_scores.sort_values(ascending=False).index.values
+            mag_name = "GammaMagnitude (Strongest)"
+        strategies.append(StaticStrategy(total_genes, args, mag_idxs, name=mag_name))
+        
+        # 2. Random
+        rnd_idxs = df.sample(frac=1, random_state=args.seed).index.values
+        strategies.append(StaticStrategy(total_genes, args, rnd_idxs, name="Random Sampling"))
+        
+        # 3. Control Covariance (Target Specific)
+        cov_indices = None
+        if adata_ctrl:
+            cov_series = compute_control_covariance(adata_ctrl, target_name)
+            if cov_series is not None:
+                cov_aligned = df['gene_name'].map(cov_series).fillna(0.0)
+                cov_scores = cov_aligned.abs()
+                if args.sampling_strategy == "uniform":
+                    cov_indices = get_stratified_indices(cov_scores, n_bins=10, seed=args.seed)
+                    c_name = "Control Covariance (Uniform)"
+                else:
+                    cov_indices = cov_scores.sort_values(ascending=False).index.values
+                    c_name = "Control Covariance (Strongest)"
+                strategies.append(StaticStrategy(total_genes, args, cov_indices, name=c_name))
+
+        # 4. External Perturbation (Target Specific)
+        if adata_ext:
+            ext_series = compute_external_perturbation_effect(adata_ext, target_name, args.target_label, args.control_label)
+            if ext_series is not None:
+                ext_aligned = df['gene_name'].map(ext_series).fillna(0.0)
+                ext_scores = ext_aligned.abs()
+                if args.sampling_strategy == "uniform":
+                    ext_idxs = get_stratified_indices(ext_scores, n_bins=10, seed=args.seed)
+                    e_name = "External Perturbation (Uniform)"
+                else:
+                    ext_idxs = ext_scores.sort_values(ascending=False).index.values
+                    e_name = "External Perturbation (Strongest)"
+                strategies.append(StaticStrategy(total_genes, args, ext_idxs, name=e_name))
+
+        # 5. GP / Active
+        if shared_learner:
             shared_learner.reset()
+            # Static GP
+            gp_idxs = cov_indices if cov_indices is not None else rnd_idxs
+            gp_name = "ControlCovariance + GP" if cov_indices is not None else "Random + GP"
+            strategies.append(StaticGPStrategy(total_genes, args, gp_idxs, shared_learner, name=gp_name))
             
-            # Pass cov_indices if available for Warm Start
-            strat_div = DiversityStrategy(total_genes, args, shared_learner, prior_indices=cov_indices)
-            
-            div_obs, div_imp, div_hist_obs, div_hist_imp, div_mse, div_diag = run_simulation_strategy(
-                strat_div, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
+            # Active Strategies
+            if args.run_active_leverage:
+                shared_learner.reset()
+                strategies.append(HighLeverageStrategy(total_genes, args, shared_learner, prior_indices=cov_indices))
+            if args.run_active_uncertainty:
+                shared_learner.reset()
+                strategies.append(UncertaintyStrategy(total_genes, args, shared_learner, prior_indices=None))
+            if args.run_active_diversity:
+                shared_learner.reset()
+                strategies.append(DiversityStrategy(total_genes, args, shared_learner, prior_indices=cov_indices))
+            if args.run_active_pca:
+                shared_learner.reset()
+                strategies.append(PCUncertaintyStrategy(total_genes, args, shared_learner, prior_indices=cov_indices))
+            if args.run_active_var_reduction:
+                shared_learner.reset()
+                strategies.append(VarianceReductionStrategy(total_genes, args, shared_learner, prior_indices=cov_indices))
+
+        # --- EXECUTE LOOP ---
+        mse_histories = {}
+        target_results = [] # Store local results for the immediate summary print
+        
+        for strat in strategies:
+            # Reset learner state
+            if hasattr(strat, 'learner') and strat.learner is not None:
+                strat.learner.reset()
+                
+            res = run_simulation_strategy(
+                strat, df, total_genes, args.batch_size, args.p_threshold,
+                target_name, y_true, ground_truth_p,
+                max_batches=args.max_batches, print_every=args.print_every, silent=silent
             )
+            results_list.append(res)
+            target_results.append(res)
             
-            all_mse_histories["Active_Diversity"] = div_mse
-            all_diagnostics["Active_Diversity"] = div_diag
-            plot_pvalue_history(div_hist_obs, "Diversity_ObservedGenes", args.output_dir, ground_truth_p)
-            plot_pvalue_history(div_hist_imp, "Diversity_ImputedGenes", args.output_dir, ground_truth_p)
+            # Plotting (Only for main target)
+            if is_plot_target:
+                mse_histories[strat.name] = res['history_mse']
+                plot_pvalue_history(res['history_obs'], f"{strat.name}_Obs", args.output_dir, target_name, ground_truth_p)
+                plot_pvalue_history(res['history_imp'], f"{strat.name}_Imp", args.output_dir, target_name, ground_truth_p)
 
-    # ---------------------------------------------------------
-    # Strategy 9: Active PC-Uncertainty (Optional)
-    # ---------------------------------------------------------
-    pca_obs, pca_imp = None, None
-    if args.run_active_pca and not args.static_only:
-        if shared_learner is None:
-            print("\nError: Active PCA requires ActiveGPLearner and external data.")
-        else:
-            print("\nRunning Active PC-Uncertainty Strategy...")
-            shared_learner.reset()
+        # --- IMMEDIATE SUMMARY (Only for main target) ---
+        if is_plot_target:
+            plot_mse_comparison(mse_histories, args.output_dir)
             
-            strat_pca = PCUncertaintyStrategy(total_genes, args, shared_learner, prior_indices=cov_indices)
+            print("\n" + "="*50)
+            print(f"SUMMARY FOR {target_name}: Batches needed for Significance")
+            print("="*50)
+            print(f"{'Strategy':<40} | {'ObservedGenes':<18} | {'ImputedGenes':<18}")
+            print("-" * 82)
+
+            def fmt(val): 
+                # run_simulation_strategy returns (max_batches + 1) if fail.
+                # If we passed None for max_batches, it returns (total_batches + 1).
+                limit = args.max_batches if args.max_batches else total_genes
+                return str(val) if val <= limit else "> Max"
+
+            for res in target_results:
+                s_name = res['strategy']
+                obs = res['batches_obs']
+                imp = res['batches_imp']
+                print(f"{s_name:<40} | {fmt(obs):<18} | {fmt(imp):<18}")
+            print("-" * 82)
             
-            pca_obs, pca_imp, pca_hist_obs, pca_hist_imp, pca_mse, pca_diag = run_simulation_strategy(
-                strat_pca, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
-            )
+            # Print Diagnostics
+            print("\n" + "="*85)
+            print("DIAGNOSTIC REPORT: Average Quality of Selected Genes")
+            print("="*85)
+            print(f"{'Strategy':<40} | {'Avg |LoF|':<12} | {'Avg |Beta|':<12} | {'Avg Connectivity':<16}")
+            print("-" * 85)
             
-            all_mse_histories["Active_PCUncertainty"] = pca_mse
-            all_diagnostics["Active_PCUncertainty"] = pca_diag
-            plot_pvalue_history(pca_hist_obs, "PCUncertainty_ObservedGenes", args.output_dir, ground_truth_p)
-            plot_pvalue_history(pca_hist_imp, "PCUncertainty_ImputedGenes", args.output_dir, ground_truth_p)
+            for res in target_results:
+                 s_name = res['strategy']
+                 d = res['avg_diag']
+                 conn_str = f"{d['conn']:.4f}" if d['conn'] > 0 else "N/A"
+                 # Note: avg_diag contains 'hba1' key but it represents the current target's Beta
+                 print(f"{s_name:<40} | {d['lof']:.4f}       | {d['hba1']:.4f}       | {conn_str:<16}")
+            print("-" * 85)
 
-    # ---------------------------------------------------------
-    # Strategy 10: Active Variance Reduction (Kriging Believer)
-    # ---------------------------------------------------------
-    svr_obs, svr_imp = None, None
-    if args.run_active_var_reduction and not args.static_only:
-        if shared_learner is None:
-            print("\nError: Active Variance Reduction requires ActiveGPLearner and external data.")
-        else:
-            print("\nRunning Active Stepwise Variance Reduction (Kriging Believer)...")
-            shared_learner.reset()
-            
-            strat_svr = VarianceReductionStrategy(total_genes, args, shared_learner, prior_indices=cov_indices)
-            
-            svr_obs, svr_imp, svr_hist_obs, svr_hist_imp, svr_mse, svr_diag = run_simulation_strategy(
-                strat_svr, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
-            )
-            
-            all_mse_histories["Active_VarReduction"] = svr_mse
-            all_diagnostics["Active_VarReduction"] = svr_diag
-            plot_pvalue_history(svr_hist_obs, "VarReduction_ObservedGenes", args.output_dir, ground_truth_p)
-            plot_pvalue_history(svr_hist_imp, "VarReduction_ImputedGenes", args.output_dir, ground_truth_p)
 
-    # ---------------------------------------------------------
-    # Final Comparative Plots
-    # ---------------------------------------------------------
-    if all_mse_histories:
-        plot_mse_comparison(all_mse_histories, args.output_dir)
-
-    # ---------------------------------------------------------
-    # Summary
-    # ---------------------------------------------------------
-    print("\n" + "="*50)
-    print("FINAL SUMMARY: Batches needed for Significance")
-    print("="*50)
-    print(f"{'Strategy':<40} | {'ObservedGenes':<18} | {'ImputedGenes':<18}")
-    print("-" * 82)
-
-    def fmt(val): return str(val) if val else "> Max Batches"
-
-    print(f"{strat_name_mag:<40} | {fmt(mag_obs):<18} | {fmt(mag_imp):<18}")
-    print(f"{'Random Sampling':<40} | {fmt(rnd_obs):<18} | {fmt(rnd_imp):<18}")
-    
-    # For optional strategies, we check if they ran (exist in history) rather than if they succeeded (is not None)
-    if "ControlCovariance" in all_mse_histories:
-        print(f"{strat_name_cov:<40} | {fmt(cov_obs):<18} | {fmt(cov_imp):<18}")
-    if "ExternalPerturbation" in all_mse_histories:
-        print(f"{strat_name_ext:<40} | {fmt(ext_obs):<18} | {fmt(ext_imp):<18}")
-    if mse_key in all_mse_histories: # GP Strategy
-        print(f"{gp_strat_name:<40} | {fmt(gp_obs):<18} | {fmt(gp_imp):<18}")
-    if "Active_HighLeverage" in all_mse_histories:
-        print(f"{'Active High Leverage':<40} | {fmt(lev_obs):<18} | {fmt(lev_imp):<18}")
-    if "Active_Uncertainty" in all_mse_histories:
-        print(f"{'Active Uncertainty':<40} | {fmt(unc_obs):<18} | {fmt(unc_imp):<18}")
-    if "Active_Diversity" in all_mse_histories:
-        print(f"{'Active Diversity':<40} | {fmt(div_obs):<18} | {fmt(div_imp):<18}")
-    if "Active_PCUncertainty" in all_mse_histories:
-        print(f"{'Active PC-Uncertainty':<40} | {fmt(pca_obs):<18} | {fmt(pca_imp):<18}")
-    if "Active_VarReduction" in all_mse_histories:
-        print(f"{'Active Var-Reduction':<40} | {fmt(svr_obs):<18} | {fmt(svr_imp):<18}")
-    print("-" * 82)
-
-    print("\n" + "="*85)
-    print("DIAGNOSTIC REPORT: Average Quality of Selected Genes")
-    print("="*85)
-    print(f"{'Strategy':<40} | {'Avg |LoF|':<12} | {'Avg |HBA1|':<12} | {'Avg Connectivity':<16}")
-    print("-" * 85)
-    
-    # Helper to print row
-    def print_diag(name, key):
-        if key in all_diagnostics:
-            d = all_diagnostics[key]
-            conn_str = f"{d['conn']:.4f}" if d['conn'] > 0 else "N/A"
-            print(f"{name:<40} | {d['lof']:.4f}       | {d['hba1']:.4f}       | {conn_str:<16}")
-
-    print_diag(strat_name_mag, "GammaMagnitude")
-    print_diag("Random Sampling", "Random")
-    if "ControlCovariance" in all_diagnostics:
-        print_diag(strat_name_cov, "ControlCovariance")
-    if "ExternalPerturbation" in all_diagnostics:
-        print_diag(strat_name_ext, "ExternalPerturbation")
-    print_diag(gp_strat_name, mse_key)
-    print_diag("Active High Leverage", "Active_HighLeverage")
-    print_diag("Active Uncertainty", "Active_Uncertainty")
-    print_diag("Active Diversity", "Active_Diversity")
-    print_diag("Active PC-Uncertainty", "Active_PCUncertainty")
-    print_diag("Active Var-Reduction", "Active_VarReduction")
-    print("-" * 85)
+    # ==========================================
+    # FINAL AGGREGATE SUMMARY
+    # ==========================================
+    print_final_summary(results_list)
 
 if __name__ == "__main__":
     main()
