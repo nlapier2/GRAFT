@@ -93,9 +93,12 @@ def load_adata_once(h5ad_path, obs_label=None, control_val=None):
 
 def print_final_summary(results_list):
     """
-    Prints the final summary tables for Correlated vs Uncorrelated genes.
-    Expects a list of dictionaries containing keys:
-    ['strategy', 'true_p', 'success_obs', 'error_nlog10_obs', 'final_mse', ...]
+    Prints summary tables for Correlated vs Uncorrelated genes.
+    
+    Tables:
+    1. Observed P-Value Stats (Succ%, Bias, MAE)
+    2. Imputed P-Value Stats (Succ%, Bias, MAE)
+    3. Beta Reconstruction Stats (MSE, MAE) - NEW
     """
     if not results_list:
         print("\nNo results to summarize.")
@@ -107,42 +110,85 @@ def print_final_summary(results_list):
     df_corr = df_res[df_res['true_p'] < 0.05]
     df_null = df_res[df_res['true_p'] >= 0.05]
 
-    def _print_group(name, sub_df):
-        print(f"\n\n>>> SUMMARY: {name} Genes (Count: {len(sub_df['gene'].unique())})")
-        if sub_df.empty:
-            print("No genes in this category.")
-            return
-
-        # Group by Strategy
+    def _print_pval_table(title, sub_df, mode="Observed"):
+        """
+        Prints P-value statistics (Success Rate, Bias, MAE of -log10p).
+        """
+        print(f"\n--- {title} : {mode} P-Value Stats ---")
+        
+        if mode == "Observed":
+            succ_col = 'success_obs'
+            bias_col = 'error_nlog10_obs'
+            mae_col = 'abs_error_nlog10_obs'
+        else:
+            succ_col = 'success_imp'
+            bias_col = 'error_nlog10_imp'
+            mae_col = 'abs_error_nlog10_imp'
+            
         grp = sub_df.groupby('strategy')
         
-        # Headers (Added MSE column at the end)
-        header = (f"{'Strategy':<35} | {'Succ% (Obs)':<11} | {'Bias (Obs)':<10} | "
-                  f"{'MAE (Obs)':<10} | {'Succ% (Imp)':<11} | {'MSE (Mean +/- SE)':<20}")
+        header = f"{'Strategy':<35} | {'Succ%':<8} | {'Bias (Mean +/- SE)':<22} | {'MAE (Mean +/- SE)':<22}"
+        print("-" * len(header))
         print(header)
         print("-" * len(header))
         
         for strat, g in grp:
-            # Stats: Success Rate, Bias (Mean Error), MAE (Mean Absolute Error)
-            succ_obs = (g['success_obs'].sum() / len(g)) * 100
-            bias_obs = g['error_nlog10_obs'].mean()
-            mae_obs = g['abs_error_nlog10_obs'].mean()
+            succ = (g[succ_col].sum() / len(g)) * 100
             
-            succ_imp = (g['success_imp'].sum() / len(g)) * 100
+            b_mean = g[bias_col].mean()
+            b_se = g[bias_col].sem()
+            if pd.isna(b_se): b_se = 0.0
             
-            # MSE Stats (Mean and Standard Error)
+            m_mean = g[mae_col].mean()
+            m_se = g[mae_col].sem()
+            if pd.isna(m_se): m_se = 0.0
+            
+            print(f"{strat:<35} | {succ:6.1f}%  | {b_mean:6.2f} +/- {b_se:4.2f}      | {m_mean:6.2f} +/- {m_se:4.2f}")
+
+    def _print_beta_table(title, sub_df):
+        """
+        Prints Beta Reconstruction statistics (MSE, MAE).
+        """
+        print(f"\n--- {title} : Beta Reconstruction Accuracy ---")
+        
+        grp = sub_df.groupby('strategy')
+        
+        # Header for Beta Errors
+        header = f"{'Strategy':<35} | {'MSE (Mean +/- SE)':<22} | {'MAE (Mean +/- SE)':<22}"
+        print("-" * len(header))
+        print(header)
+        print("-" * len(header))
+        
+        for strat, g in grp:
+            # MSE
             mse_mean = g['final_mse'].mean()
             mse_se = g['final_mse'].sem()
+            if pd.isna(mse_se): mse_se = 0.0
             
-            # Format string
-            row = (f"{strat:<35} | {succ_obs:9.1f}%  | {bias_obs:9.2f}  | "
-                   f"{mae_obs:9.2f}  | {succ_imp:9.1f}%  | "
-                   f"{mse_mean:.2e} +/- {mse_se:.2e}")
-            print(row)
+            # MAE
+            mae_mean = g['final_mae'].mean()
+            mae_se = g['final_mae'].sem()
+            if pd.isna(mae_se): mae_se = 0.0
+            
+            # Scientific notation for errors
+            print(f"{strat:<35} | {mse_mean:.2e} +/- {mse_se:.2e}  | {mae_mean:.2e} +/- {mae_se:.2e}")
+
+    def _print_group(name, sub_df):
+        print(f"\n\n{'='*95}")
+        print(f"SUMMARY: {name} Genes (Count: {len(sub_df['gene'].unique())})")
+        print(f"{'='*95}")
+        
+        if sub_df.empty:
+            print("No genes in this category.")
+            return
+
+        _print_pval_table(name, sub_df, mode="Observed")
+        _print_pval_table(name, sub_df, mode="Imputed")
+        _print_beta_table(name, sub_df)
 
     _print_group("TRUE CORRELATED", df_corr)
     _print_group("UNCORRELATED (NULL)", df_null)
-    print("\n" + "="*60)
+    print("\n" + "="*95)
 
 
 def run_simulation_strategy(strategy, df_master, total_genes, batch_size, p_threshold, 
@@ -172,6 +218,7 @@ def run_simulation_strategy(strategy, df_master, total_genes, batch_size, p_thre
     history_obs = []
     history_imp = []
     history_mse = []
+    history_mae = []
     
     # Diagnostics storage
     diag_lof = []
@@ -265,9 +312,13 @@ def run_simulation_strategy(strategy, df_master, total_genes, batch_size, p_thre
         final_p_imp = p_imp
         history_imp.append(p_imp)
 
-        # Metric 3: MSE
-        mse = np.mean((y_true_values - y_full_hybrid) ** 2)
+        # Metric 3: MSE & MAE
+        diff = y_true_values - y_full_hybrid
+        mse = np.mean(diff ** 2)
+        mae = np.mean(np.abs(diff))
+        
         history_mse.append(mse)
+        history_mae.append(mae)
 
         if not silent:
             if batch_idx == 1 or batch_idx % print_every == 0 or n_revealed == total_genes:
@@ -296,6 +347,7 @@ def run_simulation_strategy(strategy, df_master, total_genes, batch_size, p_thre
         "final_p_obs": final_p_obs,
         "final_p_imp": final_p_imp,
         "final_mse": history_mse[-1] if history_mse else 0.0,
+        "final_mae": history_mae[-1] if history_mae else 0.0,
         "batches_obs": sig_batch_obs if sig_batch_obs else (limit + 1),
         "batches_imp": sig_batch_imp if sig_batch_imp else (limit + 1),
         "success_obs": (sig_batch_obs is not None),
