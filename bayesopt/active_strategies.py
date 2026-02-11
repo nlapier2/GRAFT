@@ -105,10 +105,19 @@ class StaticGPStrategy(StaticStrategy):
         
         # Trigger GP re-weighting/training
         if self._batch_count % self.args.gp_recompute_freq == 0:
-             self.learner.update(currently_known_mask, y_obs_vector)
+            self.learner.update(currently_known_mask, y_obs_vector)
 
-        # Return full genome prediction
-        return self.learner.predict(currently_known_mask, y_obs_vector)
+        # Get Mean and Variance
+        y_pred, y_var = self.learner.predict(currently_known_mask, y_obs_vector)
+        
+        mode = getattr(self.args, 'gp_imputation_mode', 'mean')
+        
+        if mode == 'sample':
+            std = np.sqrt(np.maximum(y_var, 0))
+            noise = np.random.randn(*y_pred.shape)
+            return y_pred + (std * noise)
+            
+        return y_pred
 
 
 class ActiveGPStrategy(BaseStrategy):
@@ -142,6 +151,28 @@ class ActiveGPStrategy(BaseStrategy):
         preds_mean, preds_var = self.learner.predict_with_variance(currently_known_mask, y_obs_vector)
 
         return preds_mean, preds_var
+    
+    def predict(self, currently_known_mask, y_obs_vector):
+        """
+        Returns the imputed vector for ALL genes.
+        Modes:
+        - 'mean': Posterior Mean (Standard)
+        - 'sample': Sample from Posterior Gaussian (Mean + std * N(0,1))
+        """
+        # Learner returns (mean, var) for unobserved
+        y_pred, y_var = self.learner.predict(currently_known_mask, y_obs_vector)
+        
+        mode = getattr(self.args, 'gp_imputation_mode', 'mean')
+        
+        if mode == 'sample':
+            # Sample: y ~ N(mean, var)
+            # std = sqrt(var)
+            # We assume y_var is variance vector (diagonal)
+            std = np.sqrt(np.maximum(y_var, 0))
+            noise = np.random.randn(*y_pred.shape)
+            return y_pred + (std * noise)
+            
+        return y_pred
 
 
 class HighLeverageStrategy(ActiveGPStrategy):

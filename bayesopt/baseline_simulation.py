@@ -53,7 +53,8 @@ def parse_arguments():
     parser.add_argument("--stepwise_subset_size", type=int, default=400, help="Size of the 'Working Set' for stepwise variance reduction (speed optimization).")
 
     # --- Static Strategy Options ---
-    parser.add_argument("--imputation_method", type=str, default="mean", choices=["mean", "zero"], help="Imputation method for static strategies: 'mean' (AverageKnown) or 'zero'.")
+    parser.add_argument("--imputation_method", type=str, default="mean", choices=["mean", "zero", "noise"], help="Imputation method for static strategies: 'mean' (AverageKnown), 'zero', or 'noise' (Empirical Variance centered at 0).")
+    parser.add_argument("--gp_imputation_mode", type=str, default="mean", choices=["mean", "sample"], help="For GP strategies: 'mean' (Posterior Mean) or 'sample' (Sample from Posterior).")
     parser.add_argument("--sampling_strategy", type=str, default="strongest", choices=["strongest", "uniform"], help="Order to pick genes for static strategies: 'strongest' (Magnitude Descending) or 'uniform' (Stratified across range).")
     parser.add_argument("--random_samp_pct", type=float, default=0.0, help="Percentage of batch (0.0-1.0) to select randomly for static strategies.")
     parser.add_argument("--static_only", action="store_true", help="Skip all active learning strategies (GP/Active).")
@@ -170,21 +171,35 @@ def run_simulation_strategy(strategy, df_master, total_genes, batch_size, p_thre
             # Strategy provided full imputed vector
             hba1_full_hybrid = prediction
         else:
-            # Fallback: Static Imputation (Mean or Zero)
+            # Fallback: Static Imputation (Mean, Zero, or Noise)
             # Check strategy args first, then default to 'mean' if not present
             imp_method = getattr(strategy.args, 'imputation_method', 'mean')
             
             if imp_method == 'zero':
-                mean_val = 0.0
+                hba1_full_hybrid = np.copy(all_hba1_true)
+                hba1_full_hybrid[~revealed_mask] = 0.0
+                
+            elif imp_method == 'noise':
+                # Empirical Variance centered at 0
+                # Calculate scale from currently observed data
+                scale = np.std(hba1_known) if len(hba1_known) > 1 else 0.0
+                
+                # Generate noise vector
+                n_missing = np.sum(~revealed_mask)
+                noise_vec = np.random.normal(loc=0.0, scale=scale, size=n_missing)
+                
+                hba1_full_hybrid = np.copy(all_hba1_true)
+                hba1_full_hybrid[~revealed_mask] = noise_vec
+
             else:
                 # 'mean' (AverageKnown)
                 if len(hba1_known) > 0:
                     mean_val = np.mean(hba1_known)
                 else:
                     mean_val = 0.0
-            
-            hba1_full_hybrid = np.copy(all_hba1_true) # Start with truth...
-            hba1_full_hybrid[~revealed_mask] = mean_val # ...overwrite unknown with imputation value
+                
+                hba1_full_hybrid = np.copy(all_hba1_true) 
+                hba1_full_hybrid[~revealed_mask] = mean_val 
             
         if np.std(all_lof_true) > 0 and np.std(hba1_full_hybrid) > 0:
             corr_imp, p_imp = stats.pearsonr(all_lof_true, hba1_full_hybrid)
