@@ -9,6 +9,7 @@ Input:
 Features:
 - "Smart Selection": Only selects targets that actually exist in the Beta file.
 - "Correlation Summary": Prints a report of Gamma-Beta correlations (Core Gene strength).
+- "Responsiveness Analysis": Checks if HBA1 is a "high responder" (sum of abs effects).
 
 Output:
 - A single TSV with columns: [gene_name, LoF_gamma, HBA1_beta, GATA1_beta, ...]
@@ -80,6 +81,46 @@ def process_series(series, name, mapper):
 
 def get_symbol(name, mapper):
     return mapper.get(name, name)
+
+def print_responsiveness_summary(df_limma, target_symbol="HBA1"):
+    """
+    Calculates the magnitude of response (Sum of Absolute Betas) for each gene across all perturbations.
+    Prints stats for the target_symbol and the top 10 highest responders.
+    """
+    print("\n" + "="*60, file=sys.stderr)
+    print("RESPONSIVENESS SUMMARY (Sum of Abs Beta)", file=sys.stderr)
+    print("="*60, file=sys.stderr)
+
+    # 1. Compute Magnitude
+    # Sum of absolute values across columns (perturbations)
+    # df_limma index is already mapped to symbols and unique
+    magnitudes = df_limma.abs().sum(axis=1).sort_values(ascending=False)
+    
+    total_genes = len(magnitudes)
+    
+    # 2. HBA1 Stats
+    if target_symbol in magnitudes.index:
+        hba1_mag = magnitudes[target_symbol]
+        # Get rank (1-based). 
+        # get_loc returns integer position (0-based) in sorted index
+        rank = magnitudes.index.get_loc(target_symbol) + 1
+        percentile = (1 - (rank / total_genes)) * 100 # High percentile = Top rank
+        
+        print(f"Target Gene: {target_symbol}", file=sys.stderr)
+        print(f"  Magnitude: {hba1_mag:.4f}", file=sys.stderr)
+        print(f"  Rank:      {rank} / {total_genes}", file=sys.stderr)
+        print(f"  Percentile: {percentile:.2f}% (Top {100-percentile:.2f}%)", file=sys.stderr)
+    else:
+        print(f"[warn] Target gene '{target_symbol}' not found in Limma matrix.", file=sys.stderr)
+
+    # 3. Top 10
+    print("-" * 40, file=sys.stderr)
+    print(f"{'Rank':<5} | {'Gene':<15} | {'Magnitude':<10}", file=sys.stderr)
+    print("-" * 40, file=sys.stderr)
+    
+    for i, (gene, mag) in enumerate(magnitudes.head(10).items()):
+        print(f"{i+1:<5} | {gene:<15} | {mag:.4f}", file=sys.stderr)
+    print("="*60 + "\n", file=sys.stderr)
 
 def print_correlation_summary(df, beta_cols):
     """
@@ -206,6 +247,9 @@ def main():
     # Handle duplicate rows (mean)
     if df_limma_mapped.index.duplicated().any():
         df_limma_mapped = df_limma_mapped.groupby(df_limma_mapped.index).mean()
+
+    # === Responsiveness Check (Before column mapping/subsetting) ===
+    print_responsiveness_summary(df_limma_mapped, target_symbol=HBA1_SYMBOL)
 
     # Map Limma Columns (Perturbations) to match LoF index
     if any(str(x).startswith("ENSG") for x in df_limma_mapped.columns[:5]):
