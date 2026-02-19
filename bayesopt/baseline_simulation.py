@@ -89,6 +89,7 @@ def run_simulation_strategy(strategy, df_master, total_genes, batch_size, p_thre
     history_obs = []
     history_imp = []
     history_mse = []
+    history_r_beta = []
     
     # Diagnostics storage
     diag_lof = []
@@ -214,6 +215,15 @@ def run_simulation_strategy(strategy, df_master, total_genes, batch_size, p_thre
         mse = np.mean((all_hba1_true - hba1_full_hybrid) ** 2)
         history_mse.append(mse)
 
+        # Metric 4: Beta Correlation (True vs Imputed)
+        if np.std(all_hba1_true) > 0 and np.std(hba1_full_hybrid) > 0:
+            r_beta = stats.pearsonr(all_hba1_true, hba1_full_hybrid)[0]
+        else:
+            r_beta = 0.0
+        
+        final_r_beta = r_beta
+        history_r_beta.append(r_beta)
+
         # Print
         if batch_idx == 1 or batch_idx % print_every == 0 or n_revealed == total_genes:
             print(f"{batch_idx:<8} | {n_revealed:<8} | {corr_obs:+.4f}     | {p_obs:.2e}    | {corr_imp:+.4f}     | {p_imp:.2e}")
@@ -222,10 +232,11 @@ def run_simulation_strategy(strategy, df_master, total_genes, batch_size, p_thre
     avg_diag = {
         'lof': np.mean(diag_lof) if diag_lof else 0.0,
         'hba1': np.mean(diag_hba1) if diag_hba1 else 0.0,
-        'conn': np.nanmean(diag_conn) if not np.all(np.isnan(diag_conn)) else 0.0
+        'conn': np.nanmean(diag_conn) if not np.all(np.isnan(diag_conn)) else 0.0,
+        'final_r_beta': final_r_beta
     }
 
-    return sig_batch_obs, sig_batch_imp, history_obs, history_imp, history_mse, avg_diag
+    return sig_batch_obs, sig_batch_imp, history_obs, history_imp, history_mse, history_r_beta, avg_diag
 
 
 def plot_pvalue_history(p_values, method_name, output_dir, true_p_val=None):
@@ -283,7 +294,7 @@ def plot_pvalue_history(p_values, method_name, output_dir, true_p_val=None):
     print(f"Saved plot to {out_path}")
 
 
-def plot_mse_comparison(mse_histories, output_dir):
+def plot_mse_comparison(mse_histories, output_dir, baseline_val=None):
     """
     Plots MSE trajectories. Automatically splits the y-axis (broken axis)
     if one method's initial error is significantly (>5x) higher than the median max error.
@@ -338,6 +349,10 @@ def plot_mse_comparison(mse_histories, output_dir):
         ax1.plot([0, 1], [0, 0], transform=ax1.transAxes, **kwargs)
         ax2.plot([0, 1], [1, 1], transform=ax2.transAxes, **kwargs)
 
+        if baseline_val is not None:
+            ax1.axhline(y=baseline_val, color='k', linestyle='--', alpha=0.6, label='Zero Baseline')
+            ax2.axhline(y=baseline_val, color='k', linestyle='--', alpha=0.6, label='Zero Baseline')
+
         ax1.set_title("Imputation Error Trajectory (MSE) - Split Axis")
         ax2.set_ylabel("Mean Squared Error")
         ax2.set_xlabel("Batches")
@@ -354,6 +369,9 @@ def plot_mse_comparison(mse_histories, output_dir):
             batches = range(1, len(history) + 1)
             plt.plot(batches, history, label=name, linewidth=2, alpha=0.8)
         
+        if baseline_val is not None:
+            plt.axhline(y=baseline_val, color='k', linestyle='--', alpha=0.6, label='Zero Baseline')
+
         plt.title("Imputation Error Trajectory (MSE)")
         plt.xlabel("Batches")
         plt.ylabel("Mean Squared Error")
@@ -364,6 +382,34 @@ def plot_mse_comparison(mse_histories, output_dir):
     plt.savefig(out_path)
     plt.close()
     print(f"Saved MSE comparison plot to {out_path}")
+
+
+def plot_beta_corr_comparison(corr_histories, output_dir):
+    """
+    Plots Pearson Correlation trajectories (True vs Imputed Beta).
+    """
+    if not corr_histories:
+        return
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    plt.figure(figsize=(10, 6))
+    for name, history in corr_histories.items():
+        batches = range(1, len(history) + 1)
+        plt.plot(batches, history, label=name, linewidth=2, alpha=0.8)
+    
+    plt.title("Beta Reconstruction Accuracy (Pearson r)")
+    plt.xlabel("Batches")
+    plt.ylabel("Pearson Correlation (True vs Imputed)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.ylim(-0.2, 1.05) 
+
+    out_path = os.path.join(output_dir, "BetaCorr_Comparison.png")
+    plt.savefig(out_path)
+    plt.close()
+    print(f"Saved Beta Corr comparison plot to {out_path}")
 
 
 def compute_control_covariance(h5ad_path, target_gene, obs_label, control_val):
@@ -618,11 +664,12 @@ def main():
 
     # Dictionary to store MSE histories for comparison plot
     all_mse_histories = {}
+    all_r_beta_histories = {}
 
     # Store diagnostics for final table
     all_diagnostics = {}
 
-# ---------------------------------------------------------
+    # ---------------------------------------------------------
     # Strategy 1: GammaMagnitude Sampling
     # ---------------------------------------------------------
     mag_scores = df['LoF_gamma'].abs()
@@ -636,10 +683,11 @@ def main():
     
     strat_mag = StaticStrategy(total_genes, args, mag_indices, name=strat_name_mag)
     
-    mag_obs, mag_imp, mag_hist_obs, mag_hist_imp, mag_mse, mag_diag = run_simulation_strategy(
+    mag_obs, mag_imp, mag_hist_obs, mag_hist_imp, mag_mse, mag_r_beta, mag_diag = run_simulation_strategy(
         strat_mag, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
     )
     all_mse_histories["GammaMagnitude"] = mag_mse
+    all_r_beta_histories["GammaMagnitude"] = mag_r_beta
     all_diagnostics["GammaMagnitude"] = mag_diag
 
     plot_pvalue_history(mag_hist_obs, "GammaMagnitude_ObservedGenes", args.output_dir, ground_truth_p)
@@ -653,10 +701,11 @@ def main():
     
     strat_rnd = StaticStrategy(total_genes, args, rnd_indices, name="Random Sampling")
     
-    rnd_obs, rnd_imp, rnd_hist_obs, rnd_hist_imp, rnd_mse, rnd_diag = run_simulation_strategy(
+    rnd_obs, rnd_imp, rnd_hist_obs, rnd_hist_imp, rnd_mse, rnd_r_beta, rnd_diag = run_simulation_strategy(
         strat_rnd, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
     )
     all_mse_histories["Random"] = rnd_mse
+    all_r_beta_histories["Random"] = rnd_r_beta
     all_diagnostics["Random"] = rnd_diag
 
     plot_pvalue_history(rnd_hist_obs, "Random_ObservedGenes", args.output_dir, ground_truth_p)
@@ -690,10 +739,11 @@ def main():
             
             strat_cov = StaticStrategy(total_genes, args, cov_indices, name=strat_name_cov)
 
-            cov_obs, cov_imp, cov_hist_obs, cov_hist_imp, cov_mse, cov_diag = run_simulation_strategy(
+            cov_obs, cov_imp, cov_hist_obs, cov_hist_imp, cov_mse,  cov_r_beta, cov_diag = run_simulation_strategy(
                 strat_cov, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
             )
             all_mse_histories["ControlCovariance"] = cov_mse
+            all_r_beta_histories["ControlCovariance"] = cov_r_beta
             all_diagnostics["ControlCovariance"] = cov_diag
 
             plot_pvalue_history(cov_hist_obs, "ControlCovariance_ObservedGenes", args.output_dir, ground_truth_p)
@@ -720,10 +770,11 @@ def main():
             
             strat_ext = StaticStrategy(total_genes, args, ext_indices, name=strat_name_ext)
 
-            ext_obs, ext_imp, ext_hist_obs, ext_hist_imp, ext_mse, ext_diag = run_simulation_strategy(
+            ext_obs, ext_imp, ext_hist_obs, ext_hist_imp, ext_mse, ext_r_beta, ext_diag = run_simulation_strategy(
                 strat_ext, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
             )
             all_mse_histories["ExternalPerturbation"] = ext_mse
+            all_r_beta_histories["ExternalPerturbation"] = ext_r_beta
             all_diagnostics["ExternalPerturbation"] = ext_diag
 
             plot_pvalue_history(ext_hist_obs, "ExternalPerturbation_ObservedGenes", args.output_dir, ground_truth_p)
@@ -773,11 +824,12 @@ def main():
         shared_learner.reset()
         strat_gp = StaticGPStrategy(total_genes, args, gp_indices, shared_learner, name=gp_strat_name)
 
-        gp_obs, gp_imp, gp_hist_obs, gp_hist_imp, gp_mse, gp_diag = run_simulation_strategy(
+        gp_obs, gp_imp, gp_hist_obs, gp_hist_imp, gp_mse, gp_r_beta, gp_diag = run_simulation_strategy(
             strat_gp, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
         )
         
         all_mse_histories[mse_key] = gp_mse
+        all_r_beta_histories[mse_key] = gp_r_beta
         all_diagnostics[mse_key] = gp_diag
         plot_pvalue_history(gp_hist_obs, plot_name_obs, args.output_dir, ground_truth_p)
         plot_pvalue_history(gp_hist_imp, plot_name_imp, args.output_dir, ground_truth_p)
@@ -797,11 +849,12 @@ def main():
             # Pass cov_indices (if they exist) to use as the "Warm Start" for Batch 1
             strat_lev = HighLeverageStrategy(total_genes, args, shared_learner, prior_indices=cov_indices)
             
-            lev_obs, lev_imp, lev_hist_obs, lev_hist_imp, lev_mse, lev_diag = run_simulation_strategy(
+            lev_obs, lev_imp, lev_hist_obs, lev_hist_imp, lev_mse, lev_r_beta, lev_diag = run_simulation_strategy(
                 strat_lev, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
             )
             
             all_mse_histories["Active_HighLeverage"] = lev_mse
+            all_r_beta_histories["Active_HighLeverage"] = lev_r_beta
             all_diagnostics["Active_HighLeverage"] = lev_diag
             plot_pvalue_history(lev_hist_obs, "HighLeverage_ObservedGenes", args.output_dir, ground_truth_p)
             plot_pvalue_history(lev_hist_imp, "HighLeverage_ImputedGenes", args.output_dir, ground_truth_p)
@@ -821,11 +874,12 @@ def main():
             # Typically Uncertainty sampling starts Randomly to maximize entropy.
             strat_unc = UncertaintyStrategy(total_genes, args, shared_learner, prior_indices=None)
 
-            unc_obs, unc_imp, unc_hist_obs, unc_hist_imp, unc_mse, unc_diag = run_simulation_strategy(
+            unc_obs, unc_imp, unc_hist_obs, unc_hist_imp, unc_mse,  unc_r_beta, unc_diag = run_simulation_strategy(
                 strat_unc, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
             )
             
             all_mse_histories["Active_Uncertainty"] = unc_mse
+            all_r_beta_histories["Active_Uncertainty"] = unc_r_beta
             all_diagnostics["Active_Uncertainty"] = unc_diag
             plot_pvalue_history(unc_hist_obs, "Uncertainty_ObservedGenes", args.output_dir, ground_truth_p)
             plot_pvalue_history(unc_hist_imp, "Uncertainty_ImputedGenes", args.output_dir, ground_truth_p)
@@ -844,11 +898,12 @@ def main():
             # Pass cov_indices if available for Warm Start
             strat_div = DiversityStrategy(total_genes, args, shared_learner, prior_indices=cov_indices)
             
-            div_obs, div_imp, div_hist_obs, div_hist_imp, div_mse, div_diag = run_simulation_strategy(
+            div_obs, div_imp, div_hist_obs, div_hist_imp, div_mse, div_r_beta, div_diag = run_simulation_strategy(
                 strat_div, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
             )
             
             all_mse_histories["Active_Diversity"] = div_mse
+            all_r_beta_histories["Active_Diversity"] = div_r_beta
             all_diagnostics["Active_Diversity"] = div_diag
             plot_pvalue_history(div_hist_obs, "Diversity_ObservedGenes", args.output_dir, ground_truth_p)
             plot_pvalue_history(div_hist_imp, "Diversity_ImputedGenes", args.output_dir, ground_truth_p)
@@ -866,11 +921,12 @@ def main():
             
             strat_pca = PCUncertaintyStrategy(total_genes, args, shared_learner, prior_indices=cov_indices)
             
-            pca_obs, pca_imp, pca_hist_obs, pca_hist_imp, pca_mse, pca_diag = run_simulation_strategy(
+            pca_obs, pca_imp, pca_hist_obs, pca_hist_imp, pca_mse, pca_r_beta, pca_diag = run_simulation_strategy(
                 strat_pca, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
             )
             
             all_mse_histories["Active_PCUncertainty"] = pca_mse
+            all_r_beta_histories["Active_PCUncertainty"] = pca_r_beta
             all_diagnostics["Active_PCUncertainty"] = pca_diag
             plot_pvalue_history(pca_hist_obs, "PCUncertainty_ObservedGenes", args.output_dir, ground_truth_p)
             plot_pvalue_history(pca_hist_imp, "PCUncertainty_ImputedGenes", args.output_dir, ground_truth_p)
@@ -888,11 +944,12 @@ def main():
             
             strat_svr = VarianceReductionStrategy(total_genes, args, shared_learner, prior_indices=cov_indices)
             
-            svr_obs, svr_imp, svr_hist_obs, svr_hist_imp, svr_mse, svr_diag = run_simulation_strategy(
+            svr_obs, svr_imp, svr_hist_obs, svr_hist_imp, svr_mse, svr_r_beta, svr_diag = run_simulation_strategy(
                 strat_svr, df, total_genes, args.batch_size, args.p_threshold, args.max_batches, args.print_every
             )
             
             all_mse_histories["Active_VarReduction"] = svr_mse
+            all_r_beta_histories["Active_VarReduction"] = svr_r_beta
             all_diagnostics["Active_VarReduction"] = svr_diag
             plot_pvalue_history(svr_hist_obs, "VarReduction_ObservedGenes", args.output_dir, ground_truth_p)
             plot_pvalue_history(svr_hist_imp, "VarReduction_ImputedGenes", args.output_dir, ground_truth_p)
@@ -901,7 +958,12 @@ def main():
     # Final Comparative Plots
     # ---------------------------------------------------------
     if all_mse_histories:
-        plot_mse_comparison(all_mse_histories, args.output_dir)
+        # Calculate Zero Baseline MSE (Predicting 0 for all genes)
+        baseline_mse = np.mean(df['HBA1_beta']**2)
+        plot_mse_comparison(all_mse_histories, args.output_dir, baseline_val=baseline_mse)
+
+    if all_r_beta_histories:
+        plot_beta_corr_comparison(all_r_beta_histories, args.output_dir)
 
     # ---------------------------------------------------------
     # Summary
@@ -936,18 +998,19 @@ def main():
         print(f"{'Active Var-Reduction':<40} | {fmt(svr_obs):<18} | {fmt(svr_imp):<18}")
     print("-" * 82)
 
-    print("\n" + "="*85)
-    print("DIAGNOSTIC REPORT: Average Quality of Selected Genes")
-    print("="*85)
-    print(f"{'Strategy':<40} | {'Avg |LoF|':<12} | {'Avg |HBA1|':<12} | {'Avg Connectivity':<16}")
-    print("-" * 85)
+    print("\n" + "="*105)
+    print("DIAGNOSTIC REPORT: Selected Genes Quality & Beta Accuracy")
+    print("="*105)
+    print(f"{'Strategy':<40} | {'Avg |LoF|':<12} | {'Avg |HBA1|':<12} | {'Connectivity':<14} | {'Beta Corr (r)':<14}")
+    print("-" * 105)
     
     # Helper to print row
     def print_diag(name, key):
         if key in all_diagnostics:
             d = all_diagnostics[key]
             conn_str = f"{d['conn']:.4f}" if d['conn'] > 0 else "N/A"
-            print(f"{name:<40} | {d['lof']:.4f}       | {d['hba1']:.4f}       | {conn_str:<16}")
+            r_str = f"{d.get('final_r_beta', 0.0):.4f}"
+            print(f"{name:<40} | {d['lof']:.4f}       | {d['hba1']:.4f}       | {conn_str:<14} | {r_str:<14}")
 
     print_diag(strat_name_mag, "GammaMagnitude")
     print_diag("Random Sampling", "Random")
