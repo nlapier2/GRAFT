@@ -267,7 +267,41 @@ def main():
     print(f"Total Comparisons: {total}")
     print(f"Global Kernel Best:  {global_wins} times ({(global_wins/total)*100:.1f}%)")
     print(f"Module Kernel Best:  {module_wins} times ({(module_wins/total)*100:.1f}%)")
-    print("="*85)
+
+    # --- Dataset Comparison Report ---
+    print("\n" + "="*110)
+    print("EXTERNAL DATASET COMPARISON (Aggregated Across All Processed Modules)")
+    print("="*110)
+    
+    # Calculate Ranks per factor (highest CKA = rank 1)
+    df_res['Rank_Global'] = df_res.groupby('Factor')['CKA_Global'].rank(ascending=False, method='min')
+    df_res['Rank_Module'] = df_res.groupby('Factor')['CKA_Module'].rank(ascending=False, method='min')
+    
+    datasets = sorted(df_res['H5AD'].unique())
+    max_rank = len(datasets)
+    
+    def print_dataset_stats(mode_name, cka_col, rank_col):
+        print(f"\n--- {mode_name} ---")
+        print(f"{'H5AD Dataset':<35} | {'Avg CKA ± Std':<17} | {'Avg Rank ± Std':<17} | {'Rank Frequencies (1st, 2nd...)'}")
+        print("-" * 110)
+        for ds in datasets:
+            sub = df_res[df_res['H5AD'] == ds]
+            
+            # Use ddof=0 to avoid NaN if only 1 module is processed
+            avg_cka = sub[cka_col].mean()
+            std_cka = sub[cka_col].std(ddof=0) 
+            avg_rank = sub[rank_col].mean()
+            std_rank = sub[rank_col].std(ddof=0)
+            
+            # Rank frequencies
+            counts = sub[rank_col].value_counts()
+            freq_str = ", ".join([f"r{int(r)}:{counts.get(r, 0)}" for r in range(1, max_rank + 1)])
+            
+            print(f"{ds:<35} | {avg_cka:.4f} ± {std_cka:.4f} | {avg_rank:.2f} ± {std_rank:.2f}   | {freq_str}")
+
+    print_dataset_stats("GLOBAL CKA PERFORMANCE", "CKA_Global", "Rank_Global")
+    print_dataset_stats("MODULE CKA PERFORMANCE", "CKA_Module", "Rank_Module")
+    print("="*110 + "\n")
 
 if __name__ == "__main__":
     main()
