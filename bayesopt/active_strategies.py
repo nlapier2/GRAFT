@@ -108,12 +108,15 @@ class StaticGPStrategy(StaticStrategy):
             self.learner.update(currently_known_mask, y_obs_vector)
 
         # Get Mean and Variance
-        y_pred, y_var = self.learner.predict(currently_known_mask, y_obs_vector)
+        y_pred, y_var = self.learner.predict_with_variance(currently_known_mask, y_obs_vector)
         
         mode = getattr(self.args, 'gp_imputation_mode', 'mean')
         
         if mode == 'sample':
             std = np.sqrt(np.maximum(y_var, 0))
+            # Broadcast 1D variance across 2D module targets
+            if y_pred.ndim > 1 and std.ndim == 1:
+                std = std[:, np.newaxis]
             noise = np.random.randn(*y_pred.shape)
             return y_pred + (std * noise)
             
@@ -160,7 +163,7 @@ class ActiveGPStrategy(BaseStrategy):
         - 'sample': Sample from Posterior Gaussian (Mean + std * N(0,1))
         """
         # Learner returns (mean, var) for unobserved
-        y_pred, y_var = self.learner.predict(currently_known_mask, y_obs_vector)
+        y_pred, y_var = self.learner.predict_with_variance(currently_known_mask, y_obs_vector)
         
         mode = getattr(self.args, 'gp_imputation_mode', 'mean')
         
@@ -169,6 +172,9 @@ class ActiveGPStrategy(BaseStrategy):
             # std = sqrt(var)
             # We assume y_var is variance vector (diagonal)
             std = np.sqrt(np.maximum(y_var, 0))
+            # Broadcast 1D variance across 2D module targets
+            if y_pred.ndim > 1 and std.ndim == 1:
+                std = std[:, np.newaxis]
             noise = np.random.randn(*y_pred.shape)
             return y_pred + (std * noise)
             
@@ -206,14 +212,21 @@ class HighLeverageStrategy(ActiveGPStrategy):
         means, vars = self._get_scored_candidates(currently_known_mask, y_obs_vector)
         stds = np.sqrt(vars)
 
+        # 1b. Handle Multi-Output (Module) Aggregation
+        abs_means = np.abs(means)
+        if abs_means.ndim > 1:
+            agg_method = getattr(self.args, 'module_cov_agg', 'mean')
+            if agg_method == 'max':
+                abs_means = np.max(abs_means, axis=1)
+                stds = np.max(stds, axis=1) if stds.ndim > 1 else stds
+            else:
+                abs_means = np.mean(abs_means, axis=1)
+                stds = np.mean(stds, axis=1) if stds.ndim > 1 else stds
+
         # 2. Calculate Acquisition Score
         # Score = |Mean| + Beta * Std
         # Prioritize high magnitude predictions (Anchors) with some exploration (Std)
-        scores = np.abs(means) + (self.beta * stds)
-        
-        # 3. Mask out known genes
-        # Set their score to -infinity so they are pushed to the bottom
-        scores[currently_known_mask] = -np.inf
+        scores = abs_means + (self.beta * stds)
         
         # 4. Pick top N
         # argpartition moves the top N elements to the end of the array
@@ -247,6 +260,14 @@ class UncertaintyStrategy(ActiveGPStrategy):
         # 1. Get predictions (Variance only needed)
         _, vars = self._get_scored_candidates(currently_known_mask, y_obs_vector)
         
+        # 1b. Handle Multi-Output (Module) Aggregation
+        if vars.ndim > 1:
+            agg_method = getattr(self.args, 'module_cov_agg', 'mean')
+            if agg_method == 'max':
+                vars = np.max(vars, axis=1)
+            else:
+                vars = np.mean(vars, axis=1)
+
         # 2. Score = Variance
         scores = vars.copy()
         # Mask known genes

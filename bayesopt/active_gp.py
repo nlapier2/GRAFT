@@ -212,7 +212,12 @@ class ActiveGPLearner:
         
         # Add a dummy "control" row with value 0.0.
         # This ensures that (Value - Control) = Value - 0 = Value.
-        X_train = np.concatenate([y_obs_vector, [0.0]]).reshape(-1, 1) # (N_obs + 1, 1)
+        if y_obs_vector.ndim == 1:
+            X_train = np.concatenate([y_obs_vector, [0.0]]).reshape(-1, 1) # (N_obs + 1, 1)
+        else:
+            dummy_row = np.zeros((1, y_obs_vector.shape[1]))
+            X_train = np.vstack([y_obs_vector, dummy_row])
+            
         obs_labels = list(obs_genes) + [self.args.control_label]
         
         adata_train_dummy = ad.AnnData(
@@ -256,7 +261,7 @@ class ActiveGPLearner:
             unobs_idx = np.where(~obs_bool_mask)[0]
             
             # Center observed y
-            y_mean = np.mean(y_obs_vector)
+            y_mean = np.mean(y_obs_vector, axis=0)
             y_centered = y_obs_vector - y_mean
             
             # Slice Fused Kernel
@@ -278,7 +283,11 @@ class ActiveGPLearner:
             y_pred = y_pred_centered + y_mean
             
             # Reconstruct full vector
-            y_full = np.zeros(self.n_genes)
+            if y_obs_vector.ndim == 1:
+                y_full = np.zeros(self.n_genes)
+            else:
+                y_full = np.zeros((self.n_genes, y_obs_vector.shape[1]))
+                
             y_full[obs_idx] = y_obs_vector
             y_full[unobs_idx] = y_pred
             
@@ -295,10 +304,11 @@ class ActiveGPLearner:
         
         # 1. Handle Cold Start
         if len(obs_idx) == 0:
-            return np.zeros(self.n_genes), np.ones(self.n_genes)
+            shape = (self.n_genes, y_obs_vector.shape[1]) if y_obs_vector.ndim > 1 else self.n_genes
+            return np.zeros(shape), np.ones(self.n_genes)
 
         # 2. Compute Mean (Standard Predict Logic)
-        y_mean = np.mean(y_obs_vector)
+        y_mean = np.mean(y_obs_vector, axis=0)
         y_centered = y_obs_vector - y_mean
         
         K_OO = self.K_fused[np.ix_(obs_idx, obs_idx)]
@@ -342,8 +352,12 @@ class ActiveGPLearner:
         y_var_pred = np.maximum(y_var_pred, 0.0)
 
         # 5. Reconstruct Full Vectors
-        y_full_mean = np.zeros(self.n_genes)
-        y_full_var = np.zeros(self.n_genes)
+        if y_obs_vector.ndim == 1:
+            y_full_mean = np.zeros(self.n_genes)
+        else:
+            y_full_mean = np.zeros((self.n_genes, y_obs_vector.shape[1]))
+            
+        y_full_var = np.zeros(self.n_genes) # Variance is always 1D (shared feature space)
         
         # Fill Observed
         y_full_mean[obs_idx] = y_obs_vector
@@ -367,10 +381,11 @@ class ActiveGPLearner:
         if len(obs_idx) == 0:
             # Prior covariance is just K_UU (the kernel itself)
             # Warning: This is huge (N x N)
-            return np.zeros(len(unobs_idx)), self.K_fused[np.ix_(unobs_idx, unobs_idx)]
+            shape = (len(unobs_idx), y_obs_vector.shape[1]) if y_obs_vector.ndim > 1 else len(unobs_idx)
+            return np.zeros(shape), self.K_fused[np.ix_(unobs_idx, unobs_idx)]
 
         # 2. Setup
-        y_mean = np.mean(y_obs_vector)
+        y_mean = np.mean(y_obs_vector, axis=0)
         y_centered = y_obs_vector - y_mean
         
         K_OO = self.K_fused[np.ix_(obs_idx, obs_idx)]
